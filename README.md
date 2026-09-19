@@ -1,4 +1,4 @@
-# SynthFlow · 预生成式 AI 编程工作台
+﻿# SynthFlow · 预生成式 AI 编程工作台
 
 > 你还在打字，代码已经在写了。
 > 不是"输入 → 点发送 → 等回复"，而是**边说边生成**：AI 与你的输入同步思考、同步产出、同步给建议，你随时改前文，它只做增量。
@@ -19,7 +19,7 @@ npm start
 想看它自己证明自己没问题：
 
 ```bat
-npm run smoke        :: 41 项离线冒烟测试（不联网、不花钱）
+npm run smoke        :: 48 项离线冒烟测试（不联网、不花钱）
 node scripts/livecheck.mjs   :: 对正在运行的服务做一次真实用户流程演练
 ```
 
@@ -68,7 +68,7 @@ node scripts/livecheck.mjs   :: 对正在运行的服务做一次真实用户流
 | 14 | 无技术栈要求 | 后端零依赖（Node 内置模块），前端原生 HTML/CSS/JS，**零 npm install** | ✅ |
 | 15 | 全权交给你，睡醒要有成品 | 本仓库就是成品，含测试与文档 | ✅ |
 | 16 | 别弄坏电脑，交代清楚下载了什么、放哪了 | **没有下载任何东西、没有装任何依赖**，全部产物都在 `D:\ProgramData\SynthFlow` 内，见「磁盘与进程」 | ✅ |
-| 17 | 自己冒烟测试、上网看别人方案、注意 token 余额 | 41 项离线冒烟 + 在线验收脚本；`docs/RESEARCH.md`；默认离线模型不烧钱 | ✅ |
+| 17 | 自己冒烟测试、上网看别人方案、注意 token 余额 | 48 项离线冒烟 + 在线验收脚本；`docs/RESEARCH.md`；默认离线模型不烧钱 | ✅ |
 | 18 | 权限问题找别的办法，太麻烦就先停下 | 全程无阻塞：服务只监听 `127.0.0.1`，无需管理员权限 | ✅ |
 
 ---
@@ -169,7 +169,7 @@ D:\ProgramData\SynthFlow\
 ├── public\                前端（原生，无构建）
 │   ├── index.html  styles.css  app.js
 ├── scripts\
-│   ├── smoke.mjs          41 项离线冒烟测试
+│   ├── smoke.mjs          48 项离线冒烟测试
 │   ├── livecheck.mjs      在线端到端验收
 │   └── clean.mjs          磁盘清理（默认只看不删）
 ├── workspace\             ★ 生成出来的代码全在这里（可以被你随意删）
@@ -234,7 +234,7 @@ node scripts/clean.mjs --all        :: 以上全部（保留 config.json）
 ## 验证记录（本次交付实测）
 
 ```
-npm run smoke                 41 通过 / 0 失败 · 8.7s
+npm run smoke                 48 通过 / 0 失败 · 8.8s
 node scripts/livecheck.mjs    全部通过 · 12.2s
   场景 A 边打字边生成  → 4 个文件自动创建，思考 7 分片 / 代码 26 分片 / 建议 7 条，预演结果被直接采纳
   场景 B 采纳建议      → 提示词 +31 字，自动跟进一轮生成
