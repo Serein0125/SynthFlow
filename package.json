@@ -1,0 +1,26 @@
+{
+  "name": "synthflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SynthFlow — 预生成式 AI 编程工作台：边打字边流式生成代码，并行输出优化建议，项目级多文件增量改写，一键回退。",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js --port 7788 --open",
+    "smoke": "node scripts/smoke.mjs",
+    "bench": "node scripts/smoke.mjs --bench",
+    "clean": "node scripts/clean.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "keywords": [
+    "ai-coding",
+    "speculative-generation",
+    "stream-code",
+    "local-first"
+  ],
+  "license": "MIT"
+}

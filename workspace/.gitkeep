@@ -1,0 +1,3 @@
+# 这里放 SynthFlow 生成出来的代码。
+# 它由 SynthFlow 独占管理（写入、快照、回退都在这个目录内），你可以随时整体删掉：
+#   node scripts/clean.mjs --workspace
