@@ -699,6 +699,38 @@ await test('app.js 是纯浏览器可用语法（无 import / require / TS 注�
   assert.doesNotMatch(appJs, /:\s*(string|number|boolean|any)\b/, 'app.js 不应有 TypeScript 注解');
 });
 
+await test('语法高亮器（直接跑 app.js 里的真实实现）', () => {
+  // 把 app.js 中自包含的高亮相关源码切出来，在 Node 里执行，验证的是真正会上线的代码。
+  const start = appJs.indexOf('const esc = ');
+  const end = appJs.indexOf('/* ============================ 渲染：文件树');
+  assert.ok(start > 0 && end > start, '找不到高亮器源码区间');
+  const src = appJs.slice(start, end);
+  const { highlight } = new Function(`${src}\nreturn { highlight };`)();
+
+  const js = highlight('// 注释\nconst a = 1;\nfunction f() { return "x"; }', 'javascript');
+  assert.match(js, /tok-com/, '注释应高亮');
+  assert.match(js, /tok-key/, '关键字应高亮');
+  assert.match(js, /tok-num/, '数字应高亮');
+  assert.match(js, /tok-str/, '字符串应高亮');
+
+  const css = highlight(':root { --bg: #0f1115; }', 'css');
+  assert.match(css, /tok-key|tok-num/, 'CSS 变量/颜色应高亮');
+
+  const md = highlight('# 标题\n- 列表\n`code`', 'markdown');
+  assert.match(md, /tok-/, 'Markdown 应有高亮输出');
+
+  // 安全：高亮前必须转义，否则生成出来的代码会把工作台自己 XSS 掉
+  const dangerous = highlight('const s = "<img src=x onerror=alert(1)>";', 'javascript');
+  assert.doesNotMatch(dangerous, /<img/, '必须转义 HTML');
+  assert.match(dangerous, /&lt;img/, '应当输出转义后的实体');
+
+  // 中文与超长输入不能崩
+  const cn = highlight('const 标题 = "中文注释测试";'.repeat(400), 'javascript');
+  assert.ok(cn.length > 1000);
+  assert.match(highlight('', 'text'), /^$/);
+  assert.match(highlight('普通文本', 'text'), /普通文本/);
+});
+
 /* ============================ 11. 基准（可选） ============================ */
 if (bench) {
   section('11. 性能基线（--bench）');

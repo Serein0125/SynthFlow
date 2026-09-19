@@ -525,6 +525,18 @@ function on(name, fn) {
   window.addEventListener(`sf:${name}`, (e) => fn(e.detail));
 }
 
+function renderProviderBadge() {
+  const p = S.provider;
+  if (!p) {
+    el.providerBadge.textContent = '模型加载中…';
+    el.providerBadge.className = 'badge';
+    return;
+  }
+  el.providerBadge.textContent = `${p.label ?? p.name ?? '模型'}${p.ready ? '' : ' · 未就绪'}`;
+  el.providerBadge.className = `badge ${p.ready ? 'ok' : 'err'}`;
+  el.providerBadge.title = p.note ?? '';
+}
+
 function connect() {
   const es = new EventSource('/api/events');
   const names = [
@@ -540,23 +552,26 @@ function connect() {
     } catch { /* ignore */ }
     window.dispatchEvent(new CustomEvent(`sf:${n}`, { detail }));
   });
+  // EventSource 会自己重连；这里只是把状态显示成"重连中"而不是吓人的红字。
   es.onerror = () => {
-    el.providerBadge.textContent = '连接断开，重连中…';
-    el.providerBadge.className = 'badge err';
+    el.providerBadge.textContent = '连接中断，重连中…';
+    el.providerBadge.className = 'badge warn';
   };
+  es.onopen = () => renderProviderBadge();
 }
 
 /* ============================ 事件绑定 ============================ */
 
-on('hello', () => toast('已连接 SynthFlow 服务', 'ok', 1800));
+on('hello', () => {
+  renderProviderBadge();
+  toast('已连接 SynthFlow 服务', 'ok', 1800);
+});
 
 on('state', (st) => {
   if (!st) return;
   S.provider = st.provider;
   S.busy = st.busy;
-  el.providerBadge.textContent = `${st.provider?.label ?? '模型'}${st.provider?.ready ? '' : ' · 未就绪'}`;
-  el.providerBadge.className = `badge ${st.provider?.ready ? 'ok' : 'err'}`;
-  el.providerBadge.title = st.provider?.note ?? '';
+  renderProviderBadge();
   setRunBadge(st.session?.status ?? 'idle');
   S.draft = st.draft;
   if (st.draft) {
@@ -916,9 +931,7 @@ window.addEventListener('beforeunload', () => {});
     S.provider = st.provider;
     window.__sfPresets = st.presets;
     window.__sfConfig = st.config;
-    el.providerBadge.textContent = `${st.provider?.label ?? '模型'}${st.provider?.ready ? '' : ' · 未就绪'}`;
-    el.providerBadge.className = `badge ${st.provider?.ready ? 'ok' : 'err'}`;
-    el.providerBadge.title = st.provider?.note ?? '';
+    renderProviderBadge();
     if (st.memory?.chips) renderChips(st.memory.chips);
     const tree = await get('/api/tree');
     for (const rel of tree.files ?? []) {
