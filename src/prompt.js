@@ -34,6 +34,7 @@ export function buildMessages(ctx) {
     adopted = [],
     config = {},
     previousPrompt = '',
+    requireSuggestions = false,
   } = ctx;
 
   const sys = [];
@@ -50,6 +51,13 @@ export function buildMessages(ctx) {
       `4. 每个文件写完立刻关闭 file 通道，然后再开下一个，用户可以边看边改。\n` +
       `5. 建议总数控制在 2~4 条，宁精勿滥。`,
   );
+  if (requireSuggestions) {
+    sys.push(
+      `【硬性要求】无论这一轮是全新生成还是**增量/补丁**修改，你都必须至少给出 **2 条** suggest 建议，` +
+        `并且要基于**这一轮刚刚改动的代码**给出下一步可以做什么（例如：还没处理的边界、可以抽出的复用点、` +
+        `缺少的错误处理或测试）。用户会把这些建议一键采纳进提示词，然后让你继续增量实现。`,
+    );
+  }
   if (repoMap) sys.push(`当前工作区已有的文件（项目地图）：\n\`\`\`\n${repoMap}\n\`\`\``);
   if (memoryBriefing) sys.push(`关于这位用户的长期习惯（来自本地记忆，请顺着他的习惯写）：\n${memoryBriefing}`);
   if (skills.length) {

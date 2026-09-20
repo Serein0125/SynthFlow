@@ -1,29 +1,38 @@
 // SynthFlow 前端：SSE 驱动的实时工作台。
-// 关键点：输入不"发送"，只持续上报；服务端负责预演/意图判定/落盘，前端只负责呈现与干预。
+// 设计要点：
+//   · 输入不"发送"，只持续上报；服务端负责预演/意图判定/落盘，前端只负责呈现与干预
+//   · 每一轮生成是一个可折叠、可跳转、带锚点的"轮次块"，思考默认折叠
+//   · 差异不再占用底部空间，改为代码区一键切换「完整代码 ⇄ 本轮差异」
 
 const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const el = {
   providerBadge: $('#provider-badge'),
   runBadge: $('#run-badge'),
-  draftBadge: $('#draft-badge'),
-  btnRollback: $('#btn-rollback'),
+  btnUndo: $('#btn-undo'),
+  btnRedo: $('#btn-redo'),
   btnRegenerate: $('#btn-regenerate'),
+  btnTheme: $('#btn-theme'),
   btnSettings: $('#btn-settings'),
   wsStats: $('#ws-stats'),
   fileTree: $('#file-tree'),
   timeline: $('#timeline'),
+  versionHint: $('#version-hint'),
   tabs: $('#tabs'),
   currentPath: $('#current-path'),
   fileMeta: $('#file-meta'),
   btnSave: $('#btn-save'),
+  viewToggle: $('#view-toggle'),
+  diffCount: $('#diff-count'),
   code: $('#code'),
   codePre: $('#code-pre'),
   editorEmpty: $('#editor-empty'),
-  diffStrip: $('#diff-strip'),
   streamBody: $('#stream-body'),
-  streamMode: $('#stream-mode'),
+  unreadBadge: $('#unread-badge'),
+  roundLabel: $('#round-label'),
+  btnThinkMode: $('#btn-think-mode'),
+  btnRoundPrev: $('#btn-round-prev'),
+  btnRoundNext: $('#btn-round-next'),
   intentFill: $('#intent-fill'),
   intentText: $('#intent-text'),
   decisionText: $('#decision-text'),
@@ -31,34 +40,73 @@ const el = {
   btnCommit: $('#btn-commit'),
   btnCancel: $('#btn-cancel'),
   chips: $('#chips'),
-  hint: $('#hint'),
+  statusDot: $('#status-dot'),
+  statusText: $('#status-text'),
+  statusDetail: $('#status-detail'),
+  usage: $('#usage'),
   counter: $('#counter'),
+  btnHelp: $('#btn-help'),
   toasts: $('#toasts'),
+  palette: $('#palette'),
+  paletteInput: $('#palette-input'),
+  paletteList: $('#palette-list'),
+  helpModal: $('#help-modal'),
   modal: $('#settings-modal'),
 };
 
-const S = {
-  files: {},          // 已落盘文件内容缓存
-  live: {},           // 生成中文件的实时缓冲
-  openTabs: [],
-  current: null,
-  tree: null,
-  versions: [],
-  draft: null,
-  suggestions: [],
-  busy: false,
-  runKind: null,
-  provider: null,
-  memory: null,
-  lastIntent: null,
-  charCount: 0,
+const LS = {
+  get: (k, d) => {
+    try {
+      const v = localStorage.getItem(`sf.${k}`);
+      return v === null ? d : JSON.parse(v);
+    } catch {
+      return d;
+    }
+  },
+  set: (k, v) => {
+    try {
+      localStorage.setItem(`sf.${k}`, JSON.stringify(v));
+    } catch { /* ignore */ }
+  },
 };
 
-/* ============================ 工具函数 ============================ */
+const S = {
+  files: {},          // 已落盘文件内容
+  live: {},           // 生成中文件的实时缓冲 { content, diff, autoscroll }
+  diffs: {},          // 每个文件"本轮"的差异 { compact, added:Set, round }
+  openTabs: [],
+  current: null,
+  view: 'code',       // code | diff
+  tree: null,
+  versions: [],
+  activeVersionId: 'v0',
+  canBack: false,
+  canForward: false,
+  rounds: [],         // [{ id, kind, mode, el, idx, collapsed }]
+  currentRound: null,
+  suggestions: [],    // [{ sg, roundId, handled, el }]
+  unread: 0,
+  // 用量以服务端 session.stats 为准（单一数据源），last 是本轮的 token 数
+  usage: { calls: 0, tokens: 0, last: 0 },
+  statusKind: 'idle',
+  statusAt: 0,
+  busy: false,
+  provider: null,
+  thinkExpandAll: LS.get('thinkExpand', false),
+  theme: LS.get('theme', 'system'),
+};
 
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
+/* ============================ 提示与请求 ============================ */
+
+const recentToasts = new Map();
 function toast(message, level = 'ok', ms = 4200) {
+  const key = `${level}:${message}`;
+  const now = Date.now();
+  if (recentToasts.has(key) && now - recentToasts.get(key) < 4000) return; // 去重：同类提示 4 秒内只弹一次
+  recentToasts.set(key, now);
+  while (el.toasts.children.length >= 3) el.toasts.firstChild.remove();
   const div = document.createElement('div');
   div.className = `toast ${level}`;
   div.textContent = message;
@@ -82,6 +130,26 @@ const get = async (url) => {
   if (!res.ok) throw new Error(data.error || `${res.status}`);
   return data;
 };
+
+/* ======================== 状态栏（替代大部分 toast） ======================== */
+
+function setStatus(kind, text, detail = '') {
+  const dot = { idle: 'idle', typing: 'typing', spec: 'busy', gen: 'busy', apply: 'busy', retry: 'busy', done: 'ok', err: 'err' }[kind] ?? 'idle';
+  el.statusDot.className = `status-dot ${dot}`;
+  el.statusText.textContent = text;
+  el.statusDetail.textContent = detail;
+  S.statusKind = kind;
+  S.statusAt = Date.now();
+}
+
+function renderUsage() {
+  const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n ?? 0));
+  const parts = [];
+  if (S.usage.last) parts.push(`本轮 ≈${fmt(S.usage.last)}`);
+  parts.push(`累计 ${S.usage.calls} 次调用`);
+  if (S.usage.tokens) parts.push(`${fmt(S.usage.tokens)} tokens`);
+  el.usage.textContent = parts.join(' · ');
+}
 
 /* ======================== 代码高亮（内置，无依赖） ======================== */
 
@@ -113,7 +181,7 @@ function rulesFor(lang) {
       R('tok-var', /[-\w]+/y),
     ];
   }
-  if (lang === 'html' || lang === 'xml' || lang === 'svg' || lang === 'vue') {
+  if (lang === 'html' || lang === 'xml' || lang === 'svg') {
     return [
       R('tok-com', /<!--[\s\S]*?-->/y),
       R('tok-str', /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/y),
@@ -128,7 +196,7 @@ function rulesFor(lang) {
       R('tok-str', /"(?:\\.|[^"\\])*"/y),
       R('tok-num', /-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/y),
       R('tok-key', /\b(?:true|false|null)\b/y),
-      R('tok-punc', /[{}\[\]:,]/y),
+      R('tok-punc', /[{}[\]:,]/y),
     ];
   }
   if (lang === 'markdown') {
@@ -143,27 +211,59 @@ function rulesFor(lang) {
   return [R('tok-com', /#[^\n]*/y), R('tok-str', /'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"/y), R('tok-num', /\b\d+(?:\.\d+)?\b/y)];
 }
 
-function highlight(code, lang) {
+/**
+ * 逐行高亮：返回每一行的 HTML。
+ * 必须逐行输出，否则没法给"本轮新增行"加标记，也会让跨行的注释/模板串把标签截断。
+ */
+function highlightLines(code, lang) {
   const rules = rulesFor(lang);
-  const out = [];
+  const lines = [];
+  let cur = '';
+  let openCls = null;
+  const closeSpan = () => {
+    if (openCls) {
+      cur += '</span>';
+      openCls = null;
+    }
+  };
+  const openSpan = (cls) => {
+    if (cls === openCls) return;
+    closeSpan();
+    if (cls) {
+      cur += `<span class="${cls}">`;
+      openCls = cls;
+    }
+  };
+  const push = (cls, text) => {
+    const parts = String(text).split('\n');
+    for (let i = 0; i < parts.length; i += 1) {
+      if (i > 0) {
+        closeSpan();
+        lines.push(cur);
+        cur = '';
+      }
+      openSpan(cls);
+      if (parts[i]) cur += esc(parts[i]);
+    }
+  };
   let i = 0;
-  const n = code.length;
   let plain = '';
   const flush = () => {
     if (plain) {
-      out.push(esc(plain));
+      push(null, plain);
       plain = '';
     }
   };
+  const n = code.length;
   let guard = 0;
-  while (i < n && guard++ < 400000) {
+  while (i < n && guard++ < 500000) {
     let matched = false;
     for (const r of rules) {
       r.re.lastIndex = i;
       const m = r.re.exec(code);
       if (m && m.index === i && m[0].length > 0) {
         flush();
-        out.push(`<span class="${r.name}">${esc(m[0])}</span>`);
+        push(r.name, m[0]);
         i += m[0].length;
         matched = true;
         break;
@@ -172,14 +272,16 @@ function highlight(code, lang) {
     if (!matched) {
       plain += code[i];
       i += 1;
-      if (plain.length > 512) flush();
+      if (plain.length > 256) flush();
     }
   }
   flush();
-  return out.join('');
+  closeSpan();
+  lines.push(cur);
+  return lines;
 }
 
-/* ============================ 渲染：文件树 ============================ */
+/* ============================ 文件树 ============================ */
 
 function renderTree(tree) {
   S.tree = tree;
@@ -198,8 +300,8 @@ function renderTree(tree) {
         parent.appendChild(kids);
         walk(child, depth + 1, kids);
       } else {
-        const live = S.live[child.path] ? '<span class="dot"></span>' : '';
-        row.innerHTML = `<span class="name">${esc(child.name)}</span>${live}`;
+        const touched = S.diffs[child.path] ? '<span class="dot"></span>' : '';
+        row.innerHTML = `<span class="name">${esc(child.name)}</span>${touched}`;
         row.dataset.path = child.path;
         row.title = child.path;
         if (S.current === child.path) row.classList.add('selected');
@@ -217,11 +319,31 @@ function renderTree(tree) {
 
 function updateWorkspaceStats() {
   const count = Object.keys(S.files).length;
-  const bytes = Object.values(S.files).reduce((a, c) => a + c.length, 0);
+  const bytes = Object.values(S.files).reduce((a, c) => a + (typeof c === 'string' ? c.length : 0), 0);
   el.wsStats.textContent = count ? ` ${count} 个 · ${(bytes / 1024).toFixed(1)} KB` : '';
 }
 
-/* ============================ 渲染：标签页 ============================ */
+/**
+ * 把文件内容写进缓存。必须先校验类型：
+ * 接口一旦返回了非预期结构（错误对象等），直接赋值会让 content 变成 undefined，
+ * 随后任何 .length / split 都会把整个界面打崩。
+ */
+function cacheFile(path, data) {
+  S.files[path] = typeof data?.content === 'string' ? data.content : S.files[path] ?? '';
+  return S.files[path];
+}
+
+async function pullFile(path) {
+  try {
+    const f = await get(`/api/file?path=${encodeURIComponent(path)}`);
+    return cacheFile(path, f);
+  } catch {
+    if (typeof S.files[path] !== 'string') S.files[path] = '';
+    return S.files[path];
+  }
+}
+
+/* ============================ 标签页 ============================ */
 
 function renderTabs() {
   el.tabs.innerHTML = '';
@@ -242,10 +364,10 @@ function renderTabs() {
   }
 }
 
-/* ============================ 渲染：代码区 ============================ */
+/* ============================ 代码区 ============================ */
 
 let rafPending = false;
-function scheduleHighlight() {
+function scheduleDraw() {
   if (rafPending) return;
   rafPending = true;
   requestAnimationFrame(() => {
@@ -254,7 +376,18 @@ function scheduleHighlight() {
   });
 }
 
-let lastRendered = { path: null, content: '', diff: null };
+function currentDiff(path) {
+  if (S.live[path]?.diff?.length) return { compact: S.live[path].diff, added: null, round: S.live[path].round };
+  return S.diffs[path] ?? null;
+}
+
+function updateDiffBadge() {
+  const d = S.current ? currentDiff(S.current) : null;
+  const n = d ? (d.compact ?? []).filter((x) => x.type !== 'same').length : 0;
+  el.diffCount.textContent = n ? String(n) : '';
+  el.diffCount.classList.toggle('hidden', n === 0);
+  el.viewToggle.querySelectorAll('.seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === S.view));
+}
 
 function renderCode() {
   const path = S.current;
@@ -263,141 +396,216 @@ function renderCode() {
     el.code.innerHTML = '';
     el.currentPath.textContent = '未选择文件';
     el.fileMeta.textContent = '';
+    updateDiffBadge();
     return;
   }
   el.editorEmpty.classList.add('hidden');
   el.currentPath.textContent = path;
-  const liveEntry = S.live[path];
-  const content = liveEntry ? liveEntry.content : S.files[path] ?? '';
-  lastRendered = { path, content, diff: liveEntry?.diff ?? null };
-  scheduleHighlight();
+  const live = S.live[path];
+  el.currentPath.classList.toggle('live-path', Boolean(live));
+  scheduleDraw();
 }
 
 function drawCode() {
-  const { path, content, diff } = lastRendered;
+  const path = S.current;
   if (!path) return;
   const lang = (path.split('.').pop() || 'text').toLowerCase();
-  if (diff && diff.length) {
-    el.code.innerHTML = diff
-      .map((d) => `<div class="d-${d.type === 'ins' ? 'ins' : d.type === 'del' ? 'del' : 'same'}">${highlight(d.text || ' ', lang)}</div>`)
+  const live = S.live[path];
+  const content = live ? live.content : S.files[path] ?? '';
+  const diff = currentDiff(path);
+
+  if (S.view === 'diff') {
+    if (!diff || !(diff.compact ?? []).length) {
+      el.code.innerHTML = '<div class="no-diff">本轮没有改动这个文件。<br>按 Ctrl+D 或点上方「代码」看完整内容。</div>';
+      el.code.classList.remove('with-lines');
+      el.fileMeta.textContent = `${content.split('\n').length} 行`;
+      updateDiffBadge();
+      return;
+    }
+    el.code.classList.remove('with-lines');
+    el.code.innerHTML = (diff.compact ?? [])
+      .map((d) => {
+        if (d.type === 'gap') return `<div class="d-same gap">⋯ 折叠 ${d.count} 行未改动</div>`;
+        return `<div class="d-${d.type}">${highlightLines(d.text || ' ', lang)[0]}</div>`;
+      })
       .join('');
-  } else {
-    el.code.innerHTML = highlight(content, lang);
+    const ins = (diff.compact ?? []).filter((d) => d.type === 'ins').length;
+    const del = (diff.compact ?? []).filter((d) => d.type === 'del').length;
+    el.fileMeta.textContent = `本轮差异 +${ins} / -${del}${live ? ' · 正在写入' : ''}`;
+    updateDiffBadge();
+    return;
   }
-  el.fileMeta.textContent = `${content.split('\n').length} 行 · ${content.length} 字符${S.live[path] ? ' · 正在写入' : ''}`;
-  if (S.live[path]?.autoscroll) el.codePre.scrollTop = el.codePre.scrollHeight;
+
+  const lines = content.split('\n');
+  const added = diff?.added ?? null;
+  const showLn = lines.length <= 1500;
+  el.code.classList.toggle('with-lines', showLn);
+  const html = highlightLines(content, lang);
+  el.code.innerHTML = html
+    .map((h, i) => {
+      const ln = i + 1;
+      const mark = added && added.has(ln) ? ' mark-added' : '';
+      return `<div class="line${mark}">${showLn ? `<span class="ln">${ln}</span>` : ''}${h || ' '}</div>`;
+    })
+    .join('');
+  const markCount = added ? added.size : 0;
+  el.fileMeta.textContent = `${lines.length} 行 · ${content.length} 字符${markCount ? ` · 本轮 +${markCount}` : ''}${live ? ' · 正在写入' : ''}`;
+  if (live?.autoscroll) el.codePre.scrollTop = el.codePre.scrollHeight;
+  updateDiffBadge();
+}
+
+function setView(view) {
+  S.view = view;
+  LS.set('view', view);
+  updateDiffBadge();
+  drawCode();
 }
 
 async function openFile(path, { autoscroll = false } = {}) {
   S.current = path;
   if (!S.openTabs.includes(path)) S.openTabs.push(path);
   if (S.openTabs.length > 8) S.openTabs.shift();
-  if (!S.live[path] && !(path in S.files)) {
-    try {
-      const f = await get(`/api/file?path=${encodeURIComponent(path)}`);
-      S.files[path] = f.content;
-    } catch {
-      S.files[path] = '';
-    }
-  }
+  if (!S.live[path] && typeof S.files[path] !== 'string') await pullFile(path);
   if (autoscroll && S.live[path]) S.live[path].autoscroll = true;
   renderTabs();
   renderCode();
   updateWorkspaceStats();
-  $$('.tree-item').forEach((r) => r.classList.toggle('selected', r.dataset.path === path));
+  document.querySelectorAll('.tree-item').forEach((r) => r.classList.toggle('selected', r.dataset.path === path));
 }
 
-function showDiffStrip(diff, title) {
-  if (!diff || !diff.length) {
-    el.diffStrip.classList.add('hidden');
-    return;
-  }
-  const ins = diff.filter((d) => d.type === 'ins').length;
-  const del = diff.filter((d) => d.type === 'del').length;
-  if (ins === 0 && del === 0) {
-    el.diffStrip.classList.add('hidden');
-    return;
-  }
-  el.diffStrip.classList.remove('hidden');
-  el.diffStrip.innerHTML =
-    `<div class="line muted">${esc(title)}　+${ins} / -${del}</div>` +
-    diff
-      .filter((d) => d.type !== 'same')
-      .slice(0, 80)
-      .map((d) => `<div class="d-${d.type}">${esc(d.text || ' ')}</div>`)
-      .join('') +
-    `<div class="line"><button class="btn ghost small strip-close">收起差异</button></div>`;
-  el.diffStrip.querySelector('.strip-close').addEventListener('click', () => el.diffStrip.classList.add('hidden'));
-}
+/* ============================ 版本时间线 ============================ */
 
-/* ============================ 渲染：版本时间线 ============================ */
-
-function renderVersions(versions, current) {
-  S.versions = versions ?? S.versions;
+function renderVersions(payload) {
+  if (Array.isArray(payload)) payload = { versions: payload };
+  if (payload.versions) S.versions = payload.versions;
+  if (payload.activeVersionId) S.activeVersionId = payload.activeVersionId;
+  if (typeof payload.canBack === 'boolean') S.canBack = payload.canBack;
+  if (typeof payload.canForward === 'boolean') S.canForward = payload.canForward;
+  el.btnUndo.disabled = !S.canBack;
+  el.btnRedo.disabled = !S.canForward;
   el.timeline.innerHTML = '';
   for (const v of S.versions) {
     const li = document.createElement('li');
-    li.className = `timeline-item${v.id === current ? ' current' : ''}`;
-    const files = (v.files ?? []).length ? `${(v.files ?? []).length} 个文件` : '';
-    li.innerHTML = `<b>${esc(v.id)}</b><span>${esc(v.summary || (v.kind === 'baseline' ? '空项目基线' : v.id))}${files && v.kind !== 'baseline' ? ` · ${esc(files)}` : ''}</span>`;
-    if (v.kind !== 'baseline' && v.id === current) {
-      const actions = document.createElement('div');
-      actions.className = 'timeline-actions';
-      const btn = document.createElement('button');
-      btn.className = 'btn ghost small';
-      btn.textContent = '⏪ 回退到此前';
-      btn.title = '回到这句话还没输入时的版本';
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        doRollback(v.id);
-      });
-      actions.appendChild(btn);
-      li.appendChild(actions);
-    }
+    const isActive = v.id === S.activeVersionId;
+    const ahead = S.versions.indexOf(v) > S.versions.findIndex((x) => x.id === S.activeVersionId);
+    li.className = `timeline-item${isActive ? ' current' : ''}${ahead ? ' reverted' : ''}`;
+    const files = (v.files ?? []).length ? ` · ${(v.files ?? []).length} 个文件` : '';
+    li.innerHTML = `<b>${esc(v.id)}</b><span>${esc(v.summary || (v.kind === 'baseline' ? '空项目基线' : v.id))}${v.kind === 'baseline' ? '' : esc(files)}</span>`;
+    li.title = `提示词：${(v.promptAfter ?? '').slice(0, 120)}`;
+    li.addEventListener('click', () => {
+      if (isActive) return;
+      const idx = S.versions.indexOf(v);
+      const cur = S.versions.findIndex((x) => x.id === S.activeVersionId);
+      doVersion(idx < cur ? 'back' : 'forward', v.id);
+    });
     el.timeline.appendChild(li);
   }
+  const cur = S.versions.findIndex((x) => x.id === S.activeVersionId);
+  el.versionHint.textContent = S.versions.length > 1 ? ` ${cur}/${S.versions.length - 1}` : '';
+  el.versionHint.title = S.canForward ? '你正处于历史版本，可以点 ⏩ 前进回去' : '';
 }
 
-/* ============================ 渲染：思考与建议流 ============================ */
-
-let currentThink = null;
-let currentRunBlock = null;
+/* ============================ 思考与建议流 ============================ */
 
 function streamScroll() {
   el.streamBody.scrollTop = el.streamBody.scrollHeight;
 }
 
-function ensureRunBlock(kind) {
-  if (currentRunBlock && currentRunBlock.dataset.kind === kind) return currentRunBlock;
+function newRound(kind, mode, label) {
   const div = document.createElement('div');
-  div.className = 'stream-run';
+  div.className = `stream-run${kind === 'spec' ? ' spec-run' : ''}`;
   div.dataset.kind = kind;
-  const head = document.createElement('div');
-  head.className = 'run-head';
-  head.textContent = kind === 'spec' ? '预演 · 你还在打字' : '本轮生成';
-  div.appendChild(head);
+  div.dataset.mode = mode ?? '';
+  const idx = S.rounds.length + 1;
+  div.innerHTML =
+    `<div class="run-head">` +
+    `<span class="run-idx">第 ${idx} 轮</span>` +
+    `<span class="run-mode">${esc(label ?? (kind === 'spec' ? '预演' : '生成'))}</span>` +
+    `<span class="run-time">${new Date().toLocaleTimeString('zh-CN', { hour12: false })}</span>` +
+    `<span class="run-files"></span>` +
+    `<span class="spacer"></span>` +
+    `<span class="run-collapse"></span>` +
+    `</div><div class="run-body"></div>`;
+  const round = { id: `r${idx}_${Date.now().toString(36)}`, kind, mode, el: div, idx, collapsed: false };
+  div.querySelector('.run-head').addEventListener('click', () => toggleRound(round));
   el.streamBody.appendChild(div);
-  const empty = el.streamBody.querySelector('.empty');
-  if (empty) empty.remove();
-  currentRunBlock = div;
-  streamScroll();
-  return div;
+  el.streamBody.querySelector('.empty')?.remove();
+  S.rounds.push(round);
+  S.currentRound = round;
+  // 只有当用户本来就在看最新内容时才自动跟随，否则保持他的阅读位置
+  focusRound(round, { scroll: streamNearBottom() });
+  updateRoundLabel();
+  return round;
+}
+
+function toggleRound(round, force) {
+  round.collapsed = force ?? !round.collapsed;
+  round.el.classList.toggle('collapsed', round.collapsed);
+}
+
+function focusRound(round, { scroll = false, flash = false } = {}) {
+  S.currentRound = round;
+  if (scroll) round.el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  if (flash) {
+    round.el.classList.add('anchor-flash');
+    setTimeout(() => round.el.classList.remove('anchor-flash'), 1300);
+  }
+  updateRoundLabel();
+}
+
+/** 用户正在往回翻看上下文时，不要强行把他拽到底部。 */
+function streamNearBottom() {
+  const b = el.streamBody;
+  return b.scrollHeight - b.scrollTop - b.clientHeight < 140;
+}
+
+function updateRoundLabel() {
+  const i = S.rounds.indexOf(S.currentRound);
+  el.roundLabel.textContent = S.rounds.length ? `${i + 1}/${S.rounds.length}` : '';
+}
+
+function jumpRound(dir) {
+  if (!S.rounds.length) return;
+  const i = S.rounds.indexOf(S.currentRound);
+  const next = Math.max(0, Math.min(S.rounds.length - 1, i + dir));
+  focusRound(S.rounds[next], { scroll: true, flash: true });
+}
+
+function roundBody() {
+  if (!S.currentRound) newRound('run', 'regenerate', '生成');
+  return S.currentRound.el.querySelector('.run-body');
 }
 
 function appendThink(delta) {
-  const block = ensureRunBlock(S.runKind ?? 'run');
-  if (!currentThink) {
-    currentThink = document.createElement('div');
-    currentThink.className = 'think';
-    currentThink.innerHTML = '<div class="think-head">思考</div><div class="think-body"></div>';
-    block.appendChild(currentThink);
+  const body = roundBody();
+  let think = body.querySelector('.think.streaming');
+  if (!think) {
+    think = document.createElement('div');
+    think.className = 'think streaming';
+    think.innerHTML = '<div class="think-head">思考<span class="think-summary"></span></div><div class="think-body"></div>';
+    think.querySelector('.think-head').addEventListener('click', () => {
+      if (think.classList.contains('streaming')) return; // 流式中不允许折叠
+      think.classList.toggle('collapsed');
+    });
+    body.appendChild(think);
   }
-  currentThink.querySelector('.think-body').insertAdjacentHTML('beforeend', esc(delta).replace(/\n/g, '<br>'));
+  think.querySelector('.think-body').insertAdjacentHTML('beforeend', esc(delta).replace(/\n/g, '<br>'));
   streamScroll();
 }
 
+function finishThink() {
+  const body = S.currentRound?.el.querySelector('.run-body');
+  const think = body?.querySelector('.think.streaming');
+  if (!think) return;
+  think.classList.remove('streaming');
+  const text = think.querySelector('.think-body').textContent.replace(/\s+/g, ' ').trim();
+  think.querySelector('.think-summary').textContent = text ? `· ${text.slice(0, 46)}${text.length > 46 ? '…' : ''}` : '';
+  think.querySelector('.think-head').insertAdjacentHTML('beforeend', `<span class="muted tiny" style="margin-left:auto">${text.length} 字</span>`);
+  if (!S.thinkExpandAll) think.classList.add('collapsed');
+}
+
 function addOpBlock(op) {
-  const block = ensureRunBlock(S.runKind ?? 'run');
+  const body = roundBody();
   const div = document.createElement('div');
   div.className = 'opblock';
   const actionText = { create: '新建', update: '增量修改', rewrite: '整体重写', delete: '删除' }[op.action] ?? op.action;
@@ -405,20 +613,42 @@ function addOpBlock(op) {
     op.mode === 'patch' ? `<span class="badge accent">补丁 ×${op.patches || op.patchList?.length || 0}</span>` : ''
   }</div>`;
   div.addEventListener('click', () => openFile(op.path));
-  block.appendChild(div);
+  body.appendChild(div);
   streamScroll();
 }
 
-function addSuggestion(sg) {
-  S.suggestions.push(sg);
-  const kindText = { clarify: '需求补全', optimize: '优化方向', risk: '风险提示', test: '测试建议', a11y: '可访问性' }[sg.kind] ?? sg.kind;
-  const block = ensureRunBlock(S.runKind ?? 'run');
+function addContextBlock(d) {
+  const body = roundBody();
+  const div = document.createElement('div');
+  div.className = 'opblock';
+  div.innerHTML = `<div class="opblock-head"><span class="op">上下文</span> 项目文件 ${d.files} 个 · 检索命中 ${d.ragHits} 段${
+    d.skills?.length ? ` · 技能 ${esc(d.skills.join('/'))}` : ''
+  } · 约 ${d.chars} 字符</div>`;
+  body.appendChild(div);
+}
+
+const KIND_TEXT = { clarify: '需求补全', optimize: '优化方向', risk: '风险提示', test: '测试建议', a11y: '可访问性' };
+const IMPACT_ORDER = { high: 0, medium: 1, low: 2 };
+
+function addSuggestion(sg, { batch = false } = {}) {
+  const round = S.currentRound;
+  if (!round) return;
+  const body = round.el.querySelector('.run-body');
+  let box = body.querySelector('.suggestion-batch');
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'suggestion-batch';
+    box.innerHTML = `<div class="suggestion-batch-head"><span>本轮建议</span><span class="muted">点「采纳」会直接写进你的提示词</span></div>`;
+    body.appendChild(box);
+  }
+  const n = S.suggestions.filter((x) => x.roundId === round.id).length + 1;
   const card = document.createElement('div');
   card.className = `suggestion kind-${sg.kind}`;
   card.innerHTML = `
     <div class="suggestion-head">
-      <span class="tag">${esc(kindText)}</span>
+      <span class="tag">${esc(KIND_TEXT[sg.kind] ?? sg.kind)}</span>
       <span class="suggestion-title">${esc(sg.title)}</span>
+      ${n <= 9 ? `<span class="kbd-hint">Alt+${n}</span>` : ''}
     </div>
     <div class="suggestion-body">${esc(sg.body).replace(/\n/g, '<br>')}</div>
     ${sg.insert ? `<div class="suggestion-insert">将写入提示词：${esc(sg.insert)}</div>` : ''}
@@ -426,32 +656,46 @@ function addSuggestion(sg) {
       <button class="btn primary small act-adopt">采纳并继续</button>
       <button class="btn ghost small act-dismiss">忽略</button>
     </div>`;
-  card.querySelector('.act-adopt').addEventListener('click', async () => {
-    try {
-      const res = await post('/api/adopt', { suggestion: sg });
-      if (res.prompt !== undefined) el.prompt.value = res.prompt;
-      updateCounter();
-      card.classList.add('adopted');
-      card.querySelector('.suggestion-actions').innerHTML = '<span class="muted">已写入提示词 ✓</span>';
-      toast('建议已并入提示词，正在按新提示词增量生成…', 'ok');
-    } catch (err) {
-      toast(`采纳失败：${err.message}`, 'err');
-    }
-  });
+  const entry = { sg, roundId: round.id, handled: false, el: card };
+  S.suggestions.push(entry);
+  card.querySelector('.act-adopt').addEventListener('click', () => adopt(entry));
   card.querySelector('.act-dismiss').addEventListener('click', async () => {
+    entry.handled = true;
     card.classList.add('adopted');
     card.querySelector('.suggestion-actions').innerHTML = '<span class="muted">已忽略（会进入习惯记忆）</span>';
+    updateUnread();
     await post('/api/dismiss', { suggestion: sg }).catch(() => {});
   });
-  block.appendChild(card);
-  streamScroll();
+  box.appendChild(card);
+  if (!round.collapsed) streamScroll();
+  updateUnread();
 }
 
-function resetStreamLive() {
-  currentThink = null;
+async function adopt(entry) {
+  if (entry.handled) return;
+  try {
+    const res = await post('/api/adopt', { suggestion: entry.sg });
+    if (res.prompt !== undefined) {
+      el.prompt.value = res.prompt;
+      updateCounter();
+    }
+    entry.handled = true;
+    entry.el.classList.add('adopted');
+    entry.el.querySelector('.suggestion-actions').innerHTML = '<span class="muted">已写入提示词 ✓</span>';
+    updateUnread();
+    setStatus('gen', '正在按新提示词增量生成…', '建议已并入提示词');
+  } catch (err) {
+    toast(`采纳失败：${err.message}`, 'err');
+  }
 }
 
-/* ============================ 意图与决策展示 ============================ */
+function updateUnread() {
+  S.unread = S.suggestions.filter((x) => !x.handled).length;
+  el.unreadBadge.textContent = String(S.unread);
+  el.unreadBadge.classList.toggle('hidden', S.unread === 0);
+}
+
+/* ============================ 意图与运行状态 ============================ */
 
 function renderIntent(intent, decision) {
   if (!intent) return;
@@ -459,28 +703,29 @@ function renderIntent(intent, decision) {
   el.intentFill.style.width = `${pct}%`;
   el.intentFill.classList.remove('low', 'mid', 'high');
   el.intentFill.classList.add(pct >= 60 ? 'high' : pct >= 40 ? 'mid' : 'low');
-  const reasons = (intent.reasons ?? []).slice(0, 2).join('；');
   el.intentText.textContent = intent.complete ? `意图判定：已写完（${pct}%）` : `意图判定：还在写（${pct}%）`;
-  if (decision) {
-    const modeText = { regenerate: '全新生成', continue: '增量续写', incremental: '定点增量补丁', noop: '忽略微小改动' }[decision.mode] ?? decision.mode;
-    el.decisionText.textContent = `策略：${modeText}${decision.ratio ? ` · 变动 ${(decision.ratio * 100).toFixed(0)}%` : ''}${reasons ? ` · ${reasons}` : ''}`;
-  }
+  el.decisionText.textContent = decision?.mode
+    ? `策略：${MODE_TEXT[decision.mode] ?? decision.mode}${decision.ratio ? ` · 变动 ${(decision.ratio * 100).toFixed(0)}%` : ''}`
+    : '';
+  if (!S.busy) setStatus('typing', '输入中…', (intent.reasons ?? []).slice(0, 1).join(''));
 }
 
-function setRunBadge(status, kind) {
+const MODE_TEXT = { regenerate: '全新生成', continue: '增量续写', incremental: '定点增量补丁', noop: '忽略微小改动' };
+
+function setRunBadge(status) {
   const map = {
     idle: ['空闲', 'idle'],
-    speculating: ['预演生成中…', 'warn'],
+    speculating: ['预演中…', 'warn'],
     generating: ['正在生成…', 'accent'],
-    applying: ['正在写入文件…', 'accent'],
+    applying: ['正在写入…', 'accent'],
     error: ['出错了', 'err'],
   };
   const [text, cls] = map[status] ?? ['运行中', 'accent'];
-  el.runBadge.textContent = kind ? `${text}` : text;
+  el.runBadge.textContent = text;
   el.runBadge.className = `badge ${cls}`;
 }
 
-/* ============================ 输入处理 ============================ */
+/* ============================ 输入 ============================ */
 
 let lastInputAt = 0;
 let lastSentAt = 0;
@@ -488,42 +733,33 @@ let trailing = null;
 let localSeq = 0;
 
 function updateCounter() {
-  const t = el.prompt.value;
-  S.charCount = t.length;
-  el.counter.textContent = `${t.length} 字`;
+  el.counter.textContent = `${el.prompt.value.length} 字`;
 }
 
 function sendInput(force = false) {
   const now = Date.now();
   const idleMs = now - lastInputAt;
-  if (!force && now - lastSentAt < 180) {
+  if (!force && now - lastSentAt < 300) {
     if (trailing) clearTimeout(trailing);
-    trailing = setTimeout(() => sendInput(true), 180 - (now - lastSentAt));
+    trailing = setTimeout(() => sendInput(true), 300 - (now - lastSentAt));
     return;
   }
   lastSentAt = now;
   const seq = ++localSeq;
-  post('/api/input', { text: el.prompt.value, idleMs })
-    .catch((err) => {
-      if (seq === localSeq) toast(`上报输入失败：${err.message}`, 'err');
-    });
+  post('/api/input', { text: el.prompt.value, idleMs }).catch((err) => {
+    if (seq === localSeq) toast(`上报输入失败：${err.message}`, 'err');
+  });
 }
 
 el.prompt.addEventListener('input', () => {
   lastInputAt = Date.now();
   updateCounter();
   sendInput();
-  // 本地即时反馈（服务端随后会覆盖为权威值）
   const t = el.prompt.value.trim();
-  const rough = Math.min(1, t.length / 30 + (/[。！？!?；;]$/.test(t) ? 0.4 : 0));
-  el.intentFill.style.width = `${Math.round(rough * 100)}%`;
+  if (t) setStatus('typing', '输入中…', '等你停下来我就开始预演');
 });
 
-/* ============================ SSE 接入 ============================ */
-
-function on(name, fn) {
-  window.addEventListener(`sf:${name}`, (e) => fn(e.detail));
-}
+/* ============================ SSE ============================ */
 
 function renderProviderBadge() {
   const p = S.provider;
@@ -537,22 +773,27 @@ function renderProviderBadge() {
   el.providerBadge.title = p.note ?? '';
 }
 
+function on(name, fn) {
+  window.addEventListener(`sf:${name}`, (e) => fn(e.detail));
+}
+
 function connect() {
   const es = new EventSource('/api/events');
   const names = [
     'hello', 'state', 'intent', 'queued', 'run:start', 'run:context', 'think:start', 'think:delta', 'think:end',
-    'suggest:start', 'suggest', 'suggest:adopted', 'file:start', 'file:delta', 'file:end', 'run:text',
+    'suggest', 'suggest:adopted', 'file:start', 'file:delta', 'file:end', 'run:text', 'retry',
     'run:applied', 'run:done', 'run:error', 'run:cancelled', 'spec:done', 'run:promoted', 'tree', 'versions',
     'prompt', 'toast', 'rollback', 'file:saved',
   ];
-  for (const n of names) es.addEventListener(n, (ev) => {
-    let detail = null;
-    try {
-      detail = JSON.parse(ev.data);
-    } catch { /* ignore */ }
-    window.dispatchEvent(new CustomEvent(`sf:${n}`, { detail }));
-  });
-  // EventSource 会自己重连；这里只是把状态显示成"重连中"而不是吓人的红字。
+  for (const n of names) {
+    es.addEventListener(n, (ev) => {
+      let detail = null;
+      try {
+        detail = JSON.parse(ev.data);
+      } catch { /* ignore */ }
+      window.dispatchEvent(new CustomEvent(`sf:${n}`, { detail }));
+    });
+  }
   es.onerror = () => {
     el.providerBadge.textContent = '连接中断，重连中…';
     el.providerBadge.className = 'badge warn';
@@ -560,12 +801,9 @@ function connect() {
   es.onopen = () => renderProviderBadge();
 }
 
-/* ============================ 事件绑定 ============================ */
+/* ============================ 事件处理 ============================ */
 
-on('hello', () => {
-  renderProviderBadge();
-  toast('已连接 SynthFlow 服务', 'ok', 1800);
-});
+on('hello', () => setStatus('idle', '已连接', ''));
 
 on('state', (st) => {
   if (!st) return;
@@ -573,62 +811,47 @@ on('state', (st) => {
   S.busy = st.busy;
   renderProviderBadge();
   setRunBadge(st.session?.status ?? 'idle');
-  S.draft = st.draft;
-  if (st.draft) {
-    el.draftBadge.classList.remove('hidden');
-    el.draftBadge.textContent = `预演就绪 · ${st.draft.files.length} 文件`;
-  } else el.draftBadge.classList.add('hidden');
-  if (st.versions) renderVersions(st.versions, st.session?.currentVersionId);
-  if (st.workspace?.recent?.length) S.recent = st.workspace.recent;
+  if (st.versions) renderVersions(st.versions);
   if (st.memory?.chips) renderChips(st.memory.chips);
+  // 用量以服务端为准，不要在这里做本地累加：否则每个 state 事件都会把本地计数覆盖掉
+  const stats = st.session?.stats;
+  if (stats) {
+    if (typeof stats.modelCalls === 'number') S.usage.calls = stats.modelCalls;
+    if (typeof stats.estTokens === 'number') S.usage.tokens = stats.estTokens;
+  }
+  renderUsage();
   if (st.config) window.__sfConfig = st.config;
   if (st.presets) window.__sfPresets = st.presets;
+  // 刚跑完的"已写入 N 个文件"要让用户看得见，别被紧随其后的 state 立刻覆盖成"空闲"
+  const keepDone = S.statusKind === 'done' && Date.now() - S.statusAt < 6000;
+  if (!st.busy && !keepDone) setStatus('idle', '空闲', `${st.workspace?.files ?? 0} 个文件`);
 });
 
-on('intent', (d) => {
-  S.lastIntent = d.intent;
-  renderIntent(d.intent, d.decision);
-});
+on('intent', (d) => renderIntent(d.intent, d.decision));
 
-on('queued', () => {
-  toast('生成中：新输入已排队，会在本轮结束后增量续写', 'warn', 2600);
+on('queued', (d) => {
+  setStatus('busy', '生成中…', d.reason ?? '');
 });
 
 on('run:start', (d) => {
   S.busy = true;
-  S.runKind = d.kind;
   setRunBadge(d.kind === 'spec' ? 'speculating' : 'generating');
-  el.streamMode.textContent = d.kind === 'spec' ? '预演' : '正式生成';
-  el.streamMode.className = `badge ${d.kind === 'spec' ? 'warn' : 'accent'}`;
-  if (d.kind === 'spec') el.draftBadge.classList.remove('hidden');
-  resetStreamLive();
-  currentRunBlock = null;
+  const label = d.kind === 'spec' ? '预演' : MODE_TEXT[d.mode] ?? '生成';
+  S.diffs = {}; // 新一轮 → 「本轮差异」重新开始计
+  newRound(d.kind, d.mode, label);
+  setStatus(d.kind === 'spec' ? 'spec' : 'gen', d.kind === 'spec' ? '预演中（你还在打字）…' : '正在生成…', '');
 });
 
-on('run:context', (d) => {
-  if (!d) return;
-  const block = ensureRunBlock(S.runKind ?? 'run');
-  const div = document.createElement('div');
-  div.className = 'opblock';
-  div.innerHTML = `<div class="opblock-head"><span class="op">上下文</span> 项目文件 ${d.files} 个 · RAG 命中 ${d.ragHits} 段${
-    d.skills?.length ? ` · 技能 ${esc(d.skills.join('/'))}` : ''
-  } · 约 ${d.chars} 字符</div>`;
-  block.appendChild(div);
-});
+on('run:context', (d) => d && addContextBlock(d));
 
-on('think:start', () => {
-  currentThink = null;
-});
+on('think:start', () => {});
 on('think:delta', (d) => appendThink(d.delta));
-on('think:end', () => {
-  currentThink = null;
-});
+on('think:end', () => finishThink());
 
-on('suggest', (d) => addSuggestion(d.suggestion));
-on('suggest:adopted', () => {});
+on('suggest', (d) => addSuggestion(d.suggestion, { batch: d.batch }));
 
 on('file:start', (d) => {
-  S.live[d.path] = { content: '', diff: null, action: d.action, lang: d.lang, autoscroll: true };
+  S.live[d.path] = { content: '', diff: null, action: d.action, lang: d.lang, autoscroll: true, round: S.currentRound?.id };
   addOpBlock({ path: d.path, action: d.action, mode: d.action === 'update' ? 'patch' : 'create', patches: 0 });
   openFile(d.path, { autoscroll: true });
   renderTree(S.tree);
@@ -638,7 +861,7 @@ on('file:delta', (d) => {
   const entry = S.live[d.path];
   if (!entry) return;
   entry.content += d.delta;
-  if (S.current === d.path) scheduleHighlight();
+  if (S.current === d.path) scheduleDraw();
 });
 
 on('file:end', (d) => {
@@ -659,120 +882,277 @@ on('file:end', (d) => {
   }
   if (S.current === op.path) {
     renderCode();
-    if (entry?.diff) showDiffStrip(entry.diff, `${op.path} · 即将应用的增量补丁`);
   }
 });
 
 on('run:text', (d) => {
-  // 协议外的散文字（模型没按协议输出时兜底显示）
-  const block = ensureRunBlock(S.runKind ?? 'run');
-  let pre = block.querySelector('.stray');
+  const body = roundBody();
+  let pre = body.querySelector('.stray');
   if (!pre) {
     pre = document.createElement('pre');
     pre.className = 'stray';
-    block.appendChild(pre);
+    body.appendChild(pre);
   }
   pre.textContent += d.delta;
   streamScroll();
 });
 
+on('retry', (d) => {
+  setStatus('retry', '补丁未命中，正在自动重试…', (d.files ?? []).join(', '));
+  toast(`补丁未命中：${(d.files ?? []).join(', ')} — 正在自动重试一次`, 'warn', 5200);
+});
+
 on('run:applied', async (d) => {
   for (const r of d.results ?? []) {
-    delete S.live[r.path];
     if (r.ok) {
-      try {
-        const f = await get(`/api/file?path=${encodeURIComponent(r.path)}`);
-        S.files[r.path] = f.content;
-      } catch { /* ignore */ }
+      await pullFile(r.path);
+      if (r.compact?.length || r.addedLines?.length) {
+        S.diffs[r.path] = {
+          compact: r.compact ?? [],
+          added: new Set(r.addedLines ?? []),
+          round: S.currentRound?.id,
+        };
+      }
     }
+    delete S.live[r.path];
   }
   renderTree(S.tree);
   if (S.current) renderCode();
   updateWorkspaceStats();
-  const ok = (d.results ?? []).filter((r) => r.ok).length;
   const bad = (d.results ?? []).filter((r) => !r.ok);
-  if (ok) toast(`已写入 ${ok} 个文件（${d.files?.join(', ') ?? ''}）`, 'ok', 2600);
-  for (const b of bad) toast(`补丁未命中：${b.path} — ${b.error}`, 'warn', 5200);
+  for (const b of bad) toast(`补丁未命中：${b.path} — ${b.error}`, 'warn', 6000);
 });
 
 on('run:done', (d) => {
   S.busy = false;
   setRunBadge('idle');
-  el.streamMode.textContent = '待命';
-  el.streamMode.className = 'badge';
-  if (d.mode) {
-    const modeText = { regenerate: '全新生成', continue: '增量续写', incremental: '定点增量补丁' }[d.mode] ?? d.mode;
-    const block = ensureRunBlock(S.runKind ?? 'run');
-    const div = document.createElement('div');
-    div.className = 'opblock';
-    div.innerHTML = `<div class="opblock-head"><span class="op">完成</span> ${esc(modeText)} · ${d.ms}ms · ${d.files.length} 个文件${d.versionId ? ` · 版本 ${esc(d.versionId)}` : ''}</div>`;
-    block.appendChild(div);
+  const round = S.currentRound;
+  if (round) {
+    round.el.dataset.mode = d.mode ?? round.mode;
+    const modeEl = round.el.querySelector('.run-mode');
+    if (modeEl) modeEl.textContent = MODE_TEXT[d.mode] ?? (round.kind === 'spec' ? '预演' : '生成');
+    const filesEl = round.el.querySelector('.run-files');
+    if (filesEl) filesEl.textContent = `${d.files?.length ?? 0} 个文件 · ${d.ms}ms`;
+    const done = document.createElement('div');
+    done.className = 'opblock';
+    done.innerHTML = `<div class="opblock-head"><span class="op">完成</span> ${esc(MODE_TEXT[d.mode] ?? '生成')} · ${d.files?.length ?? 0} 个文件${
+      d.versionId ? ` · 版本 ${esc(d.versionId)}` : ''
+    }</div>`;
+    round.el.querySelector('.run-body')?.appendChild(done);
     streamScroll();
   }
+  if (d.usage) {
+    S.usage.last = d.usage.tokens ?? 0;
+    // 计数由随后的 state 事件用服务端 stats 校准，这里不自行累加（避免双重计数）
+    renderUsage();
+  }
+  setStatus('done', `已写入 ${d.files?.length ?? 0} 个文件`, `${d.ms}ms · 版本 ${d.versionId ?? '-'}`);
 });
 
-on('run:promoted', (d) => toast(`⚡ ${d.reason}`, 'ok', 5000));
+on('run:promoted', (d) => setStatus('gen', '采纳预演结果', d.reason ?? ''));
 
 on('spec:done', (d) => {
   S.busy = false;
-  el.draftBadge.classList.remove('hidden');
-  el.draftBadge.textContent = `预演就绪 · ${d.files.length} 文件 · 可省一次调用`;
-  el.btnCommit.textContent = '采纳预演结果';
+  if (d?.files?.length) setStatus('idle', '预演就绪', `${d.files.length} 个文件待落盘`);
 });
 
 on('run:cancelled', () => {
   S.busy = false;
   setRunBadge('idle');
-  toast('已停止生成', 'warn', 2000);
+  setStatus('idle', '已停止生成', '');
 });
 
 on('run:error', (d) => {
   S.busy = false;
   setRunBadge('error');
-  toast(d.message, 'err', 8000);
+  setStatus('err', '出错了', d.message ?? '');
+  toast(d.message, 'err', 9000);
 });
 
 on('tree', (d) => {
   renderTree(d.tree);
   if (!S.current) {
-    const first = (d.tree?.children ?? []).flatMap(function first2(n) {
-      return n.type === 'file' ? [n.path] : (n.children ?? []).flatMap(first2);
+    const first = (d.tree?.children ?? []).flatMap(function walk(n) {
+      return n.type === 'file' ? [n.path] : (n.children ?? []).flatMap(walk);
     })[0];
     if (first) openFile(first);
   }
 });
 
-on('versions', (d) => renderVersions(d.versions, d.current));
+on('versions', (d) => renderVersions(d));
 
 on('prompt', (d) => {
   el.prompt.value = d.text ?? '';
   updateCounter();
-  if (d.reason === 'adopt' || d.reason === 'auto-adopt') toast('提示词已更新', 'ok', 1800);
 });
 
 on('rollback', (d) => {
   el.prompt.value = d.prompt ?? '';
   updateCounter();
   S.live = {};
-  toast(`已回退：恢复 ${d.files.length} 个文件到 ${d.restoredFrom}`, 'ok', 3600);
+  S.diffs = {};
+  setStatus('done', d.direction === 'forward' ? '已前进' : '已回退', `当前 ${d.activeVersionId} · 恢复 ${d.files?.length ?? 0} 个文件`);
   (async () => {
     const tree = await get('/api/tree');
     renderTree(tree.tree);
-    for (const p of Object.keys(S.files)) {
-      try {
-        const f = await get(`/api/file?path=${encodeURIComponent(p)}`);
-        S.files[p] = f.content;
-      } catch {
-        delete S.files[p];
-      }
-    }
+    for (const p of Object.keys(S.files)) await pullFile(p);
+    for (const rel of tree.files ?? []) if (typeof S.files[rel] !== 'string') await pullFile(rel);
     updateWorkspaceStats();
     if (S.current) renderCode();
   })();
 });
 
-on('file:saved', (d) => toast(`已保存 ${d.path}`, 'ok', 1800));
+on('file:saved', (d) => setStatus('done', `已保存 ${d.path}`, ''));
 on('toast', (d) => toast(d.message, d.level ?? 'ok'));
+
+/* ============================ 主题 ============================ */
+
+function applyTheme(mode = S.theme) {
+  S.theme = mode;
+  LS.set('theme', mode);
+  const resolved = mode === 'system' ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : mode;
+  document.documentElement.dataset.theme = resolved;
+  el.btnTheme.textContent = mode === 'system' ? '🌗' : mode === 'light' ? '☀️' : '🌙';
+  el.btnTheme.title = `主题：${mode === 'system' ? '跟随系统' : mode === 'light' ? '亮色' : '暗色'}（点击切换）`;
+}
+
+el.btnTheme.addEventListener('click', () => {
+  const order = ['system', 'light', 'dark'];
+  applyTheme(order[(order.indexOf(S.theme) + 1) % order.length]);
+});
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+  if (S.theme === 'system') applyTheme('system');
+});
+
+/* ============================ 快捷键 ============================ */
+
+document.addEventListener('keydown', (e) => {
+  const meta = e.altKey || e.ctrlKey;
+  if (meta && !e.shiftKey && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    doVersion('back');
+    return;
+  }
+  if (meta && e.shiftKey && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    doVersion('forward');
+    return;
+  }
+  if (e.altKey && e.key === 'Enter') {
+    e.preventDefault();
+    el.btnCommit.click();
+    return;
+  }
+  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'd') {
+    e.preventDefault();
+    setView(S.view === 'code' ? 'diff' : 'code');
+    return;
+  }
+  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
+    e.preventDefault();
+    openPalette();
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (!el.palette.classList.contains('hidden')) return closePalette();
+    if (!el.helpModal.classList.contains('hidden')) return el.helpModal.classList.add('hidden');
+    if (!el.modal.classList.contains('hidden')) return el.modal.classList.add('hidden');
+    if (S.busy) {
+      e.preventDefault();
+      post('/api/cancel').catch(() => {});
+    }
+    return;
+  }
+  if (e.altKey && /^[1-9]$/.test(e.key)) {
+    const n = Number(e.key);
+    const pending = S.suggestions.filter((x) => !x.handled);
+    const target = pending[n - 1];
+    if (target) {
+      e.preventDefault();
+      target.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      adopt(target);
+    }
+  }
+});
+
+/* ============================ 命令面板 ============================ */
+
+let paletteItems = [];
+let paletteIndex = 0;
+
+function openPalette() {
+  const files = Object.keys(S.files).length ? Object.keys(S.files) : (S.tree ? flattenFiles(S.tree) : []);
+  if (!files.length) {
+    toast('还没有文件可以跳转', 'warn', 2000);
+    return;
+  }
+  el.palette.classList.remove('hidden');
+  el.paletteInput.value = '';
+  paletteIndex = 0;
+  renderPalette(files);
+  el.paletteInput.focus();
+}
+
+function flattenFiles(node) {
+  return (node.children ?? []).flatMap((c) => (c.type === 'file' ? [c.path] : flattenFiles(c)));
+}
+
+function closePalette() {
+  el.palette.classList.add('hidden');
+}
+
+function renderPalette(files) {
+  const q = el.paletteInput.value.trim().toLowerCase();
+  paletteItems = files
+    .filter((f) => !q || f.toLowerCase().includes(q))
+    .sort((a, b) => {
+      const ai = a.toLowerCase().indexOf(q);
+      const bi = b.toLowerCase().indexOf(q);
+      return ai === bi ? a.length - b.length : ai - bi;
+    })
+    .slice(0, 40);
+  paletteIndex = Math.min(paletteIndex, Math.max(0, paletteItems.length - 1));
+  el.paletteList.innerHTML = paletteItems
+    .map((p, i) => {
+      const dir = p.split('/').slice(0, -1).join('/');
+      return `<li class="palette-item${i === paletteIndex ? ' active' : ''}" data-path="${esc(p)}">${
+        dir ? `<span class="p-dir">${esc(dir)}/</span>` : ''
+      }<span>${esc(p.split('/').pop())}</span></li>`;
+    })
+    .join('');
+  el.paletteList.querySelectorAll('.palette-item').forEach((li) => {
+    li.addEventListener('click', () => {
+      openFile(li.dataset.path);
+      closePalette();
+    });
+  });
+}
+
+el.paletteInput.addEventListener('input', () => {
+  paletteIndex = 0;
+  renderPalette(paletteItems.length ? [...paletteItems, ...Object.keys(S.files)] : Object.keys(S.files));
+});
+el.paletteInput.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    paletteIndex = Math.min(paletteItems.length - 1, paletteIndex + 1);
+    renderPalette(paletteItems);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    paletteIndex = Math.max(0, paletteIndex - 1);
+    renderPalette(paletteItems);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const pick = paletteItems[paletteIndex];
+    if (pick) {
+      openFile(pick);
+      closePalette();
+    }
+  }
+});
+el.palette.addEventListener('click', (e) => {
+  if (e.target === el.palette) closePalette();
+});
 
 /* ============================ 设置面板 ============================ */
 
@@ -785,17 +1165,18 @@ function fillSettings(config, presets) {
     opt.textContent = `${p.label}${p.model ? ` (${p.model})` : ''}`;
     sel.appendChild(opt);
   }
-  sel.value = config.provider ?? 'mock';
+  sel.value = config.provider ?? '';
   $('#cfg-model').value = config.model ?? '';
   $('#cfg-baseUrl').value = config.baseUrl ?? '';
   $('#cfg-apiKey').value = '';
   $('#cfg-apiKey').placeholder = config.apiKeySet ? '已保存（留空则不修改）' : 'sk-...';
-  $('#cfg-specDelayMs').value = config.specDelayMs ?? 320;
+  $('#cfg-specDelayMs').value = config.specDelayMs ?? 1000;
   $('#cfg-commitIdleMs').value = config.commitIdleMs ?? 900;
   $('#cfg-settleMs').value = config.settleMs ?? 1600;
   $('#cfg-intentThreshold').value = config.intentThreshold ?? 0.6;
   $('#cfg-autoCommit').checked = config.autoCommit !== false;
   $('#cfg-autoAdoptHigh').checked = Boolean(config.autoAdoptHigh);
+  $('#cfg-patchRetry').checked = config.patchRetry !== false;
 }
 
 $('#cfg-provider')?.addEventListener('change', (e) => {
@@ -829,13 +1210,15 @@ $('#cfg-save').addEventListener('click', async () => {
     intentThreshold: Number($('#cfg-intentThreshold').value),
     autoCommit: $('#cfg-autoCommit').checked,
     autoAdoptHigh: $('#cfg-autoAdoptHigh').checked,
+    patchRetry: $('#cfg-patchRetry').checked,
   };
   const key = $('#cfg-apiKey').value.trim();
   if (key) payload.apiKey = key;
   try {
     const res = await post('/api/config', payload);
-    toast(`已切换模型：${res.provider.name}${res.provider.ready ? '' : `（${res.provider.note}）`}`, 'ok', 4200);
+    setStatus('done', '设置已保存', res.provider?.ready ? '模型就绪' : res.provider?.note ?? '');
     el.modal.classList.add('hidden');
+    if (!res.provider?.ready) toast(`模型未就绪：${res.provider?.note}`, 'warn', 7000);
   } catch (err) {
     toast(`保存失败：${err.message}`, 'err');
   }
@@ -869,23 +1252,29 @@ function renderChips(chips) {
   }
 }
 
-/* ============================ 操作按钮 ============================ */
+/* ============================ 工具栏动作 ============================ */
 
-async function doRollback(versionId) {
+async function doVersion(direction, versionId) {
   try {
-    const res = await post('/api/rollback', versionId ? { versionId } : {});
-    if (!res.ok) toast(res.error ?? '无法回退', 'warn');
+    const res = await post('/api/rollback', { direction, versionId });
+    if (!res.ok) toast(res.error ?? '无法切换版本', 'warn', 4000);
   } catch (err) {
-    toast(`回退失败：${err.message}`, 'err');
+    toast(`版本切换失败：${err.message}`, 'err');
   }
 }
 
-el.btnRollback.addEventListener('click', () => doRollback());
+el.btnUndo.addEventListener('click', () => doVersion('back'));
+el.btnRedo.addEventListener('click', () => doVersion('forward'));
+
+el.viewToggle.addEventListener('click', (e) => {
+  const btn = e.target.closest('.seg-btn');
+  if (btn) setView(btn.dataset.view);
+});
+
 el.btnCommit.addEventListener('click', async () => {
   try {
     const res = await post('/api/commit', { reason: 'manual' });
-    if (res.promoted) toast('已直接采纳预演结果（没有重复调用模型）', 'ok');
-    else if (!res.ok) toast(res.error ?? '启动失败', 'warn');
+    if (!res.ok) toast(res.error ?? '启动失败', 'warn', 3000);
   } catch (err) {
     toast(`启动失败：${err.message}`, 'err');
   }
@@ -894,14 +1283,16 @@ el.btnCancel.addEventListener('click', () => post('/api/cancel').catch(() => {})
 el.btnRegenerate.addEventListener('click', async () => {
   try {
     const res = await post('/api/commit', { reason: 'force', force: true });
-    if (res.ok) toast('已忽略预演结果，强制重新生成', 'warn');
-    else toast(res.error ?? '启动失败', 'warn');
+    if (!res.ok) toast(res.error ?? '启动失败', 'warn', 3000);
   } catch (err) {
     toast(`启动失败：${err.message}`, 'err');
   }
 });
 el.btnSave.addEventListener('click', async () => {
-  if (!S.current) return toast('先选一个文件', 'warn', 1600);
+  if (!S.current) {
+    toast('先选一个文件', 'warn', 1600);
+    return;
+  }
   try {
     await post('/api/save', { path: S.current, content: S.files[S.current] ?? '' });
   } catch (err) {
@@ -909,23 +1300,30 @@ el.btnSave.addEventListener('click', async () => {
   }
 });
 
-document.addEventListener('keydown', (e) => {
-  if (e.altKey && e.key.toLowerCase() === 'z') {
-    e.preventDefault();
-    doRollback();
-  } else if (e.altKey && e.key === 'Enter') {
-    e.preventDefault();
-    el.btnCommit.click();
-  }
+el.btnThinkMode.addEventListener('click', () => {
+  S.thinkExpandAll = !S.thinkExpandAll;
+  LS.set('thinkExpand', S.thinkExpandAll);
+  el.btnThinkMode.textContent = `思考：${S.thinkExpandAll ? '展开' : '折叠'}`;
+  document.querySelectorAll('.think:not(.streaming)').forEach((t) => t.classList.toggle('collapsed', !S.thinkExpandAll));
 });
-
-window.addEventListener('beforeunload', () => {});
+el.btnRoundPrev.addEventListener('click', () => jumpRound(-1));
+el.btnRoundNext.addEventListener('click', () => jumpRound(1));
+el.btnHelp.addEventListener('click', () => el.helpModal.classList.remove('hidden'));
+$('#help-close').addEventListener('click', () => el.helpModal.classList.add('hidden'));
+el.helpModal.addEventListener('click', (e) => {
+  if (e.target === el.helpModal) el.helpModal.classList.add('hidden');
+});
 
 /* ============================ 启动 ============================ */
 
 (async function boot() {
+  applyTheme(S.theme);
+  S.view = LS.get('view', 'code');
+  el.btnThinkMode.textContent = `思考：${S.thinkExpandAll ? '展开' : '折叠'}`;
   connect();
   updateCounter();
+  renderUsage();
+  setStatus('idle', '正在连接…', '');
   try {
     const st = await get('/api/state');
     S.provider = st.provider;
@@ -933,28 +1331,22 @@ window.addEventListener('beforeunload', () => {});
     window.__sfConfig = st.config;
     renderProviderBadge();
     if (st.memory?.chips) renderChips(st.memory.chips);
+    if (st.versions) renderVersions(st.versions);
     const tree = await get('/api/tree');
-    for (const rel of tree.files ?? []) {
-      try {
-        const f = await get(`/api/file?path=${encodeURIComponent(rel)}`);
-        S.files[rel] = f.content;
-      } catch { /* ignore */ }
-    }
+    for (const rel of tree.files ?? []) await pullFile(rel);
     renderTree(tree.tree);
     updateWorkspaceStats();
-    const versions = await get('/api/versions');
-    renderVersions(versions.versions, versions.current);
     if (st.session?.prompt) {
       el.prompt.value = st.session.prompt;
       updateCounter();
     }
-    if (tree.files?.length) openFile(S.recent?.[0] ?? tree.files[0]);
+    if (tree.files?.length) openFile(st.workspace?.recent?.[0] ?? tree.files[0]);
+    setStatus('idle', '就绪', `${tree.files?.length ?? 0} 个文件 · 版本 ${st.session?.currentVersionId ?? 'v0'}`);
     if (st.provider && !st.provider.ready) {
-      toast(`模型未就绪：${st.provider.note} — 右上角「设置」里配置即可`, 'warn', 9000);
-    } else if (st.provider?.name === 'mock') {
-      toast('当前是内置演示模型（不耗额度）。接真实模型请在右上角「设置」里填 API Key。', 'ok', 7000);
+      toast(`模型未就绪：${st.provider.note} — 右上角「设置」里填写 API Key`, 'warn', 9000);
     }
   } catch (err) {
+    setStatus('err', '初始化失败', err.message);
     toast(`初始化失败：${err.message}`, 'err', 9000);
   }
 })();

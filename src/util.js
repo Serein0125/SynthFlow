@@ -72,6 +72,57 @@ export function diffLines(aText, bText) {
   return out;
 }
 
+/**
+ * 把完整行级 diff 压缩成"只保留变化行 + 少量上下文"的紧凑视图。
+ * 连续的未改动行会折叠成 { type: 'gap', count }，避免差异视图被淹没。
+ */
+export function compactDiff(diff, { context = 2, max = 500 } = {}) {
+  const keep = new Array(diff.length).fill(false);
+  diff.forEach((d, i) => {
+    if (d.type === 'same') return;
+    for (let j = Math.max(0, i - context); j <= Math.min(diff.length - 1, i + context); j += 1) keep[j] = true;
+  });
+  const out = [];
+  let gap = 0;
+  let lineNo = 0;
+  for (let i = 0; i < diff.length; i += 1) {
+    const d = diff[i];
+    if (!keep[i]) {
+      if (d.type !== 'del') lineNo += 1;
+      gap += 1;
+      continue;
+    }
+    if (gap) {
+      out.push({ type: 'gap', count: gap });
+      gap = 0;
+    }
+    if (d.type === 'del') {
+      out.push({ type: 'del', text: d.text });
+    } else {
+      lineNo += 1;
+      out.push({ type: d.type, text: d.text, ln: lineNo });
+    }
+    if (out.length >= max) {
+      out.push({ type: 'gap', count: Math.max(0, diff.length - i - 1) });
+      return out;
+    }
+  }
+  if (gap) out.push({ type: 'gap', count: gap });
+  return out;
+}
+
+/** 新文件里哪些行是本次新增的（1 基行号），用于在代码视图里标绿点。 */
+export function addedLineNumbers(diff) {
+  const out = [];
+  let lineNo = 0;
+  for (const d of diff) {
+    if (d.type === 'del') continue;
+    lineNo += 1;
+    if (d.type === 'ins') out.push(lineNo);
+  }
+  return out;
+}
+
 /** 归一化的相似度 0..1（字符 3-gram 的 Dice 系数，速度快、对中文友好、对"追加"不敏感）。 */
 export function similarity(aText, bText) {
   const a = String(aText ?? '');
@@ -186,7 +237,11 @@ export function ensureDir(dir) {
 
 export function readJsonSafe(file, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    // 去掉可能的 UTF-8 BOM：记事本、PowerShell 5.1 的 Set-Content 都会加，
+    // 而 JSON.parse 遇到 BOM 会直接抛错（曾经因此把用户配置读成空对象）。
+    const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim();
+    if (!raw) return fallback;
+    return JSON.parse(raw);
   } catch {
     return fallback;
   }

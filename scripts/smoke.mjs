@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { bytesToHuman, changedSpan, diffLines, ensureDir, sha1, similarity } from '../src/util.js';
+import { addedLineNumbers, bytesToHuman, changedSpan, compactDiff, diffLines, ensureDir, readJsonSafe, sha1, similarity } from '../src/util.js';
 import { createProtocolParser, parseFilePayload, stripFence } from '../src/protocol.js';
 import { Workspace, locateBlock } from '../src/workspace.js';
 import { Session, analyzeIntent, decidePromptChange } from '../src/session.js';
@@ -68,6 +68,26 @@ await test('changedSpan 识别尾部追加与中间改写', () => {
   assert.equal(mid.isAppend, false);
   assert.equal(mid.removed, '登录');
   assert.equal(mid.added, '注册');
+});
+
+await test('compactDiff 只保留变化行并折叠上下文', () => {
+  const before = Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n');
+  const after = before.replace('line 20', 'line 20 changed');
+  const d = diffLines(before, after);
+  const c = compactDiff(d, { context: 2 });
+  assert.ok(c.length < 10, `压缩后应很短，实际 ${c.length}`);
+  assert.ok(c.some((x) => x.type === 'gap'), '未改动区域应折叠成 gap');
+  assert.equal(c.filter((x) => x.type === 'ins').length, 1);
+  assert.equal(c.filter((x) => x.type === 'del').length, 1);
+  const ins = c.find((x) => x.type === 'ins');
+  assert.equal(ins.ln, 21, '新增行应带新文件行号');
+});
+
+await test('addedLineNumbers 给出新文件里的新增行号', () => {
+  const d = diffLines('a\nb\nc', 'a\nx\ny\nc');
+  assert.deepEqual(addedLineNumbers(d), [2, 3]);
+  assert.deepEqual(addedLineNumbers(diffLines('a\nb', 'a\nb')), []);
+  assert.deepEqual(addedLineNumbers(diffLines('a\nb\nc', 'a\nc')), []);
 });
 
 /* ============================ 2. 流协议 ============================ */
@@ -306,20 +326,52 @@ await test('提交产生版本，回退恢复文件与提示词', () => {
   const snap2 = ws2.snapshot({ label: 'v2' });
   sess.recordCommit({ runId: 'r2', promptBefore: promptBefore, promptAfter: sess.prompt, files: ['src/x.js', 'src/extra.js'], summary: '增量续写', snapshotId: snap2.id });
   assert.equal(sess.versions.length, 3);
+  assert.equal(sess.activeIndex, 2);
 
-  const res = sess.rollback();
+  const res = sess.moveVersion('back');
   assert.equal(res.ok, true);
   assert.equal(ws2.read('src/x.js').content, 'v1', '文件应回到上一版本');
   assert.equal(ws2.exists('src/extra.js'), false, '上一轮新建的文件应被移除');
   assert.equal(sess.prompt, promptBefore, '提示词应回到这句话没输入时的状态');
-  assert.equal(sess.versions.length, 2);
+  assert.equal(sess.versions.length, 3, 'v2 的版本记录应保留（这样才能前进回去）');
+  assert.equal(sess.activeIndex, 1);
+  assert.equal(sess.canForward, true, '此时应该可以前进');
   assert.equal(sess.stats.rollbacks, 1);
 });
 
-await test('回退后再次提交可正常推进版本号', () => {
-  const snap = ws2.snapshot({ label: 'v1-again' });
-  const v = sess.recordCommit({ runId: 'r3', promptBefore: sess.prompt, promptAfter: sess.prompt, files: [], summary: '再来一次', snapshotId: snap.id });
-  assert.equal(v.id, `v${sess.versions.length - 1}`);
+await test('想法 9：回退之后还能前进回刚才的版本', () => {
+  const s = Session.load(sess.file, { workspace: ws2, config: {} }) ?? sess;
+  assert.equal(s.activeIndex, 1, '存档里的游标应保持在 v1');
+  const res = s.moveVersion('forward');
+  assert.equal(res.ok, true);
+  assert.equal(res.activeVersionId, 'v2');
+  assert.equal(ws2.exists('src/extra.js'), true, 'v2 的文件应该回来');
+  assert.equal(ws2.read('src/x.js').content, 'v2');
+  assert.match(s.prompt, /导出按钮/, '提示词也应跟着前进');
+  assert.equal(s.canForward, false);
+  assert.equal(s.canBack, true);
+  // 再回退一次，确认可反复往返
+  s.moveVersion('back');
+  assert.equal(s.activeVersionId, 'v1');
+  s.moveVersion('forward');
+  assert.equal(s.activeVersionId, 'v2');
+});
+
+await test('想法 9：在历史版本上继续生成会丢弃右侧分支并告知', () => {
+  const s = sess;
+  s.moveVersion('back');
+  assert.equal(s.activeVersionId, 'v1');
+  assert.equal(s.versions.length, 3);
+  const snap = ws2.snapshot({ label: 'branch' });
+  const rec = s.recordCommit({ runId: 'r-branch', promptBefore: s.prompt, promptAfter: s.prompt, files: [], summary: '另起一版', snapshotId: snap.id });
+  assert.equal(rec.droppedBranches, 1, '应报告丢弃了 1 个分支');
+  assert.equal(s.versions.length, 3, 'v0 + v1 + 新版本');
+  assert.notEqual(rec.id, 'v2', `版本号必须单调递增避免撞号，实际 ${rec.id}`);
+});
+
+await test('版本号在回退后仍然单调递增，不会覆盖历史 id', () => {
+  const ids = sess.versions.map((v) => v.id);
+  assert.equal(new Set(ids).size, ids.length, `版本 id 不应重复: ${ids.join(', ')}`);
 });
 
 /* ============================ 7. RAG / 记忆 ============================ */
@@ -400,16 +452,18 @@ const waitFor = async (pred, ms = 20000, label = 'condition') => {
 
 await test('定时参数缺失/非法时不会退化成"立即提交"', () => {
   const t = normalizeTiming({});
-  assert.equal(t.specDelayMs, 320);
+  assert.equal(t.specDelayMs, 1000, '预演延迟默认 1s（v2 起调高，避免逐字起跑）');
   assert.equal(t.commitIdleMs, 900);
   assert.equal(t.settleMs, 1600);
   assert.equal(t.intentThreshold, 0.6);
   const bad = normalizeTiming({ specDelayMs: null, commitIdleMs: 'abc', settleMs: undefined, intentThreshold: 99, autoCommit: undefined });
-  assert.equal(bad.specDelayMs, 320, 'null 必须回落到默认值');
+  assert.equal(bad.specDelayMs, 1000, 'null 必须回落到默认值');
   assert.equal(bad.commitIdleMs, 900, 'NaN 必须回落到默认值');
   assert.equal(bad.settleMs, 1600, 'undefined 必须回落到默认值');
   assert.equal(bad.intentThreshold, 0.6, '越界阈值必须回落到默认值');
   assert.equal(bad.autoCommit, true);
+  assert.equal(normalizeTiming({ patchRetry: false }).patchRetry, false, 'patchRetry=false 必须被尊重');
+  assert.equal(normalizeTiming({}).patchRetry, true, 'patchRetry 默认开启');
   // 反例：如果这里拿到 undefined，setTimeout(fn, undefined) 会在 0ms 立即执行
   assert.ok(Number.isFinite(normalizeTiming({}).settleMs));
 });
@@ -462,13 +516,136 @@ await test('追加需求 → 走增量补丁，不改动其它文件', async () 
 });
 
 await test('一键回退 → 回到上一句话之前的版本', async () => {
-  const mainBeforeRollback = runWs.read('src/main.js').content;
-  assert.match(mainBeforeRollback, /增量新增/);
+  const beforeRollback = runWs.read('src/main.js').content;
+  assert.match(beforeRollback, /增量新增/);
+  const activeBefore = runSess.activeVersionId;
   const res = runner.rollback();
   assert.equal(res.ok, true);
   const restored = runWs.read('src/main.js').content;
   assert.doesNotMatch(restored, /增量新增/, '增量内容应被回退掉');
   assert.equal(runSess.prompt, '帮我写一个后台管理系统，包含用户列表、搜索和分页。', '提示词也应回退');
+  assert.notEqual(runSess.activeVersionId, activeBefore);
+  assert.equal(runSess.canForward, true, '应该可以再前进回去');
+});
+
+await test('回退之后能前进回刚才的版本（想法 9）', async () => {
+  const res = runner.moveVersion('forward');
+  assert.equal(res.ok, true);
+  assert.match(runWs.read('src/main.js').content, /增量新增/, 'v2 的增量内容应该回来');
+  assert.match(runSess.prompt, /导出按钮/, '提示词也应前进');
+  // 事件里必须带上 canForward/canBack，界面才能正确禁用按钮
+  const v = events.filter((e) => e.name === 'versions').pop();
+  assert.equal(typeof v.payload.canForward, 'boolean');
+  assert.equal(typeof v.payload.activeVersionId, 'string');
+});
+
+await test('补丁未命中会自动重试一次（用桩 provider 强制失败）', async () => {
+  const retryRoot = path.join(TMP, 'retryws');
+  fs.rmSync(retryRoot, { recursive: true, force: true });
+  const rws = new Workspace(retryRoot, { storeDir: path.join(TMP, 'retrystore') });
+  const rsess = new Session({ workspace: rws, config: {} });
+  const revents = [];
+  const cfg2 = { ...cfg, patchRetry: true, autoCommit: false };
+  const rmem = new Memory(path.join(TMP, 'retrystore'));
+  const rr = new Runner({ session: rsess, workspace: rws, rag: new RagIndex(rws), memory: rmem, config: cfg2, emit: (n, p) => revents.push({ name: n, payload: p }) });
+
+  rws.applyOp({ path: 'src/a.js', mode: 'create', content: 'const a = 1;\nconst b = 2;\n' });
+
+  let call = 0;
+  rr.provider = {
+    name: 'stub',
+    label: '桩',
+    ready: true,
+    note: '',
+    async *stream() {
+      call += 1;
+      if (call === 1) {
+        // 第一次：SEARCH 与实际文件完全不符 → 必然未命中
+        yield { type: 'delta', text: '<<<SF file path="src/a.js" action="update">>>\n<<<<<<< SEARCH\nconst zzz = 999;\n=======\nconst zzz = 0;\n>>>>>>> REPLACE\n<<<SF /file>>>\n' };
+      } else {
+        // 第二次（重试）：给出正确补丁
+        yield { type: 'delta', text: '<<<SF file path="src/a.js" action="update">>>\n<<<<<<< SEARCH\nconst b = 2;\n=======\nconst b = 22;\n>>>>>>> REPLACE\n<<<SF /file>>>\n' };
+      }
+    },
+  };
+
+  rsess.setPrompt('把 b 改成 22。');
+  await rr.commit({ reason: 'test' });
+  await waitFor(() => revents.some((e) => e.name === 'run:done') && !rr.busy, 15000, '重试完成');
+  await sleep(150);
+  assert.ok(revents.some((e) => e.name === 'retry'), '应该发出 retry 事件');
+  assert.equal(call, 2, `应该恰好调用模型两次，实际 ${call}`);
+  assert.match(rws.read('src/a.js').content, /const b = 22;/, '重试后的正确补丁应该落盘');
+  assert.equal(rr.busy, false);
+});
+
+await test('建议在本轮结束后才弹出（想法 6）', async () => {
+  const sRoot = path.join(TMP, 'sugws');
+  fs.rmSync(sRoot, { recursive: true, force: true });
+  const sws = new Workspace(sRoot, { storeDir: path.join(TMP, 'sugstore') });
+  const ssess = new Session({ workspace: sws, config: {} });
+  const sev = [];
+  const srr = new Runner({
+    session: ssess,
+    workspace: sws,
+    rag: new RagIndex(sws),
+    memory: new Memory(path.join(TMP, 'sugstore')),
+    config: { ...cfg, autoCommit: false },
+    emit: (n, p) => sev.push({ name: n, payload: p }),
+  });
+  srr.provider = {
+    name: 'stub', label: '桩', ready: true, note: '',
+    async *stream() {
+      yield { type: 'delta', text: '<<<SF think>>>\n先想一下\n<<<SF /think>>>\n' };
+      yield { type: 'delta', text: '<<<SF file path="src/s.js" action="create">>>\nconst s = 1;\n<<<SF /file>>>\n' };
+      yield { type: 'delta', text: '<<<SF suggest kind="optimize" title="建议A" impact="low" insert="A">>\nbody A\n<<<SF /suggest>>>\n' };
+      yield { type: 'delta', text: '<<<SF suggest kind="risk" title="建议B" impact="high" insert="B">>\nbody B\n<<<SF /suggest>>>\n' };
+    },
+  };
+  ssess.setPrompt('写个小文件。');
+  await srr.commit({ reason: 'test' });
+  await waitFor(() => sev.some((e) => e.name === 'run:done') && !srr.busy, 15000, '完成');
+  await sleep(100);
+
+  const idxApplied = sev.findIndex((e) => e.name === 'run:applied');
+  const idxSuggest = sev.findIndex((e) => e.name === 'suggest');
+  assert.ok(idxApplied >= 0, '应有 run:applied');
+  assert.ok(idxSuggest > idxApplied, `建议必须在本轮落盘之后才推给用户（applied=${idxApplied}, suggest=${idxSuggest}）`);
+  const sugs = sev.filter((e) => e.name === 'suggest').map((e) => e.payload.suggestion);
+  assert.equal(sugs.length, 2, '增量/正式生成也必须给出建议（提示词里已强制要求）');
+  assert.equal(sugs[0].impact, 'high', '建议应按影响度排序，高的在前');
+  assert.ok(sev.filter((e) => e.name === 'suggest').every((e) => e.payload.batch === true), '正式生成的建议应标记为批量推送');
+});
+
+await test('补丁重试可被关闭（patchRetry=false）', async () => {
+  const offRoot = path.join(TMP, 'noretryws');
+  fs.rmSync(offRoot, { recursive: true, force: true });
+  const ows = new Workspace(offRoot, { storeDir: path.join(TMP, 'noretrystore') });
+  const osess = new Session({ workspace: ows, config: {} });
+  const oevents = [];
+  const orr = new Runner({
+    session: osess,
+    workspace: ows,
+    rag: new RagIndex(ows),
+    memory: new Memory(path.join(TMP, 'noretrystore')),
+    config: { ...cfg, patchRetry: false, autoCommit: false },
+    emit: (n, p) => oevents.push({ name: n, payload: p }),
+  });
+  ows.applyOp({ path: 'src/a.js', mode: 'create', content: 'const a = 1;\n' });
+  let calls = 0;
+  orr.provider = {
+    name: 'stub', label: '桩', ready: true, note: '',
+    async *stream() {
+      calls += 1;
+      yield { type: 'delta', text: '<<<SF file path="src/a.js" action="update">>>\n<<<<<<< SEARCH\nNOPE\n=======\nX\n>>>>>>> REPLACE\n<<<SF /file>>>\n' };
+    },
+  };
+  osess.setPrompt('随便改点什么。');
+  await orr.commit({ reason: 'test' });
+  await waitFor(() => oevents.some((e) => e.name === 'run:done') && !orr.busy, 15000, '完成');
+  await sleep(150);
+  assert.equal(calls, 1, '关闭后不应重试');
+  assert.ok(!oevents.some((e) => e.name === 'retry'));
 });
 
 await test('采纳建议后自动跟进生成', async () => {
@@ -491,13 +668,32 @@ let app = null;
 let port = 0;
 
 await test('服务能启动并响应 /api/health', async () => {
-  app = createServer({ projectRoot: HTTP_ROOT, port: 0, log: () => {} });
+  // providerOverride: 'mock' —— 测试必须显式指定离线模型，默认已经改成真实服务商（未配置时不可用）
+  app = createServer({ projectRoot: HTTP_ROOT, port: 0, log: () => {}, providerOverride: 'mock' });
   const addr = await app.listen();
   port = addr.port;
   assert.ok(port > 0);
   const health = await fetch(`http://127.0.0.1:${port}/api/health`).then((r) => r.json());
   assert.equal(health.ok, true);
   assert.equal(health.workspace, path.join(HTTP_ROOT, 'workspace'));
+  const st = await fetch(`http://127.0.0.1:${port}/api/state`).then((r) => r.json());
+  assert.equal(st.provider.name, 'mock');
+  assert.equal(st.provider.ready, true);
+  assert.ok(Object.keys(st.presets).includes('deepseek'), '应保留真实服务商预设');
+});
+
+await test('默认（不带 --provider mock）时界面不再暴露内置演示模型', async () => {
+  const probeRoot = path.join(TMP, 'probe');
+  fs.rmSync(probeRoot, { recursive: true, force: true });
+  ensureDir(probeRoot);
+  const probe = createServer({ projectRoot: probeRoot, port: 0, log: () => {} });
+  const addr = await probe.listen();
+  const st = await fetch(`http://127.0.0.1:${addr.port}/api/state`).then((r) => r.json());
+  assert.ok(!Object.keys(st.presets).includes('mock'), `界面预设里不应再出现 mock，实际: ${Object.keys(st.presets).join(',')}`);
+  assert.equal(st.provider.name, 'deepseek', '默认应指向真实服务商');
+  assert.equal(st.provider.ready, false, '没配 Key 时应明确标记为未就绪');
+  assert.match(st.provider.note, /apiKey|baseUrl|model/i, '未就绪时必须说明缺什么');
+  await probe.close();
 });
 
 await test('静态前端可访问', async () => {
@@ -573,12 +769,15 @@ await test('打字即上报：一次 complete 输入触发完整生成', async (
 
 await test('意图判定事件带分数与理由（想法 6）', async () => {
   const intents = sseEvents.filter((e) => e.name === 'intent').map((e) => e.data);
-  assert.ok(intents.length >= 3);
+  // v2 起服务端对 intent 事件做了 ~90ms 合并（想法 8：不要逐字抖动），
+  // 所以事件数量会明显少于输入次数——但"最后一次"必须完整送达。
+  assert.ok(intents.length >= 1, `应至少收到一次意图判定，实际 ${intents.length}`);
   const last = intents[intents.length - 1];
   assert.ok(last.intent.score >= 0.6, `最后一条应判为完整，实际 ${last.intent.score}`);
   assert.equal(last.intent.complete, true);
   assert.ok(last.intent.reasons.length > 0);
   assert.ok(['regenerate', 'continue', 'incremental', 'noop'].includes(last.decision.mode), `mode=${last.decision.mode}`);
+  assert.equal(typeof last.intent.signals.length, 'number', '应带上判定信号，界面上要显示"为什么"');
 });
 
 await test('REST：读文件 / 保存 / 版本 / 记忆 / 检索 / 设置', async () => {
@@ -616,16 +815,42 @@ await test('REST：读文件 / 保存 / 版本 / 记忆 / 检索 / 设置', asyn
   assert.ok(ctx.segments.length >= 1);
 });
 
-await test('HTTP 回退：文件与提示词一起回滚', async () => {
+await test('HTTP 回退与前进：文件、提示词、游标一起动', async () => {
   const before = await fetch(`http://127.0.0.1:${port}/api/versions`).then((r) => r.json());
-  const rollback = await fetch(`http://127.0.0.1:${port}/api/rollback`, {
+  assert.equal(typeof before.activeVersionId, 'string');
+  assert.equal(before.canBack, true, '应有可回退的历史');
+
+  const rb = await fetch(`http://127.0.0.1:${port}/api/rollback`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({}),
+    body: JSON.stringify({ direction: 'back' }),
   }).then((r) => r.json());
-  assert.equal(rollback.ok, true);
-  const after = await fetch(`http://127.0.0.1:${port}/api/versions`).then((r) => r.json());
-  assert.ok(after.versions.length < before.versions.length);
+  assert.equal(rb.ok, true);
+  assert.equal(rb.direction, 'back');
+
+  const mid = await fetch(`http://127.0.0.1:${port}/api/versions`).then((r) => r.json());
+  assert.equal(mid.versions.length, before.versions.length, '版本记录应保留，否则没法前进回去');
+  assert.equal(mid.canForward, true, '回退后应可前进');
+  assert.notEqual(mid.activeVersionId, before.activeVersionId);
+
+  const fw = await fetch(`http://127.0.0.1:${port}/api/rollback`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ direction: 'forward' }),
+  }).then((r) => r.json());
+  assert.equal(fw.ok, true);
+  assert.equal(fw.activeVersionId, before.activeVersionId, '前进应回到原来的版本');
+
+  const again = await fetch(`http://127.0.0.1:${port}/api/rollback`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ direction: 'forward' }),
+  }).then((r) => r.json());
+  assert.equal(again.ok, false, '已经在最新版时应拒绝并给出原因');
+  assert.ok(again.error);
+
+  const health = await fetch(`http://127.0.0.1:${port}/api/health`).then((r) => r.json());
+  assert.equal(health.ok, true, '服务应仍然存活');
 });
 
 await test('未知接口返回 404 而不是崩溃', async () => {
@@ -661,7 +886,7 @@ await test('app.js 的 el.* 字段都在 el 对象里声明过', () => {
   const block = appJs.match(/const el = \{([\s\S]*?)\n\};/);
   assert.ok(block, '找不到 el 对象声明');
   const declared = new Set([...block[1].matchAll(/(\w+):/g)].map((m) => m[1]));
-  const used = new Set([...appJs.matchAll(/\bel\.(\w+)\b/g)].map((m) => m[1]));
+  const used = new Set([...appJs.matchAll(/(?<![\w.])el\.(\w+)\b/g)].map((m) => m[1]));
   const missing = [...used].filter((k) => !declared.has(k));
   assert.deepEqual(missing, [], `el 对象缺少字段: ${missing.join(', ')}`);
 });
@@ -675,6 +900,12 @@ await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
     '.kind-clarify', '.kind-optimize', '.kind-risk', '.opblock', '.opblock-head', '.opblock-body',
     '.intent-bar', '.intent-fill', '.chip', '.chips', '.toast', '.modal', '.form-grid',
     '.d-ins', '.d-del', '.tok-key', '.tok-str', '.tok-com', '.badge', '.btn', '.muted', '.empty',
+    // v2 新增
+    '.seg', '.seg-btn', '.seg-badge', '.run-body', '.run-idx', '.run-mode', '.run-time',
+    '.run-files', '.run-collapse', '.anchor-flash', '.think-summary', '.think.collapsed',
+    '.suggestion-batch', '.kbd-hint', '.statusbar', '.status-dot', '.status-text',
+    '.palette-card', '.palette-input', '.palette-list', '.palette-item', '.keys', 'kbd',
+    '.switches', '.btn.tiny', '.ln', '.mark-added', '.no-diff', '.btn.icon-btn',
   ];
   const missing = critical.filter((sel) => {
     const base = sel.split(' ').pop();
@@ -682,6 +913,22 @@ await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
   });
   assert.deepEqual(missing, [], `styles.css 缺少: ${missing.join(', ')}`);
   assert.match(stylesCss, /\.hidden\s*\{[^}]*display:\s*none\s*!important/, '.hidden 必须是 display:none !important');
+  assert.match(stylesCss, /\[data-theme="light"\]/, '必须提供亮色主题');
+  // 亮色主题要能生效，前提是"半透明白"这类颜色都被抽成了令牌
+  for (const token of ['--hover', '--hover-strong', '--inset-top', '--veil', '--veil-grad-a', '--veil-grad-b']) {
+    assert.ok(new RegExp(`${token}\\s*:`).test(stylesCss), `:root 缺少令牌 ${token}`);
+    assert.ok((stylesCss.match(new RegExp(`var\\(${token}\\)`, 'g')) ?? []).length >= 1, `令牌 ${token} 没有被使用`);
+  }
+});
+
+await test('亮色主题覆盖了全部关键令牌，不会出现"白底白字"', () => {
+  const light = stylesCss.match(/\[data-theme="light"\]\s*\{([\s\S]*?)\n\}/);
+  assert.ok(light, '找不到 [data-theme="light"] 令牌块');
+  const body = light[1];
+  for (const token of ['--bg-0', '--bg-1', '--bg-2', '--text-0', '--text-1', '--text-2', '--text-3', '--border', '--accent', '--hover', '--veil', '--sh-1', '--tok-key', '--tok-var']) {
+    assert.ok(new RegExp(`${token}\\s*:`).test(body), `亮色主题缺少 ${token}`);
+  }
+  assert.match(stylesCss, /color-scheme:\s*light/, '亮色主题应声明 color-scheme: light');
 });
 
 await test('index.html 引入的资源都能被服务端路由到', () => {
@@ -702,33 +949,195 @@ await test('app.js 是纯浏览器可用语法（无 import / require / TS 注�
 await test('语法高亮器（直接跑 app.js 里的真实实现）', () => {
   // 把 app.js 中自包含的高亮相关源码切出来，在 Node 里执行，验证的是真正会上线的代码。
   const start = appJs.indexOf('const esc = ');
-  const end = appJs.indexOf('/* ============================ 渲染：文件树');
+  const end = appJs.indexOf('/* ============================ 文件树');
   assert.ok(start > 0 && end > start, '找不到高亮器源码区间');
   const src = appJs.slice(start, end);
-  const { highlight } = new Function(`${src}\nreturn { highlight };`)();
+  const { highlightLines } = new Function(`${src}\nreturn { highlightLines };`)();
+  const hl = (code, lang) => highlightLines(code, lang).join('\n');
 
-  const js = highlight('// 注释\nconst a = 1;\nfunction f() { return "x"; }', 'javascript');
+  const js = hl('// 注释\nconst a = 1;\nfunction f() { return "x"; }', 'javascript');
   assert.match(js, /tok-com/, '注释应高亮');
   assert.match(js, /tok-key/, '关键字应高亮');
   assert.match(js, /tok-num/, '数字应高亮');
   assert.match(js, /tok-str/, '字符串应高亮');
 
-  const css = highlight(':root { --bg: #0f1115; }', 'css');
+  // 逐行输出必须保持行数一致，否则"本轮新增行标绿点"会整体错位
+  const code = 'const a = 1;\n/* 多行\n   注释 */\nconst b = `模板\n字符串`;\n';
+  const lines = highlightLines(code, 'javascript');
+  assert.equal(lines.length, code.split('\n').length, '逐行高亮必须与原文行数一一对应');
+  assert.ok(lines.every((l) => !/<\/?span[^>]*$/.test(l) || true));
+
+  const css = hl(':root { --bg: #0f1115; }', 'css');
   assert.match(css, /tok-key|tok-num/, 'CSS 变量/颜色应高亮');
 
-  const md = highlight('# 标题\n- 列表\n`code`', 'markdown');
+  const md = hl('# 标题\n- 列表\n`code`', 'markdown');
   assert.match(md, /tok-/, 'Markdown 应有高亮输出');
 
   // 安全：高亮前必须转义，否则生成出来的代码会把工作台自己 XSS 掉
-  const dangerous = highlight('const s = "<img src=x onerror=alert(1)>";', 'javascript');
+  const dangerous = hl('const s = "<img src=x onerror=alert(1)>";', 'javascript');
   assert.doesNotMatch(dangerous, /<img/, '必须转义 HTML');
   assert.match(dangerous, /&lt;img/, '应当输出转义后的实体');
 
-  // 中文与超长输入不能崩
-  const cn = highlight('const 标题 = "中文注释测试";'.repeat(400), 'javascript');
+  const cn = hl('const 标题 = "中文注释测试";'.repeat(400), 'javascript');
   assert.ok(cn.length > 1000);
-  assert.match(highlight('', 'text'), /^$/);
-  assert.match(highlight('普通文本', 'text'), /普通文本/);
+  assert.deepEqual(highlightLines('', 'text'), ['']);
+  assert.match(hl('普通文本', 'text'), /普通文本/);
+});
+
+await test('配置读取能容忍 BOM 与空文件（记事本/PowerShell 会写 BOM）', () => {
+  const dir = path.join(TMP, 'bomtest');
+  fs.rmSync(dir, { recursive: true, force: true });
+  ensureDir(dir);
+  const withBom = path.join(dir, 'config.json');
+  fs.writeFileSync(withBom, `\uFEFF${JSON.stringify({ provider: 'deepseek', apiKey: 'sk-test-123' })}`, 'utf8');
+  const parsed = readJsonSafe(withBom, {});
+  assert.equal(parsed.apiKey, 'sk-test-123', 'BOM 不应导致配置被读成空对象');
+  assert.equal(parsed.provider, 'deepseek');
+
+  const empty = path.join(dir, 'empty.json');
+  fs.writeFileSync(empty, '', 'utf8');
+  assert.deepEqual(readJsonSafe(empty, { fallback: true }), { fallback: true });
+
+  const broken = path.join(dir, 'broken.json');
+  fs.writeFileSync(broken, '{ not json', 'utf8');
+  assert.deepEqual(readJsonSafe(broken, { fallback: true }), { fallback: true }, '坏文件必须回落到默认值而不是抛错');
+});
+
+await test('app.js 能在最小 DOM 上真正启动，并且事件处理不抛异常', async () => {
+  // 无头浏览器在本机不稳定，所以这里用一个最小 DOM 垫片把 app.js 真跑一遍：
+  // 能抓住"某个 id 拼错 / 某个变量未定义 / boot 逻辑抛错"这类白屏级问题。
+  const made = [];
+  const memo = new Map();
+  const mkEl = (tag = 'div') => {
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      id: '',
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      checked: false,
+      disabled: false,
+      title: '',
+      style: {},
+      dataset: {},
+      children: [],
+      scrollTop: 0,
+      scrollHeight: 100,
+      clientHeight: 100,
+      classList: {
+        add() {}, remove() {}, toggle() {}, contains() { return false; },
+      },
+      appendChild(c) { node.children.push(c); return c; },
+      insertAdjacentHTML() {},
+      removeAttribute() {},
+      setAttribute() {},
+      addEventListener() {},
+      removeEventListener() {},
+      remove() {},
+      focus() {},
+      click() {},
+      scrollIntoView() {},
+      closest() { return null; },
+      querySelector() { return mkEl(); },
+      querySelectorAll() { return []; },
+      getContext() { return {}; },
+    };
+    made.push(node);
+    return node;
+  };
+  const doc = {
+    documentElement: mkEl('html'),
+    addEventListener() {},
+    createElement: (t) => mkEl(t),
+    querySelector(sel) {
+      if (!memo.has(sel)) memo.set(sel, mkEl());
+      return memo.get(sel);
+    },
+    querySelectorAll() { return []; },
+  };
+  const win = new EventTarget();
+  win.matchMedia = () => ({ matches: false, addEventListener() {} });
+  const store = new Map();
+  const localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+  };
+  class FakeEventSource {
+    constructor() { this.listeners = {}; }
+    addEventListener() {}
+    close() {}
+  }
+  const apiData = {
+    '/api/state': {
+      provider: { name: 'mock', label: '内置演示', ready: true, note: '', model: 'demo' },
+      presets: { deepseek: { label: 'DeepSeek', baseUrl: 'x', model: 'y', needsKey: true } },
+      config: { provider: 'mock', specDelayMs: 1000, commitIdleMs: 900, settleMs: 1600, intentThreshold: 0.6, autoCommit: true, patchRetry: true },
+      memory: { chips: [{ text: '加错误处理', count: 3 }], runs: [] },
+      versions: { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }], activeVersionId: 'v0', canBack: false, canForward: false },
+      session: { prompt: '', currentVersionId: 'v0', stats: { modelCalls: 3, estTokens: 4200 } },
+      workspace: { files: 0, bytes: 0, recent: [] },
+      busy: false,
+    },
+    '/api/tree': { tree: { name: 'workspace', path: '', type: 'dir', children: [] }, files: [], bytes: 0, human: '0 B' },
+    '/api/versions': { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }], activeVersionId: 'v0', canBack: false, canForward: false },
+    '/api/context': { prompt: '', segments: [], stats: {}, versions: [] },
+  };
+  const fakeFetch = async (url) => {
+    const key = String(url).split('?')[0];
+    const data = apiData[key] ?? {};
+    return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) };
+  };
+  const raf = (cb) => setTimeout(cb, 0);
+
+  const factory = new Function(
+    'document', 'window', 'localStorage', 'EventSource', 'fetch', 'requestAnimationFrame', 'setTimeout', 'clearTimeout', 'console',
+    `${appJs}\n//# sourceURL=synthflow-app.js`,
+  );
+  let bootError = null;
+  try {
+    factory(doc, win, localStorage, FakeEventSource, fakeFetch, raf, setTimeout, clearTimeout, console);
+  } catch (err) {
+    bootError = err;
+  }
+  assert.equal(bootError, null, `app.js 顶层执行就抛错了：${bootError?.stack ?? ''}`);
+  await sleep(120); // 等 boot() 的异步流程跑完
+
+  const statusText = memo.get('#status-text')?.textContent ?? '';
+  assert.notEqual(statusText, '初始化失败', '前端启动失败了（statusbar 显示初始化失败）');
+  assert.equal(statusText, '就绪', `启动后状态栏应为"就绪"，实际「${statusText}」`);
+  assert.match(memo.get('#provider-badge')?.textContent ?? '', /内置演示/, '模型徽标应已渲染');
+  assert.ok(made.length > 5, `DOM 应该被真实创建过，实际只有 ${made.length} 个节点`);
+
+  // 再喂几个真实的 SSE 事件，确认处理链路不抛异常
+  const fire = (name, detail) => win.dispatchEvent(new CustomEvent(`sf:${name}`, { detail }));
+  let handlerError = null;
+  try {
+    fire('intent', { intent: { score: 0.72, complete: true, reasons: ['以句末标点结束'], signals: { length: 20 } }, decision: { mode: 'regenerate', ratio: 1 }, prompt: '写个登录页。', promptChars: 6 });
+    fire('run:start', { runId: 'r1', kind: 'spec', mode: 'regenerate', provider: 'mock', label: '演示' });
+    fire('think:delta', { runId: 'r1', delta: '先想一下……' });
+    fire('think:end', { runId: 'r1', text: '先想一下' });
+    fire('suggest', { runId: 'r1', suggestion: { id: 's1', kind: 'risk', title: 'XSS', body: '正文', impact: 'high', insert: '要转义' }, draft: true });
+    fire('file:start', { runId: 'r1', path: 'src/a.js', action: 'create', lang: 'js' });
+    fire('file:delta', { runId: 'r1', path: 'src/a.js', delta: 'const a = 1;\n' });
+    fire('file:end', { runId: 'r1', op: { path: 'src/a.js', action: 'create', mode: 'create', lang: 'js', content: 'const a = 1;\n' } });
+    fire('tree', { tree: { name: 'w', path: '', type: 'dir', children: [{ name: 'a.js', path: 'src/a.js', type: 'file', size: 12 }] } });
+    fire('versions', { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }, { id: 'v1', kind: 'turn', summary: '生成 1 个文件', files: ['src/a.js'] }], activeVersionId: 'v1', canBack: true, canForward: false });
+    fire('run:applied', { runId: 'r1', results: [{ path: 'src/a.js', ok: true, mode: 'patch', compact: [{ type: 'ins', text: 'const a = 1;', ln: 1 }], addedLines: [1] }], files: ['src/a.js'] });
+    fire('run:done', { runId: 'r1', kind: 'commit', ms: 1234, mode: 'continue', files: ['src/a.js'], versionId: 'v1', usage: { tokens: 1500, real: true } });
+    fire('state', apiData['/api/state']);
+  } catch (err) {
+    handlerError = err;
+  }
+  await sleep(60);
+  assert.equal(handlerError, null, `SSE 事件处理抛错了：${handlerError?.stack ?? ''}`);
+  assert.ok(memo.get('#stream-body').children.length > 0, 'run:start 之后应该在流里创建"轮次块"');
+  const usageText = memo.get('#usage')?.textContent ?? '';
+  assert.match(usageText, /1\.5k/, `本轮的 token 数应显示出来，实际「${usageText}」`);
+  assert.match(usageText, /3 次调用/, `累计调用次数应来自服务端 stats，实际「${usageText}」`);
+  assert.match(usageText, /4\.2k tokens/, `累计 token 应来自服务端 stats，实际「${usageText}」`);
+  assert.match(memo.get('#intent-text')?.textContent ?? '', /已写完/, '意图判定文案应更新');
+  assert.match(memo.get('#status-text')?.textContent ?? '', /已写入/, '状态栏应显示本轮结果');
 });
 
 /* ============================ 11. 基准（可选） ============================ */

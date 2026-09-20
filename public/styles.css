@@ -7,6 +7,8 @@
    01. 设计令牌（调色板 / 尺寸 / 圆角 / 阴影）
    -------------------------------------------------------------------------- */
 :root {
+  color-scheme: dark;
+
   /* 背景层次：越靠上层越亮 */
   --bg-0: #0b0d11;
   --bg-1: #0f1216;
@@ -69,6 +71,14 @@
   --sh-1: 0 1px 2px rgba(0, 0, 0, 0.4);
   --sh-2: 0 4px 14px rgba(0, 0, 0, 0.45);
   --sh-3: 0 18px 48px rgba(0, 0, 0, 0.6);
+
+  /* 半透明白：所有"往亮处提一档"的层次都用这些令牌，亮色主题整体反向覆盖 */
+  --hover: rgba(255, 255, 255, 0.045);
+  --hover-strong: rgba(255, 255, 255, 0.1);
+  --inset-top: rgba(255, 255, 255, 0.16);
+  --veil: rgba(255, 255, 255, 0.02);
+  --veil-grad-a: rgba(255, 255, 255, 0.012);
+  --veil-grad-b: rgba(255, 255, 255, 0);
 
   /* 字体 */
   --font-ui: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
@@ -288,7 +298,7 @@ textarea {
   background: linear-gradient(180deg, var(--accent-hi), var(--accent));
   border-color: var(--accent-lo);
   color: #fff;
-  box-shadow: var(--sh-1), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  box-shadow: var(--sh-1), inset 0 1px 0 var(--inset-top);
 }
 
 .btn.primary:hover {
@@ -309,13 +319,13 @@ textarea {
 }
 
 .btn.ghost:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--hover);
   border-color: #3a4553;
   color: var(--text-0);
 }
 
 .btn.ghost:active {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--hover-strong);
 }
 
 /* 危险按钮（当前未被使用，预留回滚/清空等操作） */
@@ -508,7 +518,7 @@ textarea {
 .tree-item:hover,
 .tree-dir:hover,
 .tree-file:hover {
-  background: rgba(255, 255, 255, 0.045);
+  background: var(--hover);
   color: var(--text-0);
 }
 
@@ -602,7 +612,7 @@ textarea {
 }
 
 .timeline-item:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--hover);
   color: var(--text-1);
 }
 
@@ -699,7 +709,7 @@ textarea {
 }
 
 .tab:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--hover);
   color: var(--text-1);
 }
 
@@ -730,7 +740,7 @@ textarea {
 }
 
 .tab .tab-close:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--hover-strong);
   color: var(--err);
 }
 
@@ -782,8 +792,8 @@ textarea {
   background: var(--bg-0);
   background-image: linear-gradient(
     to right,
-    rgba(255, 255, 255, 0.012) 0,
-    rgba(255, 255, 255, 0) 60%
+    var(--veil-grad-a) 0,
+    var(--veil-grad-b) 60%
   );
 }
 
@@ -1153,7 +1163,7 @@ textarea {
   align-items: center;
   gap: 6px;
   padding: 5px 9px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--veil);
   border-bottom: 1px solid var(--border-soft);
   color: var(--text-2);
 }
@@ -1842,5 +1852,657 @@ textarea {
   padding: 2px 7px;
   font-size: 10.5px;
   height: auto;
+}
+
+/* ==========================================================================
+   23. 亮色主题与新增组件（v2 UI）
+   —— 同样放在最后：亮色主题整体反向覆盖令牌，新组件只使用令牌，
+      所以两套主题共用一套规则。同等优先级、后写者生效。
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   23.1 亮色主题（纸感、低对比，不是把深色简单反相成纯黑白）
+   -------------------------------------------------------------------------- */
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* 背景层次：越靠上层越白 */
+  --bg-0: #f4f6f9;
+  --bg-1: #ffffff;
+  --bg-2: #f1f4f8;
+  --bg-3: #e8edf4;
+  --bg-4: #dde4ee;
+
+  /* 边框 */
+  --border: #e2e7ef;
+  --border-soft: #edf0f5;
+  --border-strong: #ccd5e0;
+
+  /* 文本 */
+  --text-0: #0f151d;
+  --text-1: #2b3441;
+  --text-2: #5a6675;
+  --text-3: #8b95a3;
+
+  /* 强调色：蓝紫，在纸上略深一档 */
+  --accent: #6b5bf0;
+  --accent-hi: #5544d6;
+  --accent-lo: #8b7cf7;
+  --accent-soft: rgba(107, 91, 240, 0.12);
+  --accent-line: rgba(107, 91, 240, 0.4);
+  --accent-glow: rgba(107, 91, 240, 0.16);
+  --link: #2563eb;
+
+  /* 语义色 */
+  --ok: #17916a;
+  --ok-soft: rgba(23, 145, 106, 0.12);
+  --warn: #b7791f;
+  --warn-soft: rgba(183, 121, 31, 0.13);
+  --err: #cf3f4d;
+  --err-soft: rgba(207, 63, 77, 0.12);
+  --info: #2b7cc4;
+  --info-soft: rgba(43, 124, 196, 0.12);
+
+  /* 语法高亮：深字浅底 */
+  --tok-com: #8a94a6;
+  --tok-str: #4d7c0f;
+  --tok-num: #b45309;
+  --tok-key: #7c3aed;
+  --tok-fn: #1d4ed8;
+  --tok-tag: #b91c1c;
+  --tok-attr: #b45309;
+  --tok-punc: #64748b;
+  --tok-var: #1f2937;
+
+  /* 半透明白在这里要反过来：用深色薄纱压暗，而不是往亮处提 */
+  --hover: rgba(15, 23, 42, 0.055);
+  --hover-strong: rgba(15, 23, 42, 0.1);
+  --inset-top: rgba(255, 255, 255, 0.9);
+  --veil: rgba(15, 23, 42, 0.03);
+  --veil-grad-a: rgba(15, 23, 42, 0.012);
+  --veil-grad-b: rgba(15, 23, 42, 0);
+
+  /* 阴影：亮底上要更收敛 */
+  --sh-1: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --sh-2: 0 4px 14px rgba(15, 23, 42, 0.08);
+  --sh-3: 0 18px 48px rgba(15, 23, 42, 0.14);
+}
+
+/* 选中文字：亮色下用强调色的淡底 */
+[data-theme="light"]::selection,
+[data-theme="light"] ::selection {
+  background: var(--accent-soft);
+  color: var(--text-0);
+}
+
+/* 差异行：深色主题的浅色字在亮底上读不出来，单独给一组 */
+[data-theme="light"] .d-ins {
+  background: rgba(23, 145, 106, 0.12);
+  color: #14603f;
+}
+
+[data-theme="light"] .d-del {
+  background: rgba(207, 63, 77, 0.1);
+  color: #8f2b36;
+}
+
+/* 本轮改动行：亮色下绿底要更淡 */
+[data-theme="light"] .code > div.mark-added {
+  background: rgba(23, 145, 106, 0.08);
+}
+
+/* 滚动条：深色滑块在浅底上几乎看不见 */
+[data-theme="light"] * {
+  scrollbar-color: rgba(15, 23, 42, 0.18) transparent;
+}
+
+[data-theme="light"]::-webkit-scrollbar-thumb,
+[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.18);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+[data-theme="light"]::-webkit-scrollbar-thumb:hover,
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.3);
+  background-clip: content-box;
+}
+
+/* 输入控件：亮色下统一白底 + 常规边框（调色板输入框自己用 --bg-2，排除掉） */
+[data-theme="light"] #prompt,
+[data-theme="light"] input:not(.palette-input),
+[data-theme="light"] select,
+[data-theme="light"] textarea {
+  background: #ffffff;
+  border-color: var(--border);
+}
+
+/* --------------------------------------------------------------------------
+   23.2 新增组件（两套主题通用，只用令牌）
+   -------------------------------------------------------------------------- */
+
+/* --- 更小的按钮：流式头部、状态栏里用 --- */
+.btn.tiny {
+  height: 20px;
+  padding: 0 6px;
+  gap: 4px;
+  border-radius: var(--radius-sm);
+  font-size: 10.5px;
+}
+
+/* 只有图标的方形按钮：去掉文字内边距，让图形居中 */
+.btn.icon-btn {
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+}
+
+.btn.tiny.icon-btn {
+  width: 20px;
+}
+
+/* --- 分段控件：代码 / 本轮差异 --- */
+.seg {
+  display: inline-flex;
+  align-items: stretch;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.seg-btn {
+  padding: 3px 9px;
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+
+.seg-btn:first-child {
+  border-left: 0;
+}
+
+.seg-btn:hover {
+  background: var(--hover);
+  color: var(--text-1);
+}
+
+.seg-btn.active {
+  background: var(--bg-4);
+  color: var(--text-0);
+  font-weight: 600;
+}
+
+/* 失效状态要和普通按钮一样明显 */
+.seg-btn:disabled,
+.seg-btn[disabled],
+.seg-btn[aria-disabled="true"] {
+  opacity: 0.45;
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+
+.seg-btn:disabled:hover,
+.seg-btn[disabled]:hover {
+  background: transparent;
+  color: var(--text-3);
+}
+
+/* 差异条数小胶囊 */
+.seg-badge {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
+/* --- 流里的轮次块 --- */
+.run-head {
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+
+.run-head:hover {
+  background: var(--hover);
+}
+
+.run-idx {
+  flex: 0 0 auto;
+  color: var(--text-0);
+  font-family: var(--font-code);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.run-mode {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-hi);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.stream-run[data-mode="regenerate"] .run-mode {
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+.run-time,
+.run-files {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  font-family: var(--font-code);
+  font-size: 10.5px;
+}
+
+.run-collapse {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.run-collapse::before {
+  content: "▾";
+  display: inline-block;
+  transition: transform var(--t-fast);
+}
+
+.stream-run.collapsed .run-collapse::before {
+  transform: rotate(-90deg);
+}
+
+/* 轮次内容：思考 / 建议 / 文件事件纵向堆叠 */
+.run-body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding-top: 8px;
+}
+
+.stream-run.collapsed > .run-body {
+  display: none;
+}
+
+/* 跳转过来的那一轮闪一下，告诉用户"就是它" */
+.stream-run.anchor-flash {
+  border-radius: var(--radius);
+  animation: run-flash 1.2s ease;
+}
+
+@keyframes run-flash {
+  0% {
+    box-shadow: 0 0 0 2px var(--accent-line);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
+/* 注意：.stream-run[data-kind='spec'] > .run-head 的琥珀色左边框在上面的
+   第 22 节里定义，这里不要重复声明，避免覆盖。 */
+
+/* --- 思考块折叠 --- */
+.think.collapsed .think-body {
+  display: none;
+}
+
+.think-head {
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+
+.think-head:hover {
+  background: var(--hover);
+  color: var(--text-1);
+}
+
+/* 旧的 ⌄ 换成状态点：常态不可见，正在流式输出时脉冲 = "正在思考" */
+.think .think-head::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: transparent;
+  transform: none;
+  animation: none;
+}
+
+.think.streaming .think-head::before {
+  background: var(--accent);
+  animation: dot-pulse 1.1s ease-in-out infinite;
+}
+
+/* 折叠箭头放到右侧 */
+.think-head::after {
+  content: "▾";
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1;
+  transition: transform var(--t-fast);
+}
+
+.think.collapsed .think-head::after {
+  transform: rotate(-90deg);
+}
+
+/* 折叠时在标题后面显示一句摘要 */
+.think-summary {
+  max-width: 190px;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- 建议卡片：批次分组 + 快捷键提示 --- */
+.suggestion-batch {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.suggestion-batch-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: none;
+}
+
+.suggestion .kbd-hint {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-3);
+  font-family: var(--font-code);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+/* --- 状态栏（取代原来的 composer 底部那一行） --- */
+.statusbar {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+  height: 26px;
+  padding: 0 10px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+
+.status-text {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+
+.status-dot.idle {
+  background: var(--text-3);
+}
+
+.status-dot.typing {
+  background: var(--info);
+}
+
+.status-dot.busy {
+  background: var(--warn);
+  animation: dot-pulse 1.1s ease-in-out infinite;
+}
+
+.status-dot.ok {
+  background: var(--ok);
+}
+
+.status-dot.err {
+  background: var(--err);
+}
+
+@keyframes dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+
+/* --- 代码视图：行号 + "本轮改动"标记 --- */
+.code .ln {
+  position: absolute;
+  left: 8px;
+  width: 22px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  text-align: right;
+  user-select: none;
+  opacity: 0.7;
+}
+
+.code > div.mark-added {
+  background: rgba(63, 191, 143, 0.08);
+  box-shadow: inset 2px 0 0 var(--ok);
+}
+
+.code > div.mark-added .ln {
+  color: var(--ok);
+  opacity: 1;
+}
+
+/* "本轮没有改动"的占位 */
+.code .no-diff {
+  padding: 14px 16px;
+  color: var(--text-3);
+  font-style: italic;
+}
+
+/* --- 命令面板（Ctrl+P） --- */
+.palette-card {
+  align-self: flex-start;
+  width: min(560px, 90vw);
+  margin-top: 12vh;
+  background: var(--bg-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--sh-3);
+  overflow: hidden;
+}
+
+/* .modal 默认垂直居中；只让命令面板贴到上面。
+   分成两条写：不支持 :has() 的浏览器会整条丢弃选择器列表，那样 #palette 就失效了。 */
+#palette {
+  align-items: flex-start;
+}
+
+.modal:has(.palette-card) {
+  align-items: flex-start;
+}
+
+.palette-input {
+  width: 100%;
+  padding: 11px 14px;
+  background: var(--bg-2);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-0);
+  font-size: 13px;
+  outline: none;
+}
+
+.palette-input::placeholder {
+  color: var(--text-3);
+}
+
+.palette-list {
+  max-height: 300px;
+  padding: 4px;
+  overflow: auto;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  font-family: var(--font-code);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.palette-item.active {
+  background: var(--accent-soft);
+  color: var(--text-0);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.palette-item .p-dir {
+  color: var(--text-3);
+}
+
+/* --- 快捷键帮助弹窗 --- */
+.keys {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+/* 注意：index.html 里 kbd 之间是裸文本 "+"，而在 grid 容器里连续的裸文本会
+   变成"匿名网格项"，会把 132px / 1fr 两列撑成多行（Alt 一行、+ 一行、Z 一行）。
+   所以这里用 flex 行内排列：快捷键组合保持在同一行，描述统一跟在后面。
+   左列宽度由 kbd 自身撑开，不再需要写死 132px。 */
+.keys > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.keys > div > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+kbd {
+  display: inline-block;
+  margin-right: 2px;
+  padding: 1px 6px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  color: var(--text-0);
+  font-family: var(--font-code);
+  font-size: 11px;
+}
+
+/* --- 设置弹窗里的开关组 --- */
+.switches {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* 上面的 label.check 规则是给 .form-grid 写的，这里补一份给 .switches */
+.switches label.check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-1);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+
+.switches label.check:hover {
+  background: var(--bg-3);
+  border-color: var(--border-strong);
+}
+
+.switches label.check input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* --- 意图计量条：宽度变化更顺，不再一格一格抖 --- */
+.intent-fill {
+  transition: width 0.3s cubic-bezier(0.22, 0.61, 0.36, 1),
+    background 0.18s ease;
+}
+
+/* --- 右侧面板标题行：容纳新的小按钮，272px 紧凑宽度下不换行 --- */
+.pane-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 6px;
+}
+
+.pane-title-row .pane-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-title-row .btn {
+  flex: 0 0 auto;
+}
+
+
+/* 通用小号文字（#round-label 等） */
+.tiny {
+  font-size: 10.5px;
+  line-height: 1.4;
 }
 

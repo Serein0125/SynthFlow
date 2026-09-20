@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -17,10 +17,11 @@
       <div class="status-cluster">
         <span id="provider-badge" class="badge" title="当前模型">模型加载中…</span>
         <span id="run-badge" class="badge idle">空闲</span>
-        <span id="draft-badge" class="badge warn hidden">预演中</span>
         <span class="spacer"></span>
-        <button id="btn-rollback" class="btn" title="回退到上一个版本（Alt+Z）">⏪ 回退一步</button>
-        <button id="btn-regenerate" class="btn" title="忽略已有产出，强制重新生成">↻ 强制重生成</button>
+        <button id="btn-undo" class="btn" title="回退一步（Alt+Z）">⏪ 回退</button>
+        <button id="btn-redo" class="btn" title="前进到下一版（Alt+Shift+Z）" disabled>⏩ 前进</button>
+        <button id="btn-regenerate" class="btn" title="忽略已有产出，强制重新生成">↻ 重生成</button>
+        <button id="btn-theme" class="btn ghost icon-btn" title="切换主题（跟随系统 / 亮 / 暗）">🌙</button>
         <button id="btn-settings" class="btn ghost" title="模型与参数设置">⚙ 设置</button>
       </div>
     </header>
@@ -34,7 +35,7 @@
           </div>
         </section>
         <section class="pane">
-          <h3 class="pane-title">版本时间线</h3>
+          <h3 class="pane-title">版本时间线<span id="version-hint" class="muted"></span></h3>
           <ol id="timeline" class="timeline">
             <li class="timeline-item current"><b>v0</b><span>空项目基线</span></li>
           </ol>
@@ -47,22 +48,30 @@
           <span id="current-path" class="path">未选择文件</span>
           <span class="spacer"></span>
           <span id="file-meta" class="muted"></span>
+          <div class="seg" id="view-toggle" role="group" aria-label="视图切换">
+            <button class="seg-btn active" data-view="code" title="看完整代码（Ctrl+D 切换）">代码</button>
+            <button class="seg-btn" data-view="diff" title="只看本轮改动（Ctrl+D 切换）">本轮差异<span id="diff-count" class="seg-badge hidden"></span></button>
+          </div>
           <button id="btn-save" class="btn ghost small">保存</button>
         </div>
         <div class="code-wrap">
           <pre id="code-pre" class="code"><code id="code" class="hl"></code></pre>
           <div id="editor-empty" class="editor-empty">
-            <p>代码会在这里**实时**长出来。</p>
+            <p>代码会在这里实时长出来。</p>
             <p class="muted">左边是它自动创建的文件，右边是它在想什么。</p>
           </div>
         </div>
-        <div id="diff-strip" class="diff-strip hidden"></div>
       </main>
 
       <aside class="stream">
         <div class="pane-title-row">
           <h3 class="pane-title">思考 &amp; 建议</h3>
-          <span id="stream-mode" class="badge">待命</span>
+          <span id="unread-badge" class="badge accent hidden">0</span>
+          <span id="round-label" class="muted tiny"></span>
+          <span class="spacer"></span>
+          <button id="btn-think-mode" class="btn ghost tiny" title="切换思考块的默认折叠状态">思考：折叠</button>
+          <button id="btn-round-prev" class="btn ghost tiny" title="上一轮">↑</button>
+          <button id="btn-round-next" class="btn ghost tiny" title="下一轮">↓</button>
         </div>
         <div id="stream-body" class="stream-body">
           <p class="empty">它在打字的间隙就会开始思考，并把可采纳的建议推到这里。</p>
@@ -79,40 +88,72 @@
       </div>
       <div class="composer-row">
         <textarea id="prompt" rows="4" spellcheck="false"
-          placeholder="直接开始打字…（不用点发送：停顿 0.3 秒我就开始预演，判定你写完了就自动落盘）"></textarea>
+          placeholder="直接开始打字…（不用点发送：停顿约 1 秒我就开始预演，判定你写完了就自动落盘）"></textarea>
         <div class="composer-side">
           <button id="btn-commit" class="btn primary">立即生成</button>
           <button id="btn-cancel" class="btn ghost">停止生成</button>
           <div id="chips" class="chips"></div>
         </div>
       </div>
-      <div class="composer-foot">
-        <span id="hint" class="muted">提示：Alt+Z 回退 · Alt+Enter 立即生成 · 建议卡片点「采纳」会自动写进你的提示词</span>
+      <div class="statusbar">
+        <span id="status-dot" class="status-dot idle"></span>
+        <span id="status-text" class="status-text">空闲</span>
+        <span id="status-detail" class="muted"></span>
         <span class="spacer"></span>
+        <span id="usage" class="muted" title="字符数按 3 字符≈1 token 估算；接真实模型后优先使用接口返回的真实用量">本轮 ≈0 tokens · 累计 0 次调用</span>
         <span id="counter" class="muted">0 字</span>
+        <button id="btn-help" class="btn ghost tiny" title="快捷键">?</button>
       </div>
     </footer>
   </div>
 
   <div id="toasts" class="toasts"></div>
 
+  <div id="palette" class="modal hidden">
+    <div class="palette-card">
+      <input id="palette-input" class="palette-input" placeholder="跳转到文件…（输入文件名，Enter 打开，Esc 关闭）" autocomplete="off" />
+      <ul id="palette-list" class="palette-list"></ul>
+    </div>
+  </div>
+
+  <div id="help-modal" class="modal hidden">
+    <div class="modal-card">
+      <h2>快捷键与交互</h2>
+      <div class="keys">
+        <div><kbd>Alt</kbd>+<kbd>Z</kbd><span>回退一步（文件与提示词一起回到上一版）</span></div>
+        <div><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd><span>前进到下一版（回退后可恢复）</span></div>
+        <div><kbd>Alt</kbd>+<kbd>Enter</kbd><span>不等判定，立即生成</span></div>
+        <div><kbd>Esc</kbd><span>停止生成</span></div>
+        <div><kbd>Ctrl</kbd>+<kbd>D</kbd><span>代码 / 本轮差异 视图切换</span></div>
+        <div><kbd>Ctrl</kbd>+<kbd>P</kbd><span>快速跳转文件</span></div>
+        <div><kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd><span>采纳本轮第 N 条建议</span></div>
+      </div>
+      <div class="modal-actions">
+        <button id="help-close" class="btn primary">知道了</button>
+      </div>
+    </div>
+  </div>
+
   <div id="settings-modal" class="modal hidden">
     <div class="modal-card">
       <h2>模型与生成设置</h2>
-      <p class="muted">默认使用「内置演示（离线可用）」，不消耗任何额度。填好任意 OpenAI 兼容端点即可接真实模型。</p>
+      <p class="muted">填写任意 OpenAI 兼容端点即可。API Key 只写入本机 <code>.synthflow/config.json</code>，不会外发。</p>
       <div class="form-grid">
         <label>服务商
           <select id="cfg-provider"></select>
         </label>
         <label>模型名<input id="cfg-model" placeholder="deepseek-chat" /></label>
         <label>Base URL<input id="cfg-baseUrl" placeholder="https://api.deepseek.com/v1" /></label>
-        <label>API Key<input id="cfg-apiKey" type="password" placeholder="sk-... （只存在本机 .synthflow/config.json）" /></label>
-        <label>预演延迟 ms<input id="cfg-specDelayMs" type="number" min="0" step="50" /></label>
+        <label>API Key<input id="cfg-apiKey" type="password" placeholder="sk-..." /></label>
+        <label>预演延迟 ms<input id="cfg-specDelayMs" type="number" min="0" step="100" /></label>
         <label>判定完成后的等待 ms<input id="cfg-commitIdleMs" type="number" min="100" step="50" /></label>
         <label>停手兜底等待 ms<input id="cfg-settleMs" type="number" min="200" step="100" /></label>
         <label>意图完成阈值 0~1<input id="cfg-intentThreshold" type="number" min="0" max="1" step="0.05" /></label>
+      </div>
+      <div class="switches">
         <label class="check"><input id="cfg-autoCommit" type="checkbox" /> 判定写完后自动落盘</label>
         <label class="check"><input id="cfg-autoAdoptHigh" type="checkbox" /> 自动采纳高价值优化建议（会改写提示词）</label>
+        <label class="check"><input id="cfg-patchRetry" type="checkbox" /> 补丁未命中时自动重试一次（会多消耗一次调用）</label>
       </div>
       <div class="modal-actions">
         <button id="cfg-save" class="btn primary">保存并生效</button>

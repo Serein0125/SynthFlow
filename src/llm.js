@@ -6,7 +6,9 @@ import path from 'node:path';
 import { readJsonSafe } from './util.js';
 
 export const PRESETS = {
-  mock: { label: '内置演示（离线可用）', baseUrl: '', model: 'synthflow-demo', needsKey: false },
+  // 内置演示模型：界面上不再展示（hidden），只在 `node src/server.js --provider mock` 时可用，
+  // 以及供 scripts/smoke.mjs 做离线回归测试。这样"界面干净"和"零成本可测"两件事都能成立。
+  mock: { label: '内置演示（离线可用）', baseUrl: '', model: 'synthflow-demo', needsKey: false, hidden: true },
   deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', needsKey: true, envKey: 'DEEPSEEK_API_KEY' },
   openai: { label: 'OpenAI 兼容', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', needsKey: true, envKey: 'OPENAI_API_KEY' },
   ollama: { label: '本地 Ollama', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5-coder:7b', needsKey: false },
@@ -17,7 +19,8 @@ export const PRESETS = {
 export function loadConfig(projectRoot) {
   const file = path.join(projectRoot, '.synthflow', 'config.json');
   const stored = readJsonSafe(file, {});
-  const provider = process.env.SYNTHFLOW_PROVIDER || stored.provider || 'mock';
+  // 默认走真实模型（DeepSeek 预设只需再填一个 Key）；没有 Key 时界面会明确提示"未就绪"。
+  const provider = process.env.SYNTHFLOW_PROVIDER || stored.provider || 'deepseek';
   const preset = PRESETS[provider] ?? PRESETS.custom;
   const apiKey =
     process.env.SYNTHFLOW_API_KEY ||
@@ -31,14 +34,16 @@ export function loadConfig(projectRoot) {
     apiKey,
     temperature: Number(process.env.SYNTHFLOW_TEMPERATURE ?? stored.temperature ?? 0.3),
     maxTokens: Number(process.env.SYNTHFLOW_MAX_TOKENS ?? stored.maxTokens ?? 4096),
-    // 预生成（想法 1/2）：打字停顿超过 specDelayMs 就先跑一遍"预演"
-    specDelayMs: Number(stored.specDelayMs ?? 320),
+    // 预生成（想法 1/2）：打字停顿超过 specDelayMs 就先跑一遍"预演"。
+    // v2 起默认 1000ms：太短会导致还在逐字打的时候就反复起跑，既吵又费 token。
+    specDelayMs: Number(stored.specDelayMs ?? 1000),
     commitIdleMs: Number(stored.commitIdleMs ?? 900),
     // 兜底：用户停手不打了但句子没以标点结尾时，停顿这么久也自动开工
     settleMs: Number(stored.settleMs ?? 1600),
     intentThreshold: Number(stored.intentThreshold ?? 0.6),
     autoCommit: stored.autoCommit !== false,
     autoAdoptHigh: stored.autoAdoptHigh === true,
+    patchRetry: stored.patchRetry !== false,
     port: Number(stored.port ?? 7788),
     open: stored.open === true,
     file: file,
@@ -850,6 +855,7 @@ async function* openaiStream(req, cfg) {
     stream: true,
     temperature: cfg.temperature,
     max_tokens: cfg.maxTokens,
+    stream_options: { include_usage: true }, // 拿到真实 token 用量，方便用户盯住余额
     messages: req.messages,
   };
   const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: req.signal });
@@ -859,6 +865,7 @@ async function* openaiStream(req, cfg) {
   }
   const decoder = new TextDecoder('utf-8');
   let buf = '';
+  let sawUsage = false;
   for await (const chunk of res.body) {
     buf += decoder.decode(chunk, { stream: true });
     let idx;
@@ -870,6 +877,10 @@ async function* openaiStream(req, cfg) {
       if (payload === '[DONE]') return;
       try {
         const json = JSON.parse(payload);
+        if (json.usage && !sawUsage) {
+          sawUsage = true;
+          yield { type: 'usage', usage: json.usage };
+        }
         const delta = json.choices?.[0]?.delta ?? {};
         const text = delta.content ?? delta.reasoning_content ?? '';
         if (text) yield { type: 'delta', text };

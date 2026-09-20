@@ -43,9 +43,10 @@ export function parseArgs(argv = process.argv.slice(2)) {
   return args;
 }
 
-export function createServer({ projectRoot, port, host = '127.0.0.1', log = console.log } = {}) {
+export function createServer({ projectRoot, port, host = '127.0.0.1', log = console.log, providerOverride, allowMock = false } = {}) {
   const root = path.resolve(projectRoot ?? path.join(__dirname, '..'));
   const cfg = loadConfig(root);
+  if (providerOverride) cfg.provider = providerOverride;
   const workspaceDir = path.join(root, 'workspace');
   ensureDir(workspaceDir);
 
@@ -78,7 +79,6 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       broadcast(entry.name, entry.payload, true);
     }
   }
-
   function broadcast(name, payload, raw = false) {
     const text = `event: ${name}\ndata: ${JSON.stringify(payload ?? null)}\n\n`;
     for (const res of clients) {
@@ -91,13 +91,19 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
   }
 
   const THROTTLED = new Set(['think:delta', 'file:delta', 'run:text']);
+  const LAST_WINS = new Set(['intent']); // 高频状态类事件：只保留最后一次，避免界面抖动
   function emit(name, payload) {
     if (THROTTLED.has(name)) {
       const key = `${name}:${payload?.path ?? ''}`;
       const cur = throttle.get(key);
       if (cur) cur.payload.delta += payload.delta ?? '';
-      else throttle.set(key, { name, payload: { ...payload } });
+      else throttle.set(key, { name, payload: { ...payload }, mode: 'append' });
       if (!throttleTimer) throttleTimer = setTimeout(flushThrottled, 45);
+      return;
+    }
+    if (LAST_WINS.has(name)) {
+      throttle.set(name, { name, payload, mode: 'last' });
+      if (!throttleTimer) throttleTimer = setTimeout(flushThrottled, 90);
       return;
     }
     broadcast(name, payload);
@@ -155,7 +161,14 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       case '/api/state':
         return {
           ...runner.snapshot(),
-          presets: Object.fromEntries(Object.entries(PRESETS).map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, model: v.model, needsKey: v.needsKey }])),
+          // runner.snapshot().config 只有生成参数；这里补上完整的公开配置（含 apiKeySet / patchRetry），
+          // 否则设置面板拿不到 baseUrl、也判断不出 Key 是否已保存。
+          config: { ...runner.snapshot().config, ...publicConfig(cfg) },
+          presets: Object.fromEntries(
+            Object.entries(PRESETS)
+              .filter(([k, v]) => !v.hidden || allowMock || k === cfg.provider)
+              .map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, model: v.model, needsKey: v.needsKey }]),
+          ),
           paths: { projectRoot: root, workspace: workspaceDir, store: workspace.storeDir, public: PUBLIC_DIR },
         };
 
@@ -171,7 +184,10 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         return { ok: true, cancelled: runner.cancel('user') };
 
       case '/api/rollback':
-        return runner.rollback(body.versionId);
+        return runner.moveVersion(body.direction ?? 'back', body.versionId);
+
+      case '/api/forward':
+        return runner.moveVersion('forward');
 
       case '/api/adopt':
         return runner.adopt(body.suggestion);
@@ -197,7 +213,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         return runner.writeFile(body.path, body.content ?? '');
 
       case '/api/versions':
-        return { versions: session.versionList(), current: session.currentVersion?.id, segments: session.segments.slice(-80) };
+        return { ...session.versionList(), segments: session.segments.slice(-80) };
 
       case '/api/context':
         return { ...session.contextStack(), stats: session.stats, versions: session.versionList() };
@@ -297,6 +313,7 @@ function publicConfig(cfg) {
     intentThreshold: cfg.intentThreshold,
     autoCommit: cfg.autoCommit,
     autoAdoptHigh: Boolean(cfg.autoAdoptHigh),
+    patchRetry: cfg.patchRetry !== false,
   };
 }
 
@@ -330,7 +347,13 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve
 if (isMain) {
   const args = parseArgs();
   const projectRoot = args.root ? path.resolve(args.root) : path.join(__dirname, '..');
-  const app = createServer({ projectRoot, port: Number(args.port) || undefined });
+  const providerOverride = args.provider ? String(args.provider) : undefined;
+  const app = createServer({
+    projectRoot,
+    port: Number(args.port) || undefined,
+    providerOverride,
+    allowMock: Boolean(args['show-mock']),
+  });
   const addr = await app.listen();
   const url = `http://127.0.0.1:${addr.port}/`;
   const cfg = app.config;

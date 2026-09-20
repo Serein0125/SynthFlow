@@ -175,9 +175,11 @@ export class Session {
 
     this.prompt = ''; // 输入框当前完整内容 = 编译后的 Prompt
     this.segments = []; // 上下文栈：每一次对 prompt 的贡献
-    this.versions = []; // 版本链，index 0 是基线
+    this.versions = []; // 版本链（完整历史，不因回退而删除）
+    this.versionSeq = 0; // 版本号单调递增，回退后再提交也不会撞号
+    this.activeIndex = 0; // 游标：当前处于哪个版本（支持回退/前进）
     this.notes = []; // 被采纳/忽略的建议记录
-    this.stats = { runs: 0, commits: 0, rollbacks: 0, charsGenerated: 0, adopted: 0, dismissed: 0 };
+    this.stats = { runs: 0, commits: 0, rollbacks: 0, forwards: 0, charsGenerated: 0, adopted: 0, dismissed: 0, modelCalls: 0, estTokens: 0 };
 
     this.pendingIntent = null;
     this.lastDecision = null;
@@ -204,7 +206,19 @@ export class Session {
   }
 
   get currentVersion() {
-    return this.versions[this.versions.length - 1];
+    return this.versions[this.activeIndex];
+  }
+
+  get activeVersionId() {
+    return this.currentVersion?.id ?? 'v0';
+  }
+
+  get canBack() {
+    return this.activeIndex > 0;
+  }
+
+  get canForward() {
+    return this.activeIndex < this.versions.length - 1;
   }
 
   /** 编译后的完整 Prompt（想法 8）：当前输入 + 已采纳建议（已写回输入框，故此处直接返回）。 */
@@ -281,7 +295,14 @@ export class Session {
 
   /** 记录一次生成运行的结果，并产生新版本。 */
   recordCommit({ runId, promptBefore, promptAfter, files, summary, kind = 'turn', snapshotId }) {
-    const versionId = `v${this.versions.length}`;
+    // 若游标停在历史版本上继续生成，右侧那条分支会被丢弃（与 git 在历史提交上继续提交一致）。
+    let dropped = 0;
+    if (this.activeIndex < this.versions.length - 1) {
+      dropped = this.versions.length - 1 - this.activeIndex;
+      this.versions = this.versions.slice(0, this.activeIndex + 1);
+    }
+    this.versionSeq += 1;
+    const versionId = `v${this.versionSeq}`;
     const rec = {
       id: versionId,
       seq: this.versions.length,
@@ -296,47 +317,75 @@ export class Session {
       kind,
     };
     this.versions.push(rec);
+    this.activeIndex = this.versions.length - 1;
     this.stats.commits += 1;
     for (const s of this.segments) if (s.runId === runId && !s.versionId) s.versionId = versionId;
     this.touch();
+    rec.droppedBranches = dropped;
     return rec;
   }
 
   /**
-   * 一键回退（想法 5）：回到"这句话还没输入时"的版本。
-   * @param {string} [versionId] 默认回退最后一个版本
+   * 在版本链上移动游标（想法 9：回退之后还能前进回去）。
+   * @param {'back'|'forward'} direction
+   * @param {string} [versionId] 直接跳到指定版本
    */
-  rollback(versionId) {
-    const target = versionId
-      ? this.versions.find((v) => v.id === versionId)
-      : this.versions[this.versions.length - 1];
-    if (!target || target.kind === 'baseline') return { ok: false, error: '已经位于最初版本，无法继续回退' };
-    const idx = this.versions.indexOf(target);
-    const prevVersion = this.versions[idx - 1];
-    const restore = this.workspace.restore(prevVersion.snapshotId);
-    const removed = this.versions.splice(idx);
-    this.versions.forEach((v, i) => {
-      v.seq = i;
-    });
-    const removedIds = new Set(removed.flatMap((v) => v.segmentIds));
-    for (const s of this.segments) if (removedIds.has(s.id)) s.reverted = true;
-    this.segments = this.segments.filter((s) => !s.reverted || s.kind !== 'adopt');
-    this.prompt = target.promptBefore ?? '';
+  moveVersion(direction = 'back', versionId) {
+    const cur = this.activeIndex;
+    let target = cur;
+    if (versionId) {
+      const i = this.versions.findIndex((v) => v.id === versionId);
+      if (i < 0) return { ok: false, error: `版本不存在: ${versionId}` };
+      target = i;
+    } else if (direction === 'forward') {
+      target = cur + 1;
+    } else {
+      target = cur - 1;
+    }
+    if (target < 0) return { ok: false, error: '已经是最初版本，无法继续回退' };
+    if (target > this.versions.length - 1) return { ok: false, error: '已经是最新版本，无法继续前进' };
+    if (target === cur) return { ok: false, error: '已经位于该版本' };
+
+    const v = this.versions[target];
+    let restore;
+    try {
+      restore = this.workspace.restore(v.snapshotId);
+    } catch (err) {
+      return { ok: false, error: `恢复快照失败：${err.message}` };
+    }
+    this.activeIndex = target;
+    this.prompt = v.promptAfter ?? '';
     this.pushSegment({
       kind: 'revert',
       text: this.prompt,
-      delta: `回退到 ${prevVersion.id}`,
-      meta: { from: target.id, to: prevVersion.id, restoredFiles: restore.restored },
+      delta: `${direction === 'forward' ? '前进' : '回退'}到 ${v.id}`,
+      meta: { from: this.versions[cur]?.id, to: v.id, direction, restoredFiles: restore.restored },
     });
-    this.stats.rollbacks += 1;
+    if (direction === 'forward') this.stats.forwards = (this.stats.forwards ?? 0) + 1;
+    else this.stats.rollbacks += 1;
     this.touch();
     return {
       ok: true,
-      restoredFrom: prevVersion.id,
-      rolledBackVersion: target.id,
+      direction,
+      activeVersionId: v.id,
       files: restore.files,
+      restored: restore.restored,
       prompt: this.prompt,
+      canBack: this.canBack,
+      canForward: this.canForward,
+      versions: this.versionList(),
     };
+  }
+
+  /** 兼容旧接口：回退一步。 */
+  rollback(versionId) {
+    if (versionId) {
+      const i = this.versions.findIndex((v) => v.id === versionId);
+      if (i < 0) return { ok: false, error: `版本不存在: ${versionId}` };
+      if (i === this.activeIndex) return { ok: false, error: '已经位于该版本' };
+      return this.moveVersion(i < this.activeIndex ? 'back' : 'forward', versionId);
+    }
+    return this.moveVersion('back');
   }
 
   save() {
@@ -377,6 +426,14 @@ export class Session {
     if (!data) return null;
     const s = Object.create(Session.prototype);
     Object.assign(s, data, { workspace, config: config ?? {}, storeDir: path.dirname(file), status: 'idle', pendingIntent: null, lastDecision: null });
+    // 兼容旧存档：游标默认落在最后一个版本上
+    if (typeof s.activeIndex !== 'number' || s.activeIndex < 0 || s.activeIndex >= s.versions.length) {
+      s.activeIndex = Math.max(0, s.versions.length - 1);
+    }
+    if (typeof s.versionSeq !== 'number') {
+      s.versionSeq = s.versions.reduce((max, v) => Math.max(max, Number(String(v.id).replace(/^v/, '')) || 0), 0);
+    }
+    s.stats = { runs: 0, commits: 0, rollbacks: 0, forwards: 0, charsGenerated: 0, adopted: 0, dismissed: 0, modelCalls: 0, estTokens: 0, ...(data.stats ?? {}) };
     return s;
   }
 
@@ -387,22 +444,32 @@ export class Session {
       prompt: this.prompt,
       stats: this.stats,
       versionCount: this.versions.length - 1,
-      currentVersionId: this.currentVersion?.id ?? 'v0',
+      currentVersionId: this.activeVersionId,
+      activeIndex: this.activeIndex,
+      canBack: this.canBack,
+      canForward: this.canForward,
       segments: this.segments.length,
     };
   }
 
   /** 精简版版本列表（给 UI 时间线）。 */
   versionList() {
-    return this.versions.map((v) => ({
-      id: v.id,
-      seq: v.seq,
-      kind: v.kind,
-      summary: v.summary,
-      files: v.files,
-      createdAt: v.createdAt,
-      promptAfter: v.promptAfter,
-      isCurrent: v.id === this.currentVersion?.id,
-    }));
+    return {
+      versions: this.versions.map((v, i) => ({
+        id: v.id,
+        seq: i,
+        kind: v.kind,
+        summary: v.summary,
+        files: v.files,
+        createdAt: v.createdAt,
+        promptAfter: v.promptAfter,
+        isCurrent: i === this.activeIndex,
+        ahead: i > this.activeIndex,
+      })),
+      activeVersionId: this.activeVersionId,
+      activeIndex: this.activeIndex,
+      canBack: this.canBack,
+      canForward: this.canForward,
+    };
   }
 }

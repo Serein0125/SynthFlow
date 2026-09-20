@@ -7,7 +7,7 @@ import { createProvider } from './llm.js';
 import { buildMessages } from './prompt.js';
 import { createProtocolParser } from './protocol.js';
 import { analyzeIntent, decidePromptChange } from './session.js';
-import { newId, nowIso, sha1 } from './util.js';
+import { addedLineNumbers, compactDiff, newId, nowIso, sha1 } from './util.js';
 
 export class Runner {
   constructor({ session, workspace, rag, memory, config, emit }) {
@@ -133,7 +133,7 @@ export class Runner {
 
   /* ------------------------------ 运行控制 ------------------------------ */
 
-  #startRun(kind, decision = {}) {
+  #startRun(kind, decision = {}, extra = {}) {
     if (this.busy) return this.run;
     const s = this.session;
     const prompt = s.compilePrompt();
@@ -157,6 +157,8 @@ export class Runner {
       tokensIn: 0,
       chars: 0,
       error: null,
+      usage: null,
+      ...extra,
     };
     this.run = run;
     this.busy = true;
@@ -194,10 +196,12 @@ export class Runner {
       skills,
       memoryBriefing: this.memory?.briefing() ?? '',
       existingFiles,
-      recentFiles: this.recentFiles,
+      // 补丁重试时，把上次未命中的文件提到上下文最前面
+      recentFiles: run.forceFiles?.length ? [...run.forceFiles, ...this.recentFiles] : this.recentFiles,
       adopted: s.segments.filter((x) => x.kind === 'adopt' && !x.reverted).map((x) => ({ text: x.text })),
       previousPrompt: this.committedPrompt,
       config: this.config,
+      requireSuggestions: true,
     });
     run.context = { ragHits: ragHits.length, skills: skills.map((k) => k.name), files: Object.keys(existingFiles).length, chars: messages.reduce((a, m) => a + m.content.length, 0) };
     this.emit('run:context', { runId: run.id, ...run.context });
@@ -217,7 +221,10 @@ export class Runner {
       onSuggestionEnd: (sug) => {
         run.suggestions.push(sug);
         s.stats.charsGenerated += (sug.body ?? '').length;
-        this.emit('suggest', { runId: run.id, suggestion: sug, draft: run.kind === 'spec' });
+        // 想法 6（v2）：正式生成阶段的建议本轮结束后统一弹出；预演阶段用户还在打字，实时给。
+        if (run.kind !== 'commit') {
+          this.emit('suggest', { runId: run.id, suggestion: sug, draft: true });
+        }
         // 想法 10：高价值优化建议 + 用户开启自动采纳时，同步改写 prompt
         if (this.config.autoAdoptHigh && sug.kind === 'optimize' && sug.impact === 'high' && sug.insert) {
           const r = s.adoptSuggestion(sug, { auto: true });
@@ -248,6 +255,7 @@ export class Runner {
       for await (const evt of this.provider.stream({ messages, signal: run.abort.signal, userPrompt: run.prompt, mode: run.mode, existingFiles })) {
         if (run.abort.signal.aborted) break;
         if (evt?.type === 'delta' && evt.text) parser.push(evt.text);
+        else if (evt?.type === 'usage' && evt.usage) run.usage = evt.usage; // 真实 token 用量
       }
       parser.end();
     } catch (err) {
@@ -323,11 +331,19 @@ export class Runner {
       promptBefore,
       promptAfter: run.prompt,
       files: okFiles,
-      summary: `${run.mode === 'regenerate' ? '生成' : run.mode === 'continue' ? '增量续写' : '增量修改'} ${okFiles.length} 个文件${failed.length ? `（${failed.length} 个失败）` : ''}`,
+      summary: `${run.retryOf ? '补丁重试 · ' : ''}${run.mode === 'regenerate' ? '生成' : run.mode === 'continue' ? '增量续写' : '增量修改'} ${okFiles.length} 个文件${failed.length ? `（${failed.length} 个失败）` : ''}`,
       snapshotId: snap.id,
     });
     this.committedPrompt = run.prompt;
     s.status = 'idle';
+
+    // token 用量：优先用接口返回的真实 usage，没有就按字符数估算
+    const usage = run.usage
+      ? { tokens: run.usage.total_tokens ?? (run.usage.prompt_tokens ?? 0) + (run.usage.completion_tokens ?? 0), real: true }
+      : { tokens: Math.max(0, Math.round(run.chars / 3)), real: false };
+    s.stats.modelCalls = (s.stats.modelCalls ?? 0) + 1;
+    s.stats.estTokens = (s.stats.estTokens ?? 0) + usage.tokens;
+
     this.memory?.observeRun({
       prompt: run.prompt,
       files: okFiles,
@@ -335,21 +351,73 @@ export class Runner {
       adopted: s.notes.filter((n) => n.type === 'adopt').map((n) => n.suggestion),
       mode: run.mode,
       ms,
-      tokens: run.chars,
+      tokens: usage.tokens,
     });
     this.rag?.build({ force: true });
     s.save();
 
     this.emit('run:applied', { runId: run.id, results: results.map(stripDiff), versionId: version.id, files: okFiles });
     this.emit('tree', { tree: this.safeTree() });
-    this.emit('versions', { versions: s.versionList(), current: version.id });
-    this.emit('run:done', { runId: run.id, kind: 'commit', ms, mode: run.mode, files: okFiles, failed: failed.map((f) => ({ path: f.path, error: f.error })), versionId: version.id, chars: run.chars });
+    this.emit('versions', s.versionList());
+    // 想法 6（v2）：本轮结束后才把建议推给用户，避免生成过程中分散注意力。
+    // 预演被直接采纳的情况例外：预演阶段已经实时给过建议了，不能再推一遍。
+    if (!run.promotedFromDraft) this.#flushSuggestions(run);
+    this.emit('run:done', {
+      runId: run.id,
+      kind: 'commit',
+      ms,
+      mode: run.mode,
+      files: okFiles,
+      failed: failed.map((f) => ({ path: f.path, error: f.error })),
+      versionId: version.id,
+      chars: run.chars,
+      usage,
+      droppedBranches: version.droppedBranches ?? 0,
+    });
     this.emit('state', this.snapshot());
 
     if (failed.length) {
       this.emit('toast', { level: 'warn', message: `${failed.length} 个补丁未命中：${failed.map((f) => f.path).join(', ')}（已保留其余改动）` });
     }
+    if (version.droppedBranches) {
+      this.emit('toast', { level: 'warn', message: `你刚才在历史版本上继续生成，已丢弃后面的 ${version.droppedBranches} 个版本分支` });
+    }
+
+    // 补丁未命中 → 自动重试一次（把真实文件内容重新喂回去让它重出补丁）
+    if (this.#maybeRetryPatch(run, failed)) return;
     this.#maybeResume();
+  }
+
+  /** 本轮结束后统一推建议（按影响度排序，高的在前）。 */
+  #flushSuggestions(run) {
+    if (!run.suggestions.length) return;
+    const order = { high: 0, medium: 1, low: 2 };
+    const sorted = [...run.suggestions].sort((a, b) => (order[a.impact] ?? 1) - (order[b.impact] ?? 1));
+    for (const sug of sorted) {
+      this.emit('suggest', { runId: run.id, suggestion: sug, batch: true });
+    }
+  }
+
+  /** 补丁没命中时自动重试一次（默认开启，可在设置里关闭）。 */
+  #maybeRetryPatch(run, failed) {
+    if (!this.config.patchRetry || run.retryOf || !failed.length) return false;
+    const retryFiles = failed.filter((f) => f.mode === 'patch' || f.mode === 'rewrite').map((f) => f.path);
+    if (!retryFiles.length) return false;
+    this.emit('retry', { runId: run.id, files: retryFiles });
+    const instruction =
+      `你上一次输出的补丁**没有命中真实文件内容**（涉及：${retryFiles.join(', ')}）。\n` +
+      `下面会给出这些文件的**真实当前内容**，请重新生成 search/replace 补丁。\n` +
+      `硬性要求：\n` +
+      `1. SEARCH 片段必须与文件内容**逐字一致**（包含缩进、空行、结尾分号）。\n` +
+      `2. 只做最小必要改动，不要重写整个文件。\n` +
+      `3. 只输出这些文件的补丁，不要动别的文件。`;
+    const r = this.#startRun(
+      'commit',
+      { mode: 'incremental', reason: '补丁未命中自动重试', instruction, ratio: 0 },
+      { retryOf: run.id, forceFiles: retryFiles },
+    );
+    if (!r) this.emit('toast', { level: 'warn', message: '补丁重试未能启动' });
+    return Boolean(r);
   }
 
   /** 提交：优先就地"采纳"预演结果，避免重复调用模型（省钱 + 更快）。 */
@@ -377,6 +445,7 @@ export class Runner {
           files: this.draft.ops.map((o) => o.path),
           chars: 0,
           startedAt: Date.now(),
+          promotedFromDraft: true,
         };
         this.emit('run:promoted', { runId: run.id, reason: '预演结果直接采纳，无需二次调用', ms: this.draft.ms });
         this.draft = null;
@@ -410,21 +479,32 @@ export class Runner {
     return false;
   }
 
-  rollback(versionId) {
+  /**
+   * 在版本链上移动游标。回退之后仍可用 forward 回到刚才的版本（想法 9）。
+   */
+  moveVersion(direction = 'back', versionId) {
     const s = this.session;
-    const res = s.rollback(versionId);
+    const res = s.moveVersion(direction, versionId);
     if (!res.ok) return res;
     this.draft = null;
-    this.committedPrompt = s.versions[s.versions.length - 1]?.promptAfter ?? '';
+    clearTimeout(this.specTimer);
+    clearTimeout(this.commitTimer);
+    clearTimeout(this.settleTimer);
+    this.committedPrompt = s.currentVersion?.promptAfter ?? '';
     this.rag?.build({ force: true });
-    this.memory?.observeRollback();
+    if (direction !== 'forward') this.memory?.observeRollback();
     s.save();
     this.emit('tree', { tree: this.safeTree() });
-    this.emit('versions', { versions: s.versionList(), current: s.currentVersion.id });
-    this.emit('prompt', { text: s.prompt, reason: 'rollback' });
+    this.emit('versions', s.versionList());
+    this.emit('prompt', { text: s.prompt, reason: direction === 'forward' ? 'redo' : 'rollback' });
     this.emit('rollback', res);
     this.emit('state', this.snapshot());
     return res;
+  }
+
+  /** 兼容旧接口。 */
+  rollback(versionId) {
+    return this.moveVersion('back', versionId);
   }
 
   adopt(suggestion) {
@@ -478,7 +558,7 @@ export class Runner {
     });
     s.save();
     this.emit('tree', { tree: this.safeTree() });
-    this.emit('versions', { versions: s.versionList(), current: version.id });
+    this.emit('versions', s.versionList());
     this.emit('file:saved', { path: rel, bytes: res.bytes });
     this.emit('state', this.snapshot());
     return { ok: true, ...res, versionId: version.id };
@@ -530,7 +610,7 @@ export function normalizeTiming(config = {}) {
   };
   return {
     ...config,
-    specDelayMs: num(config.specDelayMs, 320),
+    specDelayMs: num(config.specDelayMs, 1000),
     commitIdleMs: num(config.commitIdleMs, 900),
     settleMs: num(config.settleMs, 1600),
     intentThreshold: (() => {
@@ -539,9 +619,25 @@ export function normalizeTiming(config = {}) {
     })(),
     autoCommit: config.autoCommit !== false,
     autoAdoptHigh: config.autoAdoptHigh === true,
+    patchRetry: config.patchRetry !== false,
   };
 }
 
 function stripDiff(res) {
-  return { path: res.path, ok: res.ok, mode: res.mode, error: res.error, warning: res.warning, changedLines: res.changedLines, appliedCount: res.appliedCount, totalPatches: res.totalPatches };
+  const out = {
+    path: res.path,
+    ok: res.ok,
+    mode: res.mode,
+    error: res.error,
+    warning: res.warning,
+    changedLines: res.changedLines,
+    appliedCount: res.appliedCount,
+    totalPatches: res.totalPatches,
+  };
+  if (res.ok && res.diff?.length) {
+    out.compact = compactDiff(res.diff);
+    // 只有增量补丁才标"本轮新增行"；整文件新建/重写时整篇都是新的，标了反而没意义
+    if (res.mode === 'patch') out.addedLines = addedLineNumbers(res.diff).slice(0, 400);
+  }
+  return out;
 }
