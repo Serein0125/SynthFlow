@@ -1238,6 +1238,9 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* position: relative 是给 #selection-chip 用的 —— 那个标签要绝对定位浮在本区上方，
+     不能参与布局（参与布局就会在拖拽选中的过程中改变编辑器尺寸，把选中打断）。 */
+  position: relative;
   min-height: var(--composer-min-h);
   padding: 10px 12px 9px;
   background: var(--bg-1);
@@ -2770,14 +2773,30 @@ body.resizing .editor-host {
   white-space: nowrap;
 }
 
-/* --- 24.6 选中代码提需求 --- */
+/* --- 24.6 选中代码提需求 ---
+   注意：这个标签**必须脱离文档流**（绝对定位浮在输入区上方）。
+   它以前是输入区里的一个普通子元素，于是"选中代码"这个动作本身会
+   把输入区撑高 33px、把上面的 Monaco 容器压矮 33px ——
+   而那个尺寸变化正好发生在**鼠标拖拽选中的过程中**，
+   Monaco 的拖拽选中会被打断：第一次移动之后就不再有反应，
+   表现为"从行尾往前选，选不中这一行"。 */
 .selection-chip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 12px;
+  z-index: 6;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 10px 0;
+  max-width: calc(100% - 24px);
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  box-shadow: var(--sh-1);
   font-size: 11.5px;
   color: var(--text-2);
+  white-space: nowrap;
 }
 
 .selection-chip .tag {

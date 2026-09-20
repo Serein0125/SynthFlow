@@ -562,6 +562,97 @@ try {
     if (n < 2) throw new Error(`Alt+点击之后只有 ${n} 个光标，多选不可用`);
     console.log(`      ${dim(`Alt+点击产生了 ${n} 个光标`)}`);
   });
+  await test('★ 从行尾往前拖选整行必须选得中（选中标签不能改变编辑器尺寸）', async () => {
+    // 用户报的："光标定到代码末尾往前选中这一行代码时无法选中"。
+    // 根因：#selection-chip 以前是输入区里的普通子元素，它一出现就把输入区撑高 33px、
+    // 把上面的 Monaco 容器压矮 33px —— 而那个尺寸变化正好发生在**拖拽选中的过程中**，
+    // Monaco 的拖拽会被打断：第一次移动之后就不再有反应。
+    // 所以这条用例同时守两件事：拖拽要真的选中整行，且编辑器尺寸全程不变。
+    const prep = await cdp.evaluate(`
+      const ed = Editor.inst;
+      if (!ed) return null;
+      const em = ed.getModel();
+      em.setValue('const alpha = 1;\\nconst beta = 2;\\n');
+      ed.setPosition({ lineNumber: 1, column: em.getLineMaxColumn(1) });
+      ed.focus();
+      const col = em.getLineMaxColumn(1);
+      const a = ed.getScrolledVisiblePosition({ lineNumber: 1, column: col });
+      const z = ed.getScrolledVisiblePosition({ lineNumber: 1, column: 1 });
+      const host = document.querySelector('#editor-host').getBoundingClientRect();
+      return {
+        lineLen: em.getLineContent(1).length,
+        codeWrapH: Math.round(document.querySelector('.code-wrap').getBoundingClientRect().height),
+        from: { x: Math.round(host.x + a.left - 4), y: Math.round(host.y + a.top + a.height / 2) },
+        to: { x: Math.round(host.x + z.left), y: Math.round(host.y + z.top + z.height / 2) },
+      };
+    `);
+    if (!prep) {
+      console.log(`      ${dim('（Monaco 不可用，跳过）')}`);
+      return;
+    }
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: prep.from.x, y: prep.from.y, button: 'left', clickCount: 1, buttons: 1 });
+    for (let i = 1; i <= 8; i += 1) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: Math.round(prep.from.x + ((prep.to.x - prep.from.x) * i) / 8),
+        y: prep.from.y,
+        button: 'left',
+        buttons: 1,
+      });
+      await sleep(70);
+    }
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: prep.to.x, y: prep.to.y, button: 'left', buttons: 0 });
+    await sleep(250);
+
+    const r = await cdp.evaluate(`
+      const ed = Editor.inst;
+      const em = ed.getModel();
+      return {
+        text: em.getValueInRange(ed.getSelection()),
+        codeWrapH: Math.round(document.querySelector('.code-wrap').getBoundingClientRect().height),
+        chipVisible: document.querySelector('#selection-chip')?.getClientRects().length > 0,
+      };
+    `);
+    // 只要求"几乎整行"：鼠标坐标换算有一两个字符的误差是正常的
+    if (r.text.length < prep.lineLen - 3) {
+      throw new Error(`从行尾往前拖，只选中了 ${JSON.stringify(r.text)}（整行 ${prep.lineLen} 个字符）—— 拖拽被打断了`);
+    }
+    if (Math.abs(r.codeWrapH - prep.codeWrapH) > 2) {
+      throw new Error(
+        `拖拽过程中编辑器高度从 ${prep.codeWrapH}px 变成了 ${r.codeWrapH}px —— `
+        + '这正是打断拖拽的原因（选中标签必须脱离文档流）',
+      );
+    }
+    if (!r.chipVisible) throw new Error('选中之后没有出现"已选中"标签');
+    console.log(`      ${dim(`拖选整行成功：${JSON.stringify(r.text)} · 编辑器高度全程 ${r.codeWrapH}px · 标签已显示`)}`);
+  });
+
+  await test('选中标签出现/消失不能改变输入区与编辑器的高度', async () => {
+    const r = await cdp.evaluate(`
+      const h = (s) => Math.round(document.querySelector(s).getBoundingClientRect().height);
+      const setSel = (on) => {
+        S.selection = on ? { path: 'x.js', startLine: 1, endLine: 2, text: 'a', lang: 'javascript' } : null;
+        renderSelectionChip();
+      };
+      setSel(false);
+      const before = { composer: h('.composer'), codeWrap: h('.code-wrap') };
+      setSel(true);
+      const after = { composer: h('.composer'), codeWrap: h('.code-wrap'), chip: h('#selection-chip') };
+      setSel(false);
+      const back = { composer: h('.composer'), codeWrap: h('.code-wrap') };
+      return { before, after, back };
+    `);
+    if (r.after.composer !== r.before.composer) {
+      throw new Error(`标签出现后输入区从 ${r.before.composer}px 变成 ${r.after.composer}px —— 它必须不占布局`);
+    }
+    if (r.after.codeWrap !== r.before.codeWrap) {
+      throw new Error(`标签出现后编辑器从 ${r.before.codeWrap}px 变成 ${r.after.codeWrap}px —— 拖拽会被它打断`);
+    }
+    if (r.after.chip <= 0) throw new Error('标签没有真正显示出来');
+    if (r.back.composer !== r.before.composer) throw new Error('标签消失后高度没有复原');
+    console.log(`      ${dim(`标签高度 ${r.after.chip}px，输入区 ${r.before.composer}px 与编辑器 ${r.before.codeWrap}px 全程不变`)}`);
+  });
+
   await cdp.screenshot('03-multi-cursor');
 
   /* ------------------------------ F. 同步开关 ------------------------------ */
