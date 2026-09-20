@@ -441,7 +441,8 @@ const Panels = {
   },
 
   bindPicker() {
-    if (!el.pickerModal) return;
+    if (!el.pickerModal || this.pickerBound) return;
+    this.pickerBound = true;
     el.pickerClose.addEventListener('click', () => this.closePicker());
     el.pickerModal.addEventListener('click', (e) => {
       if (e.target === el.pickerModal) this.closePicker();

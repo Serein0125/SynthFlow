@@ -12,6 +12,9 @@
     "dev": "node src/server.js --port 7788 --open",
     "smoke": "node scripts/smoke.mjs",
     "bench": "node scripts/smoke.mjs --bench",
+    "uitest": "node scripts/uitest.mjs",
+    "uitest:model": "node scripts/uitest.mjs --with-model",
+    "livecheck": "node scripts/livecheck.mjs",
     "clean": "node scripts/clean.mjs"
   },
   "dependencies": {

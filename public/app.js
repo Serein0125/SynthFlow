@@ -230,13 +230,16 @@ async function renderCode({ soft = false, focus = false } = {}) {
 
   if (S.view === 'diff') {
     await showDiffView(path);
-  } else if (Editor.path === path) {
-    await Editor.refresh(content, { added });
   } else {
-    await Editor.open(path, content, { added, focus });
+    if (Editor.path === path) {
+      await Editor.refresh(content, { added });
+    } else {
+      await Editor.open(path, content, { added, focus });
+    }
+    // 想法 9：从差异切回代码时，必须把 Monaco 的显示主机切回来。
+    // 注意只能在这个分支里切 —— 放到 if 外面会把刚打开的差异视图又顶掉。
+    Editor.showHost('code');
   }
-  // 想法 9：不管走哪条分支，都要把显示的主机切对，否则从"差异"点回"代码"会卡在差异视图
-  Editor.showHost('code');
   if (el.fileMeta) {
     const lines = content.split('\n').length;
     const mark = added.length ? ` · 本轮 +${added.length}` : '';
@@ -1415,6 +1418,7 @@ function collectDirs(node, out = []) {
     S.view = LS.get('view', 'code');
     if (el.btnThinkMode) el.btnThinkMode.textContent = `思考：${S.thinkExpandAll ? '展开' : '折叠'}`;
     Panels.bindPalette();
+    Panels.bindPicker(); // 必须在启动时就绑：否则"点项目名直接开选择器"时按钮是死的
     bindUi();
     connect();
     updateCounter();

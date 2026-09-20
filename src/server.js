@@ -303,9 +303,12 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       case '/api/cancel':
         return { ok: true, cancelled: runner.cancel('user') };
 
-      case '/api/sync':
-        // 想法 1：一键关掉/开启"同步思考与同步生成"
-        return runner.setSync(body.enabled !== false && body.enabled !== undefined ? body.enabled : !runner.syncEnabled);
+      case '/api/sync': {
+        // 想法 1：一键关掉/开启"同步思考与同步生成"。
+        // 明确传了布尔值就照做，没传才当作切换。前端两个按钮都是显式传值的。
+        const wantSync = typeof body.enabled === 'boolean' ? body.enabled : !runner.syncEnabled;
+        return runner.setSync(wantSync);
+      }
 
       case '/api/version/save':
         // 想法 11：只有这个接口才会产生版本

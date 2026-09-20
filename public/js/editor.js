@@ -152,6 +152,9 @@ const Editor = {
     this.setDirty(false);
     if (this.mode === 'monaco') {
       const M = this.monaco;
+      // 想法 10：Monaco 的 setModel() 会自己去抢焦点（Chromium 下表现为 native-edit-context），
+      // 所以先记下当前焦点，切完模型再还回去 —— 否则你打字打到一半就被踢出输入框。
+      const prevActive = typeof document !== 'undefined' ? document.activeElement : null;
       let model = M.editor.getModel(M.Uri.parse(`inmemory://sf/${path}`));
       if (!model) model = M.editor.createModel(content, lang, M.Uri.parse(`inmemory://sf/${path}`));
       else model.setValue(content);
@@ -159,12 +162,29 @@ const Editor = {
       this.inst.setModel(model);
       this.suppressChange = false;
       this.applyAddedLines(added);
-      // 想法 10：只有用户主动点文件才把光标挪进编辑器，其它情况一律留在输入框
-      if (focus) this.inst.focus();
+      if (focus) {
+        this.inst.focus();
+      } else {
+        this.restoreFocus(prevActive);
+      }
     } else {
       this.renderFallback(content, added);
     }
     this.showHost('code');
+  },
+
+  /** 把焦点还给"本来该拿着焦点"的元素（通常是输入框）。 */
+  restoreFocus(prevActive) {
+    if (typeof document === 'undefined') return;
+    if (!prevActive || prevActive === document.body || !document.contains(prevActive)) return;
+    const restore = () => {
+      try {
+        prevActive.focus({ preventScroll: true });
+      } catch { /* ignore */ }
+    };
+    restore();
+    // Monaco 有时会在下一帧才把焦点拿走，所以再补一次
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restore);
   },
 
   /** 外部刷新内容（AI 写入 / 回退），不标记为脏。 */
@@ -174,11 +194,14 @@ const Editor = {
       // 用户有未保存改动时不覆盖编辑器内容，只更新缓存（内容见 S.files）
       return;
     }
+    const prevActive = typeof document !== 'undefined' ? document.activeElement : null;
     if (this.mode === 'monaco' && this.inst && this.inst.getModel()) {
       this.suppressChange = true;
       this.inst.getModel().setValue(content);
       this.suppressChange = false;
       this.applyAddedLines(added);
+      // 生成过程中不断刷新内容，也绝不能顺手把焦点抢走
+      if (prevActive && prevActive !== document.activeElement) this.restoreFocus(prevActive);
     } else {
       this.renderFallback(content, added);
     }

@@ -254,18 +254,32 @@ recordCommit()         若游标不在末尾 → 丢弃右侧分支（记入 dro
 | 高亮器 | 1 | 直接执行 app.js 里的真实实现，校验逐行不丢行、token 与 HTML 转义（XSS） |
 | 配置健壮性 | 1 | **BOM / 空文件 / 坏 JSON 都能回落**（记事本与 PowerShell 会写 BOM） |
 
-合计 **60 项**，全部离线、不消耗 API 额度。
+合计 **71 项**，全部离线、不消耗 API 额度。
+
+### 三层测试的分工
+
+| 层 | 工具 | 擅长抓什么 | 抓不到什么 |
+| --- | --- | --- | --- |
+| 单元 / 集成 | `scripts/smoke.mjs`（71 项，13s） | 算法、协议、决策逻辑、工作区语义、HTTP/SSE | 真实 DOM、真实浏览器行为、参数签名 |
+| DOM 垫片 | smoke 里的第 10 节 | 前端 id/类名契约、boot 抛错、事件处理异常 | 真实布局、Monaco、CSS |
+| **真实浏览器** | `scripts/uitest.mjs`（39 项，21s） | **点击链路、焦点、布局几何、真实 Monaco、下载/文件输入** | 复杂视觉审美 |
+| 端到端 | `scripts/livecheck.mjs` | 真实模型下的完整业务流程 | 界面 |
+
+**为什么三层都要有**：`/api/sync` 参数写反这类 bug，前两层全测不出来 ——
+单元测试直接调 `runner.setSync(false)` 是对的，DOM 垫片测的 `setSyncUi()` 也是对的，
+**只有真的在浏览器里点一下「停止生成」才会暴露**。
 
 `scripts/livecheck.mjs` 是**在线验收**：对着真实运行中的服务跑一遍五个场景，
 既验证产品，也验证你配置的模型是否真的可用（离线模式用 `--provider mock` 起服务即可零成本跑）。
 
 ### 无头浏览器不可靠，于是换成"最小 DOM 垫片"
 
-本机的无头 Edge 多次挂起且会在临时目录堆几十 MB，所以前端不再依赖浏览器验证：
+本机的无头 Edge 在做"dump-dom"时多次挂起且会在临时目录堆几十 MB，所以前端契约验证不再依赖它：
 `smoke.mjs` 用一个最小的 DOM 垫片（`querySelector` 返回记忆化桩节点、`EventTarget` 当 window、
 假 `fetch`/`EventSource`/`localStorage`）把 **真实的 app.js 源码**执行一遍，等 `boot()` 跑完，
 再手动派发 `intent / run:start / think:delta / file:start / file:delta / file:end / run:applied / run:done / state`
 等 SSE 事件，断言状态栏、轮次块、用量显示都正确。
+（真正的浏览器交互验证交给第 13 节的 CDP 测试台 —— 那里不存在"页面永远加载不完"的问题。）
 
 这一条实测抓出了三个会白屏的真 bug：
 
@@ -479,7 +493,63 @@ for (rel of projectFiles)     if (!(rel in snapshot.files)) deleted.add(rel) // 
 
 ---
 
-## 13. 已知取舍
+## 13. UI 自动化测试台（scripts/uitest.mjs）
+
+### 13.1 为什么要自己写
+
+无头浏览器 + `--dump-dom` 那条路走不通：主页面有一条常开的 SSE 连接，页面永远不会"加载完成"，
+`--dump-dom` 会一直挂着；而且 Edge 每次无头启动都会在临时目录堆 20~50 MB，反复几次就是几百 MB。
+
+正解是 **CDP**：`--remote-debugging-port=0` 启动浏览器，从 `DevToolsActivePort` 文件读出真实端口，
+`GET /json/list` 拿到 page target 的 WebSocket 地址，然后就是 JSON-RPC。
+Node 22+ 内置了 `WebSocket`，所以**一个依赖都不用加**（对比 Puppeteer 要下几百 MB 的 Chromium）。
+
+```
+launch Edge(headless, 独立 profile) -> 读 DevToolsActivePort -> /json/list -> WebSocket
+  -> Page.enable / Runtime.enable / DOM.enable
+  -> Runtime.evaluate  读写页面、点击、打字
+  -> Page.captureScreenshot  存证
+  -> Runtime.exceptionThrown / consoleAPICalled  抓崩溃
+```
+
+浏览器生命周期与 profile 目录都在 `OUT = .synthflow/uitest/` 下，脚本结束（含异常路径）时
+在 `finally` 里 `close()` —— 关 WS、杀进程、删 profile。这是"别把电脑塞满"的实际落实。
+
+### 13.2 三条踩过的坑（都写进代码注释了）
+
+1. **`$visible()` 必须返回表达式**。它会被拼进 `Boolean(...)` 里求值；
+   如果返回的是语句序列（`const el = ...; return ...`），整个表达式就是语法错误，
+   `evaluate` 直接抛错，`waitFor` 一直重试到超时 —— 症状是"所有可见性检查都失败"，看起来像产品坏了。
+2. **弹窗不能用 `offsetParent` 判断可见性**。`position: fixed` 元素的 `offsetParent` 恒为 null。
+   改用 `getComputedStyle` + `getClientRects().length`。
+3. **`<input>` 的 `textContent` 永远是空的**，路径要看 `.value`。
+
+### 13.3 它逼出来的产品修复
+
+| 现象 | 真因 |
+| --- | --- |
+| 目录选择弹窗按钮全死 | `bindPicker()` 挂在"设置面板首次打开"的初始化链上，直接开选择器时事件还没绑 |
+| 差异视图刚打开就被顶掉 | 修 #9 时把 `Editor.showHost('code')` 放到了 if/else **外面** |
+| 光标乱定位（想法 10 的根因） | Monaco 的 `setModel()` 会主动抢焦点，Chromium 下表现为 `native-edit-context` |
+| 已关闭同步时点"停止生成"反而打开 | `/api/sync` 的三元条件把 `{enabled:false}` 判成了"切换" |
+
+最后一条尤其说明这个测试台的价值：**签名/参数类的错误，静态检查、单元测试、DOM 垫片都抓不到，
+只有真的点一下才会暴露。**
+
+### 13.4 视觉断言替代人眼
+
+因为当前模型看不了图，所以把"看图"能发现的问题改成了可断言的量：
+
+- `documentElement.scrollWidth <= innerWidth + 2` —— 没有横向溢出
+- 三栏宽度都 > 0 且总和不超视口 —— 没有栏位塌陷
+- 8 个关键控件都在视口内、尺寸 > 8px —— 没有被挤出去
+- `.composer` 实测高度 ≈ `--composer-h` —— 布局变量真的生效
+
+这些比"截图看一眼"更适合做回归：它们有明确阈值，能在 CI 里跑，也不受分辨率影响。
+
+---
+
+## 14. 已知取舍
 
 - 回退是**线性版本链 + 游标**：能自由往返，但在历史版本上继续生成会丢弃右侧分支（界面会告知丢弃了几个）。
   版本树会让 UI 与心智负担都变重，当前不值。
