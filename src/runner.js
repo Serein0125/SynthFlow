@@ -1062,7 +1062,7 @@ export class Runner {
           // v3.3：时间线要显示"还没保存的每一轮"，⏪ 也要能一轮一轮往回退
           rounds: s.roundJournalBrief(),
         }
-        : { round: 0, files: [], at: null, canUndo: false, rounds: [] },
+        : null,
       syncEnabled: this.syncEnabled,
       intent: this.lastIntent,
       decision: this.lastDecision ? { mode: this.lastDecision.mode, ratio: this.lastDecision.ratio, reason: this.lastDecision.reason } : null,

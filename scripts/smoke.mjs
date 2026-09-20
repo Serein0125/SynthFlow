@@ -1292,6 +1292,10 @@ await test('想法 11：手动保存模型 —— 不点保存就不产生版本
   assert.equal(saved.ok, true);
   assert.equal(s.versions.length, 2, '保存后应出现一个版本');
   assert.equal(s.pendingRound, null, '保存后清空未保存状态');
+  // 契约：没有未保存改动时，snapshot().unsaved 必须是 null（不是 {round:0}）。
+  // 之前轮次回退那轮改成"恒为对象"，livecheck 里 `!st.unsaved` 就永远为假 ——
+  // 这一条专门守住这个契约，别再让在线验收脚本和实现各说各话。
+  assert.equal(r.snapshot().unsaved, null, '没有未保存改动时 snapshot().unsaved 必须是 null');
   assert.match(s.versions[1].summary, /存一下/);
   assert.equal(s.versions[1].files.length, 2, '版本应记录两轮涉及的文件');
 
