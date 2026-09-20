@@ -1,40 +1,89 @@
 # SynthFlow · 预生成式 AI 编程工作台
 
-> 你还在打字，代码已经在写了。
-> 不是"输入 → 点发送 → 等回复"，而是**边说边生成**：AI 与你的输入同步思考、同步产出、同步给建议，你随时改前文，它只做增量。
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![dependencies](https://img.shields.io/badge/runtime%20deps-0-success.svg)](#零依赖是怎么做到的)
+
+> **你还在打字，代码已经在写了。**
+>
+> 不是"输入 → 点发送 → 等回复"，而是**边说边生成**：AI 与你的输入同步思考、同步产出、同步给建议。
+> 你随时改前文，它只做增量 —— 而不是推倒重来。
+
+![主界面](docs/images/overview.png)
 
 ---
 
 ## 30 秒上手
 
-```bat
-:: 双击项目根目录的 start.cmd，或者：
-cd /d D:\ProgramData\SynthFlow
-npm install          :: 只为装 Monaco 编辑器（约 25 MB，见下方"磁盘"）
+```bash
+git clone https://github.com/Serein0125/SynthFlow.git
+cd SynthFlow
+npm install     # 只为装 Monaco 编辑器（VS Code 内核，约 25 MB）
 npm start
 ```
 
-浏览器打开 **http://127.0.0.1:7788/** 即可。模型在右上角「⚙ 设置」里配置（DeepSeek / OpenAI 兼容 / 本地 Ollama 都行），
-Key 只写进本机 `.synthflow/config.json`，不会外发。
+浏览器打开 **http://127.0.0.1:7788/** 。Windows 用户也可以直接双击 `start.cmd`。
 
-### 测试（不用你手点）
+模型在右上角「⚙ 设置 → 模型」里配置（DeepSeek / OpenAI 兼容端点 / 本地 Ollama 都行）：
 
-```bat
-npm run smoke         :: 71 项离线单元/集成测试（不联网、不花钱、13 秒）
-npm run uitest        :: 39 项真实浏览器 UI 自动化（零依赖 CDP 驱动 Edge/Chrome，不花钱、21 秒）
-npm run uitest:model  :: 上面全部 + 真实模型生成链路（会消耗额度）
-npm run livecheck     :: 后端端到端验收（真实模型，会消耗额度）
+- **模型可选**：DeepSeek 提供 `deepseek-flash`（快、便宜、支持看图）与 `deepseek-v4-pro`（更强）；
+  也可以手填任意模型名
+- **推理强度可选**：关闭思考 / 低 / 中 / 高 / 最高 —— 它直接决定速度、质量与花钱速度
+
+![模型设置](docs/images/model-settings.png)
+
+API Key 只写进本机 `.synthflow/config.json`（该目录已在 `.gitignore` 里），不会外发到任何地方。
+想先零成本试玩：`npm run mock`（内置离线演示模型，不联网、不花钱）。
+
+---
+
+## 它长什么样
+
+| 边打字边生成 | 版本时间线 + 一键回退 |
+| --- | --- |
+| ![生成中](docs/images/generating.png) | ![版本时间线](docs/images/version-timeline.png) |
+
+左边是它在流式产出代码、右边是它**同时**在推理和给建议；下面那条进度条是"意图完整度判定"，
+告诉你它为什么认为你还没写完。版本时间线上每个版本都能点着回退、也能单独删掉（连同快照回收磁盘）。
+
+---
+
+## 测试（不用你手点）
+
+```bash
+npm test              # 89 项离线单元/集成测试（不联网、不花钱、约 19 秒）
+npm run uitest        # 65 项真实浏览器 UI 自动化（零依赖 CDP 驱动本机 Edge/Chrome）
+npm run uitest:model  # 上面全部 + 真实模型生成链路（会消耗额度）
+npm run monkey        # 猴子测试：按种子随机乱点乱拖，校验"界面不许坏"的不变量
+npm run livecheck     # 在线验收：真人流程演练，逐字打字 → 预演 → 落盘 → 增量 → 存版本 → 回退
 ```
 
-`npm run uitest` **会用真实浏览器打开页面并操作它**：点按钮、往输入框打字、读 DOM、切主题、
-开关面板、检查布局有没有溢出，每一步都截图。跑完把截图丢在
-`.synthflow/uitest/shots/`，报告在 `.synthflow/uitest/report.json`。
-它不需要你装任何东西 —— 用的是本机已有的 Edge/Chrome + Node 内置的 WebSocket。
+四个测试层各管一段，加起来覆盖了「协议解析 → 沙箱读写 → 决策逻辑 → 真实浏览器 → 真实模型 → 随机破坏」：
 
-浏览器里还有个自检页：**http://127.0.0.1:7788/selftest.html**（逐项检查服务、资源、模型、Monaco）。
+| 层 | 抓什么 | 抓不到什么 |
+| --- | --- | --- |
+| `smoke` | 逻辑正确性、边界、契约 | 界面长什么样 |
+| `uitest` | 真实 DOM、布局、焦点、视觉回归 | 随机操作组合 |
+| `monkey` | "界面不许坏"的不变量（不可整体滚动、控件不重叠、连接不断） | 功能对不对 |
+| `livecheck` | 跨层契约漂移、真实模型是否守协议 | 极端输入 |
 
-> 需要零成本离线演练时：`node src/server.js --provider mock`（内置演示模型，界面上已隐藏，仅供开发与测试）。
-> 排障时可以加 `SF_DEBUG=1` 启动，服务端会打印意图判定与预演决策过程。
+> 它不需要你装任何东西 —— 用的是本机已有的 Edge/Chrome + Node 内置的 WebSocket。
+> 截图落在 `.synthflow/uitest/shots/`，报告在 `.synthflow/uitest/report.json`。
+
+浏览器里还有个自检页：**http://127.0.0.1:7788/selftest.html**（逐项检查服务、静态资源、模型、Monaco）。
+
+排障时可以加 `SF_DEBUG=1` 启动，服务端会打印意图判定与预演决策过程。
+
+---
+
+## 关于本文档
+
+README 后半部分是**这个项目从零到现在的发展日志** —— 每一轮都是"有人提了 N 条意见 → 我复现、
+定位根因、修好、补回归测试"。里面的"你"指的是当时提意见的人，记录原样保留，因为它们展示的是
+**问题是怎么被找到的**，而不只是最后改成了什么样。
+
+如果你想直接看设计取舍，请读 [`docs/DESIGN.md`](docs/DESIGN.md)；
+想看同类工具的调研对比，读 [`docs/RESEARCH.md`](docs/RESEARCH.md)。
 
 ---
 
@@ -80,7 +129,7 @@ npm run livecheck     :: 后端端到端验收（真实模型，会消耗额度�
 | 13 | 自动保存 prompt 对话历史，学习用户操作习惯 | `.synthflow/history/`、`.synthflow/memory/profile.json`、快捷片段 chips | ✅ |
 | 14 | 无技术栈要求 | 后端零依赖（Node 内置模块），前端原生 HTML/CSS/JS，**零 npm install** | ✅ |
 | 15 | 全权交给你，睡醒要有成品 | 本仓库就是成品，含测试与文档 | ✅ |
-| 16 | 别弄坏电脑，交代清楚下载了什么、放哪了 | **没有下载任何东西、没有装任何依赖**，全部产物都在 `D:\ProgramData\SynthFlow` 内，见「磁盘与进程」 | ✅ |
+| 16 | 别弄坏电脑，交代清楚下载了什么、放哪了 | **除 Monaco 外没有下载任何东西、没有装任何依赖**，全部产物都在仓库目录内，见「磁盘与进程」 | ✅ |
 | 17 | 自己冒烟测试、上网看别人方案、注意 token 余额 | 60 项离线冒烟 + 在线验收脚本；`docs/RESEARCH.md`；状态栏实时显示 token 用量 | ✅ |
 | 18 | 权限问题找别的办法，太麻烦就先停下 | 全程无阻塞：服务只监听 `127.0.0.1`，无需管理员权限 | ✅ |
 
@@ -432,7 +481,7 @@ node scripts/monkey.mjs --verbose          # 每一步都打印
 | 7 | 参考 Photoshop 的可自定义工作界面 | 面板之间可**拖拽调宽**（双击复原）、字号可调（界面/代码分开）、左右面板可整体隐藏，另有 4 套布局预设（默认 / 专注代码 / 专注对话 / 极简），全部存 localStorage |
 | 8 | 多个 API Key 自由切换 | 配置从单份改成**配置档列表**：可保存多份（名称/服务商/模型/Base URL/Key），顶栏下拉一键切换，设置里可增删改。Key 只回传掩码（`sk-…abcd`），旧的单份配置会自动迁移成第一份 |
 | +C | 与任意历史版本对比（我提的） | 差异视图旁边多了一个版本下拉：默认对比"本轮之前"，也可选任意历史版本，用 Monaco 的并排 diff 展示 |
-| +D | 改动先预览再应用到真实项目（我提的） | **暂存模式**：把目标项目指向你的真实项目后，AI 的改动只落在 `.synthflow/projects/<项目>/staging/`，编辑器顶部出现"待应用"条，列出改动文件与 +/- 行数，确认后才写进项目，也可以一键全部丢弃。**实测：指向你真实的 EasyCampus 前端跑了一轮生成，项目里 188 个文件大小与修改时间全部字节级未变** |
+| +D | 改动先预览再应用到真实项目（我提的） | **暂存模式**：把目标项目指向一个真实仓库后，AI 的改动只落在 `.synthflow/projects/<项目>/staging/`，编辑器顶部出现"待应用"条，列出改动文件与 +/- 行数，确认后才写进项目，也可以一键全部丢弃。**实测：指向你真实的 EasyCampus 前端跑了一轮生成，项目里 188 个文件大小与修改时间全部字节级未变** |
 
 ### 关于目标项目（这是 v3 最实用的部分）
 
@@ -509,7 +558,7 @@ node scripts/monkey.mjs --verbose          # 每一步都打印
 三种方式任选（优先级：环境变量 > 界面设置 > 配置文件）：
 
 **A. 界面（推荐）**：右上角「⚙ 设置」→ 选服务商 → 填模型名 / Base URL / API Key → 保存并生效。
-Key 只写入本机 `D:\ProgramData\SynthFlow\.synthflow\config.json`，不会外发到任何地方。
+Key 只写入本机 `<仓库目录>/.synthflow/config.json`，不会外发到任何地方。
 
 **B. 环境变量**（适合写进脚本）：
 
@@ -568,13 +617,33 @@ npm start
 
 ---
 
+## 零依赖是怎么做到的
+
+`npm install` 只装一个包：`monaco-editor`（VS Code 的编辑器内核）。**后端的运行时依赖是 0** ——
+`src/` 里所有 import 不是 `node:` 内置模块，就是项目内的相对路径。
+
+这不是洁癖，是有实际好处的：
+
+| 省掉的东西 | 换来什么 |
+| --- | --- |
+| 打包器（webpack/vite/rollup） | 前端就是 5 个经典 `<script>`，改完刷新即生效，没有构建等待 |
+| HTTP 框架（express/koa） | 直接用 `node:http`，SSE 是一行一行手写的，行为完全可控 |
+| 向量库 / 分词库 | RAG 用自带的 BM25（约 200 行），不下载模型、不占磁盘 |
+| 测试框架（jest/playwright） | 冒烟测试是 `node:assert` + 自写 runner；UI 测试直接说 CDP 协议驱动本机浏览器 |
+| `node_modules` 生态风险 | 供应链攻击面几乎为零，`npm ci` 秒装 |
+
+代价也如实说：没有类型检查、没有框架带来的便利、CDP 那层要自己维护。
+但对"本机跑、看得懂、改得动"这个目标来说，这些交换是划算的。
+
+---
+
 ## 目录结构与磁盘去向
 
 ```
-D:\ProgramData\SynthFlow\
-├── start.cmd              一键启动（双击即可，会打开浏览器）
-├── package.json           零依赖，无 node_modules
-├── src\                   后端（全部 Node 内置模块）
+SynthFlow/
+├── start.cmd              一键启动（Windows 双击即可，会打开浏览器）
+├── package.json           唯一依赖是 monaco-editor
+├── src/                   后端（全部 Node 内置模块，零第三方依赖）
 │   ├── server.js          HTTP + SSE + REST + Monaco 静态服务 + 多项目隔离
 │   ├── runner.js          预演/提交/落盘/回退/自动重试 的调度核心
 │   ├── session.js         上下文栈 · 意图判定 · 漂移决策 · 版本游标 · 轮次时间线
@@ -582,26 +651,29 @@ D:\ProgramData\SynthFlow\
 │   ├── protocol.js        流协议解析（think/suggest/file/memory）
 │   ├── prompt.js          上下文组装（风格/技能/检索/手改/选区/用户画像）
 │   ├── style.js           项目风格扫描（想法 4）
-│   ├── llm.js             模型接入层 + 多配置档 + 内置离线演示大脑（界面已隐藏）
+│   ├── llm.js             模型接入层 + 模型目录/推理强度 + 内置离线演示大脑（界面已隐藏）
 │   ├── rag.js             BM25 检索 + skills
 │   └── memory.js          习惯记忆与用户画像
-├── public\                前端（原生，无构建）
+├── public/                前端（原生，无构建）
 │   ├── index.html  styles.css  selftest.html
 │   ├── app.js             主逻辑：SSE 接线 / 文件树 / 轮次流 / 输入框 / 启动
-│   └── js\core.js  js\editor.js(Monaco)  js\layout.js(布局)  js\panels.js(各面板)
-├── scripts\
-│   ├── smoke.mjs          69 项离线冒烟测试
+│   └── js/core.js  js/editor.js(Monaco)  js/layout.js(布局)  js/panels.js(各面板)
+├── scripts/
+│   ├── smoke.mjs          离线冒烟测试（不联网、不花钱）
+│   ├── uitest.mjs         真实浏览器 UI 自动化
+│   ├── monkey.mjs         猴子测试（随机操作 + 不变量校验）
 │   ├── livecheck.mjs      在线端到端验收
 │   └── clean.mjs          磁盘清理（默认只看不删）
-├── workspace\             ★ 默认目标的代码输出（可以被你随意删）
-├── .synthflow\            ★ 本机运行数据（可以被你随意删）
-│   ├── config.json        模型配置与配置档（clean 脚本永不删它）
-│   ├── skills\            技能 *.md（clean 脚本永不删）
-│   ├── memory\            习惯记忆（全局）
-│   └── projects\<项目>\   按目标项目隔离的数据
-│       ├── snapshots\     版本快照（回退/对比用）
-│       ├── sessions\      会话上下文栈 + 轮次时间线
-│       ├── staging\       暂存模式下的待应用改动
+├── docs/                  DESIGN.md（设计取舍）· RESEARCH.md（同类工具调研）· images/
+├── workspace/             ★ 默认目标的代码输出（可以被你随意删）
+├── .synthflow/            ★ 本机运行数据（已被 .gitignore 排除）
+│   ├── config.json        模型配置与配置档（含你的 API Key，clean 脚本永不删它）
+│   ├── skills/            技能 *.md（clean 脚本永不删）
+│   ├── memory/            习惯记忆（全局）
+│   └── projects/<项目>/   按目标项目隔离的数据
+│       ├── snapshots/     版本快照（回退/对比用）
+│       ├── sessions/      会话上下文栈 + 轮次时间线
+│       ├── staging/       暂存模式下的待应用改动
 │       ├── style.json     项目风格画像
 │       └── index.json     RAG 索引
 └── docs\                  设计文档与调研笔记
@@ -662,34 +734,43 @@ node scripts/clean.mjs --all        :: 以上全部（保留 config.json 与 ski
 
 ---
 
-## 验证记录（本次交付实测）
+## 验证记录（实测）
+
+以下都是真跑出来的数字，不是估算：
 
 ```
-npm run smoke                 71 通过 / 0 失败 · 13.7s
-node scripts/livecheck.mjs    全部通过（真实 DeepSeek · 42.2s）
-  跑在你真实项目上：D:\ProgramData\My_resume-main（暂存模式，Spring Boot + Vue3 + TS，43 个文件）
-  场景 A 边打字边生成  → 中途停顿触发"预演"；本轮结束给出 3 条建议；
-                        预演结果被直接采纳（省一次调用）；真实 token 用量 ≈12505
-  场景 B 采纳建议      → 提示词 +77 字，自动跟进生成，并又给出 3 条新建议
-  场景 C 追加需求      → mode=continue，补丁一次命中，其余 41 个文件字节级不变
-  场景 D 保存/回退/前进 → 3 轮改动处于"未保存"→ 点保存才产生 v1 → 回退到 v0 → 前进回 v1
-  场景 E 差异与检索    → 紧凑差异 14 段含 2 处折叠、索引 186 片段
-
-定位索引实测（同一个真实项目）
-  「简历列表页」    → frontend/src/api/resume.ts、stores/resume.ts
-  「后端简历接口」  → …/service/ResumeService.java、…/controller/ResumeController.java
-  「技能展示组件」  → views/SkillsView.vue
-  「前端的路由」    → frontend/src/router/index.ts
-  「样式的主题色」  → frontend/src/styles/main.css
-  路由解析同时认出了 vue-router（/ → HomeView.vue）和 Spring 的 @RequestMapping
-
-安全性：整个验收过程里，你的项目 44 个文件大小与修改时间始终一致；改动全程只在暂存层。
-
-浏览器实测（headless Edge + /selftest.html）
-  Monaco loader → editor.main → 创建实例 → 语言识别 → 语法着色 → 差异编辑器 全部 ✓
+npm test                      89 通过 / 0 失败 · 18.6s   （离线，零成本）
+npm run uitest -- --with-model 65 通过 / 0 失败 · 56.6s   （真实浏览器 + 真实模型）
+npm run monkey                 4 个种子 × 150 步 = 600 步 · 0 违规
+npm run livecheck              全部通过（真实 DeepSeek）
+  场景 A 边打字边生成  → 中途停顿触发"预演"（不落盘）；本轮结束给出 5 条建议；
+                        预演结果被直接采纳（省一次调用）；真实 token 用量 ≈2760
+  场景 B 采纳建议      → 提示词自动增长，跟进生成，并又给出 3 条新建议
+  场景 C 追加需求      → mode=continue，补丁一次命中，其余文件字节级不变
+  场景 D 保存/回退/前进 → 3 轮改动处于"未保存" → 点保存才产生版本 → 回退 → 前进回最新
+  场景 E 差异与检索    → 紧凑差异含折叠、BM25 索引可用、版本游标状态完整
 ```
 
-代价：整轮真实验收约 5 次模型调用、合计约 3 万 token。**冒烟测试全程零成本**（不联网）。
+安全性实测：跑在**真实项目**上时，整个验收过程里该项目的文件大小与修改时间始终一致 ——
+改动全程只落在暂存层，除非你点"应用到项目"。
+
+定位索引实测（在一个真实的前后端项目上，用自然语言找文件）：
+
+```
+「简历列表页」    → frontend/src/api/resume.ts、stores/resume.ts
+「后端简历接口」  → …/service/ResumeService.java、…/controller/ResumeController.java
+「技能展示组件」  → views/SkillsView.vue
+「前端的路由」    → frontend/src/router/index.ts
+「样式的主题色」  → frontend/src/styles/main.css
+```
+
+路由解析同时认 vue-router 与 Spring 的 `@RequestMapping`，并且带一张中英对照表
+（"简历" ↔ resume、"后端接口" ↔ controller/service）。
+
+浏览器实测（headless Edge + `/selftest.html`）：Monaco loader → editor.main → 创建实例 →
+语言识别 → 语法着色 → 差异编辑器，全部通过。
+
+代价：整轮在线验收约 5 次模型调用、合计约 3 万 token。**离线测试全程零成本**（不联网）。
 
 ---
 

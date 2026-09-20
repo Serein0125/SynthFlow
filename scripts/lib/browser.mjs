@@ -10,13 +10,42 @@ import { spawn } from 'node:child_process';
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function findBrowser() {
-  const candidates = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ];
-  return candidates.find((p) => fs.existsSync(p)) ?? null;
+  const candidates = process.platform === 'win32'
+    ? [
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ]
+    : process.platform === 'darwin'
+      ? [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+      ]
+      : [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/microsoft-edge',
+        '/snap/bin/chromium',
+      ];
+  const hit = candidates.find((p) => fs.existsSync(p));
+  if (hit) return hit;
+  // 兜底：从 PATH 里找一个（很多 Linux 发行版把 chrome 装在别处）
+  for (const name of ['google-chrome', 'chromium', 'chromium-browser', 'microsoft-edge', 'chrome']) {
+    for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+      if (!dir) continue;
+      const p = path.join(dir, name);
+      try {
+        fs.accessSync(p, fs.constants.X_OK);
+        return p;
+      } catch { /* 继续找 */ }
+    }
+  }
+  return null;
 }
 
 export class Cdp {

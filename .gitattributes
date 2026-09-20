@@ -1,0 +1,15 @@
+# 统一换行符，避免不同平台 clone 之后产生"整个文件都改了"的假 diff
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则某些环境下会执行异常
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

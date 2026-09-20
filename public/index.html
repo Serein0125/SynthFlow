@@ -190,7 +190,7 @@
       <p class="muted">浏览到你项目的根目录（含 package.json / .git 的那种）。默认用「暂存模式」，AI 的改动要你确认后才会写进去。</p>
       <div class="picker-bar">
         <button id="picker-up" class="btn ghost small">↑ 上一级</button>
-        <input id="picker-path" class="picker-path" placeholder="也可以直接粘贴路径，例如 D:\my-project" />
+        <input id="picker-path" class="picker-path" placeholder="也可以直接粘贴路径，例如 项目所在文件夹" />
         <button id="picker-go" class="btn small">前往</button>
       </div>
       <div id="picker-drives" class="picker-drives"></div>
@@ -309,7 +309,7 @@
         <section data-pane="project" class="hidden">
           <p class="muted">当前目标：<code id="pj-current"></code></p>
           <div class="form-grid">
-            <label>项目目录<input id="pj-dir" placeholder="留空 = 用 D:\ProgramData\SynthFlow\workspace" /></label>
+            <label>项目目录<input id="pj-dir" placeholder="留空 = 用本项目自带的 workspace 目录" /></label>
             <label>写入方式
               <select id="pj-mode">
                 <option value="staging">暂存模式：改动先放着，我确认后再写入项目（推荐）</option>

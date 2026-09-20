@@ -64,12 +64,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* ============================ 找浏览器 ============================ */
 
 function findBrowser() {
-  const candidates = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ];
+  const candidates = process.platform === 'win32'
+    ? [
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ]
+    : process.platform === 'darwin'
+      ? [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      ]
+      : [
+        '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/microsoft-edge',
+      ];
   return candidates.find((p) => fs.existsSync(p)) ?? null;
 }
 
@@ -943,7 +954,9 @@ try {
   });
 
   await test('★ 输入路径 → 切换项目（必须秒回、弹窗自动关闭、界面重置）', async () => {
-    const target = 'D:\\ProgramData';
+    // 用一个"文件很多但不是项目"的目录来验切换速度。取本仓库的上一级 ——
+    // 它是跨平台的，不写死盘符。
+    const target = path.dirname(ROOT);
     await cdp.evaluate(`
       const el = document.querySelector('#picker-path');
       el.value = ${JSON.stringify(target)};
@@ -958,7 +971,8 @@ try {
     if (ms > 15000) throw new Error(`切换用了 ${ms}ms，太久（用户会以为卡死）`);
 
     try {
-      await cdp.waitFor(`document.querySelector('#project-chip').textContent.includes('ProgramData')`, { timeout: 15000, label: '项目徽标更新' });
+      const wantName = path.basename(target);
+      await cdp.waitFor(`document.querySelector('#project-chip').textContent.includes(${JSON.stringify(wantName)})`, { timeout: 15000, label: '项目徽标更新' });
     } catch (err) {
       const diag = await cdp.evaluate(`
         return {
@@ -989,9 +1003,11 @@ try {
   await cdp.screenshot('08-switched');
 
   await test('★ 切到盘符根目录会给出警告而不是报错', async () => {
+    // 盘符根目录：Windows 是 D:\，类 Unix 是 /。用 path.parse 推出来，不写死。
+    const rootDir = path.parse(ROOT).root;
     await cdp.evaluate($click('#project-chip'));
     await cdp.waitFor($visible('#picker-modal'), { timeout: 8000, label: '选择器出现' });
-    await cdp.evaluate(`document.querySelector('#picker-path').value = 'D:\\\\'; return true;`);
+    await cdp.evaluate(`document.querySelector('#picker-path').value = ${JSON.stringify(rootDir)}; return true;`);
     // 会弹 confirm，先自动点掉
     await cdp.evaluate(`window.__sfOrigConfirm = window.confirm; window.confirm = () => true; return true;`);
     const t0 = Date.now();
@@ -1000,9 +1016,9 @@ try {
     const ms = Date.now() - t0;
     await cdp.evaluate(`window.confirm = window.__sfOrigConfirm; return true;`);
     const st = await (await fetch(`${BASE}/api/state`)).json();
-    if (st.paths.projectDir !== 'D:\\') throw new Error(`没切到 D:\\（实际 ${st.paths.projectDir}）`);
-    if (ms > 20000) throw new Error(`切盘符根目录用了 ${ms}ms`);
-    console.log(`      ${dim(`D:\\ 切换耗时 ${ms}ms，${st.workspace.files} 个文件`)}`);
+    if (st.paths.projectDir !== rootDir) throw new Error(`没切到 ${rootDir}（实际 ${st.paths.projectDir}）`);
+    if (ms > 20000) throw new Error(`切根目录用了 ${ms}ms`);
+    console.log(`      ${dim(`${rootDir} 切换耗时 ${ms}ms，${st.workspace.files} 个文件`)}`);
   });
 
   await test('切回原项目', async () => {

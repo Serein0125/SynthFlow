@@ -3,13 +3,35 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "SynthFlow — 预生成式 AI 编程工作台：边打字边流式生成代码，并行输出优化建议，项目级多文件增量改写，一键回退。",
+  "description": "预生成式 AI 编程工作台：不等你点发送，边打字边流式生成代码，并行给出建议，项目级多文件增量改写，一键回退。",
+  "keywords": [
+    "ai-coding",
+    "speculative-generation",
+    "stream-code",
+    "code-generation",
+    "llm",
+    "deepseek",
+    "local-first",
+    "zero-dependency",
+    "monaco-editor"
+  ],
+  "homepage": "https://github.com/Serein0125/SynthFlow#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Serein0125/SynthFlow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Serein0125/SynthFlow/issues"
+  },
+  "author": "Serein0125",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node src/server.js --port 7788 --open",
+    "mock": "node src/server.js --provider mock",
     "smoke": "node scripts/smoke.mjs",
     "bench": "node scripts/smoke.mjs --bench",
     "uitest": "node scripts/uitest.mjs",
@@ -17,16 +39,10 @@
     "monkey": "node scripts/monkey.mjs",
     "monkey:model": "node scripts/monkey.mjs --with-model --rounds=80",
     "livecheck": "node scripts/livecheck.mjs",
-    "clean": "node scripts/clean.mjs"
+    "clean": "node scripts/clean.mjs",
+    "test": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "monaco-editor": "^0.56.0"
-  },
-  "keywords": [
-    "ai-coding",
-    "speculative-generation",
-    "stream-code",
-    "local-first"
-  ],
-  "license": "MIT"
+  }
 }
