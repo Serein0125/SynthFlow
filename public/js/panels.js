@@ -569,16 +569,28 @@ function flattenFiles(node) {
 
 async function refreshAll() {
   // 想法 15：不再把整个项目的文件内容一次性拉下来（大项目会卡死），只刷新树与元数据
+  //
+  // epoch 守卫：这一串请求是串行的（树 → 待应用 → 版本 → 当前文件），
+  // 如果在请求飞在半路时用户又切了项目，回来的就是**上一个项目的数据**。
+  // 以前没有这层保护，那些迟到的响应会把刚重置好的界面覆盖回去
+  //（表现就是"切了项目，版本时间线还是旧的"）。
+  const epoch = S.epoch ?? 0;
+  const fresh = () => (S.epoch ?? 0) === epoch;
+
   const tree = await get('/api/tree');
+  if (!fresh()) return;
   renderTree(tree.tree);
   updateWorkspaceStats();
   const pending = await get('/api/pending');
+  if (!fresh()) return;
   renderPending(pending);
   const versions = await get('/api/versions');
+  if (!fresh()) return;
   renderVersions(versions);
   // 当前打开的文件重新拉一次；其它文件等用户点开时再按需加载
   if (S.current) {
     await pullFile(S.current);
+    if (!fresh()) return;
     await renderCode();
   } else {
     const first = flattenFiles(tree.tree ?? {})[0];

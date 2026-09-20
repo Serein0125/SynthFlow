@@ -457,6 +457,22 @@ export class Workspace {
     return index.snapshots ?? [];
   }
 
+  /**
+   * 彻底删掉一个快照（连同磁盘上的副本），用于"删除版本"时回收空间。
+   * 删不掉的（目录被占用等）不当作错误 —— 至多是这份快照暂时占着磁盘。
+   */
+  dropSnapshot(snapshotId) {
+    if (!snapshotId) return false;
+    let ok = false;
+    try {
+      fs.rmSync(path.join(this.snapshotsDir, snapshotId), { recursive: true, force: true });
+      ok = true;
+    } catch { /* ignore */ }
+    const list = this.listSnapshots().filter((s) => s.id !== snapshotId);
+    writeJsonAtomic(path.join(this.snapshotsDir, 'index.json'), { snapshots: list });
+    return ok;
+  }
+
   snapshot({ label = '', turnId = '', segmentIds = [], runId = '', meta = {} } = {}) {
     const list = this.listSnapshots();
     const seq = list.length ? Math.max(...list.map((s) => s.seq)) + 1 : 1;

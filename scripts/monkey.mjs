@@ -267,6 +267,20 @@ async function actDrag(cdp) {
   return `拖动 ${sel} (${dx},${dy}) → 实际变化 ${actual}px`;
 }
 
+async function actDeleteVersion(cdp) {
+  // 点时间线上某个版本的 ×（会弹 confirm，由上面的对话框处理器自动确认）
+  const which = rnd() < 0.5 ? 'first' : 'last';
+  const ok = await cdp.evaluate(`
+    const btns = [...document.querySelectorAll('#timeline .timeline-item .tl-del')];
+    if (!btns.length) return false;
+    const btn = ${JSON.stringify(which)} === 'first' ? btns[0] : btns[btns.length - 1];
+    if (btn.getClientRects().length === 0) return false;
+    btn.click();
+    return true;
+  `);
+  return ok ? `点删除按钮（${which}）删一个版本` : null;
+}
+
 async function actTree(cdp) {
   const ok = await cdp.evaluate(`
     const items = [...document.querySelectorAll('#file-tree .tree-item')];
@@ -347,14 +361,15 @@ async function actGenerate(cdp) {
 }
 
 const ACTIONS = [
-  { w: 26, fn: actClick },
-  { w: 18, fn: actSlider },
-  { w: 16, fn: actDrag },
-  { w: 10, fn: actTree },
-  { w: 10, fn: actModal },
-  { w: 8, fn: actPreset },
-  { w: 6, fn: actPanelToggle },
+  { w: 24, fn: actClick },
+  { w: 16, fn: actSlider },
+  { w: 14, fn: actDrag },
+  { w: 9, fn: actTree },
+  { w: 9, fn: actModal },
+  { w: 7, fn: actPreset },
+  { w: 5, fn: actPanelToggle },
   { w: 12, fn: actType },
+  { w: 8, fn: actDeleteVersion },
   ...(WITH_MODEL ? [{ w: 6, fn: actGenerate }] : []),
 ];
 

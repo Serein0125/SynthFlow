@@ -1800,9 +1800,146 @@ await test('★ preSnapshotId 保留第一轮：一次性撤销能退掉全部�
   assert.equal(sess.roundJournal.length, 0, '轮次日志也要一起清空');
 });
 
-/* ============================ 14. 基准（可选） ============================ */
+/* ====== 14. 切项目不再被旧 Runner 污染 / 版本删除（用户反馈回归） ====== */
+section('14. 切项目的隔离与版本删除');
+
+await test('★ dispose() 之后，旧 Runner 再也不许广播任何事件', async () => {
+  // 用户现象：生成途中切项目，两秒后界面又整个变回旧项目
+  //（版本时间线、文件树、项目徽标全中招）。
+  // 根因就是 reloadServices() 只换了 svc，旧 Runner 的定时器与在跑的那一轮还在继续，
+  // 跑完把旧项目的 state/tree/versions 广播了出去。
+  const dir = path.join(TMP, 'dispose');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'dispose-store') });
+  const sess = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'dispose-sessions') });
+  const evts = [];
+  const r = new Runner({
+    session: sess,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'dispose-store')),
+    config: { ...cfg, saveMode: 'manual', autoCommit: true, patchRetry: false, specDelayMs: 20, commitIdleMs: 20, settleMs: 20 },
+    emit: (n, p) => evts.push({ name: n, payload: p }),
+  });
+
+  // 一个"永远不结束"的模型流，用来模拟"切项目时这一轮还在跑"
+  let streamStarted = false;
+  r.provider = {
+    name: 'stub',
+    label: '桩',
+    ready: true,
+    note: '',
+    async *stream() {
+      streamStarted = true;
+      yield { type: 'delta', text: '<<<SF file path="slow.js" action="create">>>\n' };
+      await sleep(3000);
+      yield { type: 'delta', text: 'export const slow = 1;\n<<<SF /file>>>\n' };
+    },
+  };
+
+  sess.setPrompt('慢慢写一个文件。');
+  r.commit({ reason: 'test', force: true }).catch(() => {});
+  await waitFor(() => streamStarted, 5000, '流已开始');
+  const beforeDispose = evts.length;
+  assert.ok(beforeDispose > 0, 'dispose 之前应该有事件');
+
+  r.dispose();
+  assert.equal(r.disposed, true);
+  assert.equal(r.busy, false, 'dispose 之后不该还显示忙');
+  evts.length = 0;
+
+  // 让那个"慢流"继续跑一会儿：它必须一个事件都发不出来
+  await sleep(600);
+  assert.equal(evts.length, 0, `dispose 之后仍在广播：${evts.map((e) => e.name).join(', ')}`);
+
+  // 定时器也要被清掉：dispose 之后打字不该再触发预演
+  r.onInput({ text: '再写一个别的文件。', idleMs: 5000 });
+  await sleep(400);
+  assert.equal(evts.filter((e) => e.name === 'run:start').length, 0, 'dispose 之后不该再启动新的生成');
+});
+
+await test('★ 删除版本：不能删基线；删非当前版本不动工作区', async () => {
+  const dir = path.join(TMP, 'delver');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'delver-store') });
+  const sess = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'delver-sessions') });
+  const r = new Runner({
+    session: sess,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'delver-store')),
+    config: { ...cfg, saveMode: 'manual' },
+    emit: () => {},
+  });
+
+  ws.applyOp({ path: 'a.js', mode: 'create', content: 'const a = 1;\n' });
+  const v1 = r.saveVersion({ label: '第一版' });
+  ws.applyOp({ path: 'b.js', mode: 'create', content: 'const b = 2;\n' });
+  const v2 = r.saveVersion({ label: '第二版' });
+  ws.applyOp({ path: 'c.js', mode: 'create', content: 'const c = 3;\n' });
+  const v3 = r.saveVersion({ label: '第三版' });
+  assert.deepEqual(sess.versions.map((v) => v.id), ['v0', 'v1', 'v2', 'v3']);
+
+  // 基线不能删
+  const base = r.deleteVersion('v0');
+  assert.equal(base.ok, false);
+  assert.match(base.error, /基线/);
+  // 不存在的版本要说清楚
+  const none = r.deleteVersion('v99');
+  assert.equal(none.ok, false);
+  assert.match(none.error, /不存在/);
+
+  // 删中间的 v2：工作区必须原样不动（当前版本是 v3）
+  const del = r.deleteVersion(v2.versionId);
+  assert.equal(del.ok, true, del.error);
+  assert.deepEqual(sess.versions.map((v) => v.id), ['v0', 'v1', 'v3'], 'id 不该重排');
+  assert.equal(sess.activeVersionId, v3.versionId, '删的不是当前版本，游标不该动');
+  assert.deepEqual(ws.listFiles().sort(), ['a.js', 'b.js', 'c.js'], '删非当前版本不该动工作区');
+
+  // 快照目录应该被回收
+  assert.ok(del.snapshotId, '删除结果要带上被删版本的快照 id');
+  assert.equal(del.snapshotDropped, true, '快照应当被回收');
+  const snapDir = path.join(ws.snapshotsDir, del.snapshotId);
+  assert.ok(!fs.existsSync(snapDir), `快照目录应被删除：${snapDir}`);
+  assert.ok(
+    !ws.listSnapshots().some((s) => s.id === del.snapshotId),
+    'index.json 里也要摘掉，否则下次快照编号会撞车',
+  );
+});
+
+await test('★ 删除"当前版本"：先退回上一版，再把这一版摘掉', async () => {
+  const dir = path.join(TMP, 'delactive');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'delactive-store') });
+  const sess = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'delactive-sessions') });
+  const evts = [];
+  const r = new Runner({
+    session: sess, workspace: ws, rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'delactive-store')),
+    config: { ...cfg, saveMode: 'manual' },
+    emit: (n, p) => evts.push({ name: n, payload: p }),
+  });
+
+  ws.applyOp({ path: 'a.js', mode: 'create', content: 'const a = 1;\n' });
+  const v1 = r.saveVersion({ label: '只建 a' });
+  ws.applyOp({ path: 'only-in-v2.js', mode: 'create', content: 'const x = 2;\n' });
+  const v2 = r.saveVersion({ label: '再加一个文件' });
+  assert.deepEqual(ws.listFiles().sort(), ['a.js', 'only-in-v2.js']);
+  assert.equal(sess.activeVersionId, v2.versionId);
+
+  // 删掉当前版本 v2：工作区应该回到 v1 的样子
+  const del = r.deleteVersion(v2.versionId);
+  assert.equal(del.ok, true, del.error);
+  assert.deepEqual(ws.listFiles().sort(), ['a.js'], '删当前版本要先退回上一版，工作区必须跟着回退');
+  assert.equal(sess.activeVersionId, v1.versionId, '游标要落到上一版上');
+  assert.deepEqual(sess.versions.map((v) => v.id), ['v0', 'v1']);
+  assert.ok(evts.some((e) => e.name === 'versions'), '要广播新的版本链，否则界面还显示删掉的那个');
+  assert.ok(sess.versions.every((v) => v.id !== v2.versionId), 'v2 必须真的从链上消失');
+});
+
+/* ============================ 15. 基准（可选） ============================ */
 if (bench) {
-  section('14. 性能基线（--bench）');
+  section('15. 性能基线（--bench）');
   await test('1000 行文件的补丁定位 < 60ms', async () => {
     const big = Array.from({ length: 1000 }, (_, i) => `function f${i}() { return ${i}; }`).join('\n');
     const start = Date.now();

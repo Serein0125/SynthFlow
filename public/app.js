@@ -295,6 +295,19 @@ function renderVersions(payload) {
       if (isActive) return;
       doVersion(i < curIdx ? 'back' : 'forward', v.id);
     });
+    // v3.6：删除版本。基线不给删（否则连退回的起点都没有了）。
+    if (v.kind !== 'baseline' && v.id !== 'v0') {
+      const del = document.createElement('button');
+      del.className = 'tl-del';
+      del.type = 'button';
+      del.textContent = '×';
+      del.title = `删除版本 ${v.id}（连同它的快照一起回收磁盘${isActive ? '；这是当前版本，会先退回上一版' : ''}）`;
+      del.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await deleteVersion(v.id);
+      });
+      li.appendChild(del);
+    }
     el.timeline.appendChild(li);
   });
 
@@ -1050,9 +1063,35 @@ async function undoUnsaved() {
   }
 }
 
-/** v3.3：往回退 N 轮（粒度是"轮"，不是"已保存版本"）。 */
-async function undoRounds(count = 1) {
+/** v3.6：删除一个版本（连同快照）。删的是当前版本时会先退回上一版，所以要问一句。 */
+async function deleteVersion(id) {
+  const v = (S.versions ?? []).find((x) => x.id === id);
+  if (!v) return;
+  const isActive = id === S.activeVersionId;
+  const ok = window.confirm(
+    `删除版本 ${id}？\n\n`
+    + `${v.summary ? `内容：${v.summary}\n` : ''}`
+    + (isActive
+      ? '这是**当前**版本：会先退回上一个版本（工作区文件会跟着回退），再把这一版从链上删掉。\n'
+      : '只从版本链里删掉它，工作区不变。\n')
+    + '它的快照也会一起删掉以回收磁盘，删了就找不回来了。',
+  );
+  if (!ok) return;
   try {
+    const res = await post('/api/version/delete', { id });
+    if (!res.ok) {
+      toast(res.error ?? '删除失败', 'warn', 4200);
+      return;
+    }
+    renderVersions(res.versions);
+    setStatus('done', `已删除版本 ${id}`, `当前版本 ${res.activeVersionId}`);
+  } catch (err) {
+    toast(`删除版本失败：${err.message}`, 'err');
+  }
+}
+
+/** v3.3：往回退 N 轮（粒度是"轮"，不是"已保存版本"）。 */
+async function undoRounds(count = 1) {  try {
     const res = await post('/api/version/undo-step', { count });
     if (!res.ok) {
       toast(res.error ?? '没有可回退的轮次', 'warn', 3200);
@@ -1311,7 +1350,10 @@ function importPromptFile(file) {
 /* ============================ 会话重置（想法 13） ============================ */
 
 async function applyReset(payload) {
-  // 切项目 = 换会话：思考栏、输入框、文件缓存全部清空，避免上一个项目的内容残留
+  // 切项目 = 换会话：思考栏、输入框、文件缓存全部清空，避免上一个项目的内容残留。
+  // 递增 epoch：所有"切项目之前发出去的异步请求"回来时都会发现 epoch 变了，
+  // 从而不敢再往界面上写数据（否则迟到的响应会把新项目的数据覆盖成旧的）。
+  S.epoch = (S.epoch ?? 0) + 1;
   S.files = {};
   S.live = {};
   S.diffs = {};
@@ -1324,6 +1366,12 @@ async function applyReset(payload) {
   S.selection = null;
   S.manualEdits = [];
   S.collapsedDirs = new Set();
+  // 版本链也必须清掉：否则 reset 之后、新项目的 versions 事件到达之前，
+  // 时间线上留着的是**上一个项目的版本**。
+  S.versions = [];
+  S.activeVersionId = null;
+  S.canBack = false;
+  S.canForward = false;
   renderSelectionChip();
   if (payload?.projectDir) {
     S.projectDir = payload.projectDir;
@@ -1332,6 +1380,8 @@ async function applyReset(payload) {
   }
   if (el.streamBody) el.streamBody.innerHTML = '<p class="empty">已切换到新项目。这里的思考与建议会从零开始。</p>';
   if (el.timeline) el.timeline.innerHTML = '';
+  // reset 事件自带新项目的版本链，直接画出来 —— 不依赖后续的 versions 事件能不能按时到达
+  if (payload?.versions) renderVersions(payload.versions);
   if (el.tabs) el.tabs.innerHTML = '';
   if (el.code) el.code.innerHTML = '';
   if (el.prompt) el.prompt.value = payload?.prompt ?? '';

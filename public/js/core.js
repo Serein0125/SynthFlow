@@ -143,6 +143,8 @@ const S = {
   profile: null,
   staging: false,
   projectDir: '',
+  // 每次切项目 +1。异步请求回来时如果 epoch 变了，说明数据已经属于"上一个项目"，一律丢弃。
+  epoch: 0,
   pending: [],
   selection: null,
   manualEdits: [],

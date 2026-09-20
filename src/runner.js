@@ -26,10 +26,18 @@ export class Runner {
     // 定时参数必须收敛成有限数值：一旦某个字段缺失/为 null，
     // setTimeout(fn, undefined) 会退化成"立即执行"，那就会在你敲第一个字时直接提交。
     this.config = normalizeTiming(config ?? {});
-    this.emit = emit;
+    // 所有事件都从这里出去，顺带把"这个 Runner 是否已被废弃"这件事守住。
+    // 切项目时服务端会 dispose() 旧的 Runner，此后它一个事件都不该再发出去 ——
+    // 否则旧项目跑完那一轮会把旧 state/tree/versions 播出来，覆盖刚切好的新界面。
+    const rawEmit = emit ?? (() => {});
+    this.emit = (name, payload) => {
+      if (this.disposed) return;
+      rawEmit(name, payload);
+    };
     this.provider = createProvider(config);
     this.run = null;
     this.draft = null; // 预演结果（未落盘）
+    this.disposed = false; // 被 dispose() 置为 true 之后，这个 Runner 不许再广播任何事件
     this.specTimer = null;
     this.commitTimer = null;
     this.settleTimer = null;
@@ -760,10 +768,85 @@ export class Runner {
   }
 
   /**
+   * 彻底停掉这个 Runner —— 切项目时调用。
+   *
+   * 之前 `reloadServices()` 只是把 `svc` 换成新的，**旧 Runner 从来没被停过**：
+   * 它的 spec/commit/settle 定时器还在，正在跑的那一轮也还在跑，
+   * 跑完以后会把**旧项目的** state / tree / versions 广播出去 ——
+   * 于是你切到新项目后过两秒，界面又整个变回旧项目（版本时间线、文件树、项目徽标全中招）。
+   *
+   * 这里刻意**不 emit 任何事件**：这一步发生在服务容器已经被替换之后，
+   * 任何广播都只会污染新界面。真正的"停"是：清定时器 + 中断在跑的流 + 标记为已废弃。
+   */
+  dispose() {
+    this.disposed = true;
+    clearTimeout(this.specTimer);
+    clearTimeout(this.commitTimer);
+    clearTimeout(this.settleTimer);
+    if (this.run) {
+      try { this.run.abort.abort(); } catch { /* ignore */ }
+      this.run = null;
+    }
+    this.draft = null;
+    this.busy = false;
+  }
+
+  /**
+   * 删除一个版本（v3.6）。
+   *
+   * 最难的一种情况是"删掉的正好是当前版本"：工作区的内容就是那个版本，
+   * 如果直接从链上摘掉，游标就会停在一个不存在的版本上。所以先退到上一个版本（真的恢复工作区），
+   * 再把它从链上删掉。删完顺手把对应的快照目录也删掉，把磁盘回收回来。
+   */
+  deleteVersion(versionId) {
+    const s = this.session;
+    const target = s.versions.find((v) => v.id === versionId);
+    if (!target) return { ok: false, error: `版本不存在：${versionId}` };
+    if (target.kind === 'baseline' || target.id === 'v0') {
+      return { ok: false, error: '基线版本不能删除 —— 至少要留一个可以退回的起点' };
+    }
+    if (s.versions.length <= 1) return { ok: false, error: '至少要保留一个版本' };
+    if (this.busy) return { ok: false, error: '正在生成中，等这一轮结束再删版本' };
+
+    const idx = s.versions.indexOf(target);
+    const isActive = s.activeVersionId === versionId;
+    if (isActive) {
+      const fallback = s.versions[idx - 1];
+      const moved = this.moveVersion('back', fallback.id);
+      if (!moved?.ok) return { ok: false, error: moved?.error ?? '退回上一个版本失败，已取消删除' };
+    }
+
+    const res = s.deleteVersion(versionId);
+    if (!res.ok) return res;
+
+    // 快照只有这一个版本在用，就一起删掉回收磁盘
+    let snapshotDropped = false;
+    if (res.snapshotId && !s.versions.some((v) => v.snapshotId === res.snapshotId)) {
+      snapshotDropped = this.workspace.dropSnapshot(res.snapshotId);
+    }
+
+    clearTimeout(this.specTimer);
+    clearTimeout(this.commitTimer);
+    clearTimeout(this.settleTimer);
+    this.committedPrompt = s.currentVersion?.promptAfter ?? '';
+    s.save();
+    this.emit('versions', s.versionList());
+    this.emit('state', this.snapshot());
+    this.emit('toast', { level: 'ok', message: `已删除版本 ${versionId}（快照一并回收）` });
+    return {
+      ok: true,
+      deleted: versionId,
+      snapshotId: res.snapshotId ?? null,
+      snapshotDropped,
+      activeVersionId: s.activeVersionId,
+      versions: s.versionList(),
+    };
+  }
+
+  /**
    * 在版本链上移动游标。回退之后仍可用 forward 回到刚才的版本（想法 9）。
    */
-  moveVersion(direction = 'back', versionId) {
-    const s = this.session;
+  moveVersion(direction = 'back', versionId) {    const s = this.session;
     const res = s.moveVersion(direction, versionId);
     if (!res.ok) return res;
     this.draft = null;

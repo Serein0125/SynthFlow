@@ -543,6 +543,30 @@ export class Session {
     return { ok: true, versionId: v.id, versions: this.versionList() };
   }
 
+  /**
+   * 从版本链里删掉一个版本（v3.6）。
+   * 只动链条本身，不碰工作区 —— 工作区那边的"删掉当前版本要先退到别的版本"由 Runner 负责。
+   * 版本 id 不重排：v0/v1/v3 这样留着，快照与历史引用才不会错位。
+   */
+  deleteVersion(versionId) {
+    const idx = this.versions.findIndex((v) => v.id === versionId);
+    if (idx < 0) return { ok: false, error: `版本不存在：${versionId}` };
+    const v = this.versions[idx];
+    if (v.kind === 'baseline' || v.id === 'v0') {
+      return { ok: false, error: '基线版本不能删除 —— 至少要留一个可以退回的起点' };
+    }
+    if (this.versions.length <= 1) return { ok: false, error: '至少要保留一个版本' };
+
+    this.versions.splice(idx, 1);
+    // 游标修正：删的在自己前面就整体左移；删的就是自己就退一格
+    if (idx < this.activeIndex) this.activeIndex -= 1;
+    else if (idx === this.activeIndex) this.activeIndex = Math.max(0, this.activeIndex - 1);
+    this.activeIndex = Math.max(0, Math.min(this.activeIndex, this.versions.length - 1));
+    // pendingConfirm 是根据 versions 现算的只读视图，不用（也不能）在这里维护
+    this.touch();
+    return { ok: true, deleted: v.id, snapshotId: v.snapshotId ?? null, versions: this.versionList() };
+  }
+
   /** 丢弃一个"待确认"版本：等价于回退到它之前的那一版。 */
   discardVersion(versionId) {
     const idx = versionId ? this.versions.findIndex((v) => v.id === versionId) : this.activeIndex;

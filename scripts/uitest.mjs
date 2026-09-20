@@ -1237,6 +1237,212 @@ try {
     console.log(`      ${dim(`已切回 ${res.projectDir}（${res.writeMode === 'direct' ? '直接写入' : '暂存确认'}）`)}`);
   });
 
+  /* ---------- T. 版本链：删除 / 切项目时不被旧项目污染 ---------- */
+  section('T. 版本链：删除版本 / 切项目后时间线必须跟着走');
+
+  const verProj = path.join(OUT, 'verproj');
+  const verProj2 = path.join(OUT, 'verproj2');
+  for (const d of [verProj, verProj2]) {
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'seed.js'), 'export const seed = 1;\n', 'utf8');
+  }
+
+  await test('切到版本测试项目并造出 3 个版本', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: verProj, mode: 'direct' }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切换失败：${res.error ?? ''}`);
+    for (let i = 1; i <= 3; i += 1) {
+      await fetch(`${BASE}/api/save`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: `v${i}.js`, content: `export const v${i} = ${i};\n` }),
+      });
+    }
+    await sleep(800);
+    const ids = await cdp.evaluate(`return [...document.querySelectorAll('#timeline .timeline-item')].map((li) => (li.textContent.trim().match(/^v\\d+/) ?? [''])[0]).filter(Boolean)`);
+    if (ids.length < 4) throw new Error(`时间线只有 ${ids.length} 个版本：${ids.join(',')}`);
+    console.log(`      ${dim(`造出 ${ids.join(', ')}`)}`);
+  });
+
+  await test('★ 每个版本都有删除按钮，基线没有', async () => {
+    const info = await cdp.evaluate(`
+      const items = [...document.querySelectorAll('#timeline .timeline-item')];
+      return items.map((li) => ({
+        text: li.querySelector('b')?.textContent?.trim() ?? '',
+        hasDel: Boolean(li.querySelector('.tl-del')),
+      }));
+    `);
+    const baseline = info.find((x) => x.text === 'v0');
+    const others = info.filter((x) => x.text !== 'v0' && /^v\d+$/.test(x.text));
+    if (!baseline) throw new Error('时间线里没有 v0 基线');
+    if (baseline.hasDel) throw new Error('基线版本不该有删除按钮（删了就没有退回起点了）');
+    if (!others.length) throw new Error('没有可删除的版本');
+    if (others.some((x) => !x.hasDel)) throw new Error(`这些版本缺删除按钮：${others.filter((x) => !x.hasDel).map((x) => x.text).join(',')}`);
+    console.log(`      ${dim(`${others.length} 个版本有删除按钮，基线没有`)}`);
+
+    // 删除按钮默认淡显（0.35），悬停/聚焦时变实。
+    // 注意：无头浏览器里用 Input.dispatchMouseEvent 移动鼠标**不一定**能触发 :hover，
+    // 所以这里用 CDP 的 CSS.forcePseudoState 强制 :hover —— 验证的是 CSS 规则本身，
+    // 而不是"CDP 能不能模拟鼠标"。
+    const box = await cdp.evaluate(`
+      const items = [...document.querySelectorAll('#timeline .timeline-item')];
+      const hit = items.find((li) => /^v\\d+$/.test(li.querySelector('b')?.textContent?.trim() ?? ''));
+      if (!hit) return null;
+      hit.scrollIntoView({ block: 'center' });
+      const r = hit.getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    `);
+    if (box) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y });
+      await sleep(200);
+      const before = await cdp.evaluate(`
+        const btns = [...document.querySelectorAll('#timeline .tl-del')];
+        const visible = btns.filter((b) => b.getClientRects().length > 0);
+        return { total: btns.length, visible: visible.length, opacity: visible.length ? Number(getComputedStyle(visible[0]).opacity) : null };
+      `);
+      if (!before.visible) throw new Error('删除按钮一个都看不见（应该常驻淡显，否则用户发现不了这个功能）');
+
+      // 强制 :hover，确认淡显会变实
+      await cdp.send('CSS.enable').catch(() => {});
+      const { root } = await cdp.send('DOM.getDocument', { depth: -1 });
+      const { nodeIds } = await cdp.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: '#timeline .timeline-item' });
+      for (const nodeId of nodeIds) {
+        await cdp.send('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: ['hover'] }).catch(() => {});
+      }
+      await sleep(250);
+      const after = await cdp.evaluate(`
+        const btn = [...document.querySelectorAll('#timeline .tl-del')].find((b) => b.getClientRects().length > 0);
+        return btn ? Number(getComputedStyle(btn).opacity) : null;
+      `);
+      await cdp.screenshot('10-version-delete');
+      if (after !== null && after <= before.opacity) {
+        throw new Error(`悬停后删除按钮没有变实：${before.opacity} → ${after}`);
+      }
+    }
+  });
+
+  await test('★ 删掉一个版本：时间线上消失，服务端也少了它', async () => {
+    const before = await (await fetch(`${BASE}/api/versions`)).json();
+    const target = before.versions[before.versions.length - 1].id; // 删最后一个（就是当前版本）
+    const beforeCount = before.versions.length;
+
+    await cdp.evaluate(`
+      window.__sfOrigConfirm2 = window.confirm; window.confirm = () => true;
+      const items = [...document.querySelectorAll('#timeline .timeline-item')];
+      const hit = items.find((li) => li.querySelector('b')?.textContent?.trim() === ${JSON.stringify(target)});
+      if (!hit) throw new Error('时间线上找不到 ' + ${JSON.stringify(target)});
+      hit.querySelector('.tl-del').click();
+      return true;
+    `);
+    await sleep(1200);
+    await cdp.evaluate(`window.confirm = window.__sfOrigConfirm2; return true;`);
+
+    const after = await (await fetch(`${BASE}/api/versions`)).json();
+    if (after.versions.length !== beforeCount - 1) {
+      throw new Error(`服务端版本数没减：${beforeCount} → ${after.versions.length}`);
+    }
+    if (after.versions.some((v) => v.id === target)) throw new Error(`${target} 还在服务端的版本链里`);
+    const domIds = await cdp.evaluate(`return [...document.querySelectorAll('#timeline .timeline-item')].map((li) => (li.textContent.trim().match(/^v\\d+/) ?? [''])[0]).filter(Boolean)`);
+    const serverIds = after.versions.map((v) => v.id);
+    if (JSON.stringify(domIds) !== JSON.stringify(serverIds)) {
+      throw new Error(`删完之后时间线和服务端对不上：DOM ${domIds.join(',')} vs 服务端 ${serverIds.join(',')}`);
+    }
+    if (domIds.includes(target)) throw new Error(`${target} 还留在时间线上`);
+    console.log(`      ${dim(`删掉 ${target}：${beforeCount} → ${after.versions.length} 个版本，界面一致`)}`);
+  });
+
+  await test('基线仍然删不掉（服务端会拒绝）', async () => {
+    const r = await fetch(`${BASE}/api/version/delete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'v0' }),
+    });
+    const res = await r.json();
+    if (res.ok) throw new Error('基线版本竟然被删掉了');
+    if (!/基线/.test(res.error ?? '')) throw new Error(`拒绝理由不明确：${res.error}`);
+  });
+
+  if (WITH_MODEL) {
+    await test('★ 生成途中切项目：界面必须停在新项目（用户报"时间线还是旧的"）', async () => {
+      // 这正是用户踩的坑：切项目时旧的 Runner 没被停，它跑完那一轮后
+      // 把旧项目的 state/tree/versions 又广播一遍，把刚重置好的界面整个覆盖回去。
+      const r = await fetch(`${BASE}/api/project`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dir: verProj, mode: 'direct' }),
+      });
+      if (!(await r.json()).ok) throw new Error('切到 verProj 失败');
+      await sleep(900);
+      const verVersions = (await (await fetch(`${BASE}/api/versions`)).json()).versions.map((v) => v.id);
+
+      // 在 verProj 里发起一轮真实生成
+      await cdp.evaluate($type('#prompt', '在项目里新建一个 switching.md，写一行"切换测试"。'));
+      await sleep(1200);
+      await cdp.evaluate($click('#btn-commit'));
+      await sleep(700);
+      const busy = (await (await fetch(`${BASE}/api/state`)).json()).busy;
+
+      // ★ 生成还没结束就切到另一个项目
+      const r2 = await fetch(`${BASE}/api/project`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dir: verProj2, mode: 'direct' }),
+      });
+      if (!(await r2.json()).ok) throw new Error('切到 verProj2 失败');
+      await sleep(1200);
+
+      const check = async (tag) => {
+        const st = await (await fetch(`${BASE}/api/state`)).json();
+        const dom = await cdp.evaluate(`
+          return {
+            title: document.querySelector('#project-chip')?.textContent?.trim() ?? '',
+            ids: [...document.querySelectorAll('#timeline .timeline-item')].map((li) => (li.textContent.trim().match(/^v\\d+/) ?? [''])[0]).filter(Boolean),
+            tree: [...document.querySelectorAll('#file-tree .tree-file .name')].map((n) => n.textContent.trim()),
+          };
+        `);
+        const serverIds = st.versions.versions.map((v) => v.id);
+        if (JSON.stringify(dom.ids) !== JSON.stringify(serverIds)) {
+          throw new Error(`[${tag}] 时间线没跟着项目走：DOM ${dom.ids.join(',')} vs 服务端 ${serverIds.join(',')}`);
+        }
+        if (!dom.title.includes('verproj2')) throw new Error(`[${tag}] 项目徽标还是旧的：${dom.title}`);
+        if (dom.tree.some((n) => n.includes('switching.md'))) {
+          throw new Error(`[${tag}] 文件树里混进了旧项目刚生成的文件：${dom.tree.join(',')}`);
+        }
+        return { ids: dom.ids, title: dom.title };
+      };
+
+      const t0 = Date.now();
+      let last = null;
+      // 持续盯 12 秒：覆盖"旧项目那一轮跑完"的时间点
+      while (Date.now() - t0 < 12000) {
+        last = await check(`切后 ${Date.now() - t0}ms`);
+        await sleep(1500);
+      }
+      console.log(`      ${dim(`busy=${busy} · 全程稳定在 ${last.title}（${last.ids.length} 个版本）`)}`);
+    });
+  }
+
+  await test('清理版本测试项目并切回', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: originalProject, mode: originalMode }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切回失败：${res.error ?? ''}`);
+    for (const d of [verProj, verProj2]) {
+      fs.rmSync(d, { recursive: true, force: true });
+      const slug = `${path.basename(d).replace(/[^\w-]/g, '') || 'project'}-${sha1(d).slice(0, 8)}`;
+      fs.rmSync(path.join(ROOT, '.synthflow', 'projects', slug), { recursive: true, force: true });
+    }
+    await cdp.waitFor(`document.querySelector('#project-chip').textContent.length > 0`, { timeout: 10000, label: '界面恢复' });
+  });
+
   /* ------------------------------ 收尾 ------------------------------ */
   section('收尾');
   // 无论中间成功失败，都要把项目切回测试前的状态，别把用户的应用留在测试目录上

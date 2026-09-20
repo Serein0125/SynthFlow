@@ -185,6 +185,8 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     }
     if (!session) session = new Session({ id: newId('sess'), workspace, config: cfg, storeDir: sessionsDir });
 
+    // Runner 内部自己保证"被 dispose() 之后不再广播任何事件"（见 runner.js），
+    // 所以这里不需要再包一层。切项目时 reloadServices() 会先 dispose 旧的 runner。
     const runner = new Runner({ session, workspace, rag, memory, config: cfg, emit });
 
     // 记录项目登记表（供界面切换）
@@ -204,16 +206,25 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
   svc = buildServices();
 
   function reloadServices() {
+    // ★ 先把上一个项目的 Runner 彻底停掉。
+    // 以前这里直接换成新的 svc，旧 Runner 的定时器还在、正在跑的那一轮也还在跑，
+    // 跑完会把**旧项目的** state / tree / versions 广播出去 ——
+    // 于是切到新项目两秒后，版本时间线、文件树、项目徽标又全变回旧项目。
+    if (svc?.runner && typeof svc.runner.dispose === 'function') {
+      try { svc.runner.dispose(); } catch { /* 停不掉也不能挡住切换 */ }
+    }
     cfg = loadConfig(root);
     if (providerOverride) cfg.provider = providerOverride;
     svc = buildServices();
-    // 想法 13：切项目等于换会话，前端必须整体重置，不能留着上一个项目的思考栏和输入框
+    // 想法 13：切项目等于换会话，前端必须整体重置，不能留着上一个项目的思考栏和输入框。
+    // 注意 versions 也要带上：reset 事件必须**自洽**，不能只清空等下一个事件来填。
     broadcast('reset', {
       projectDir: svc.projectDir,
       staging: svc.workspace.staging,
       sessionId: svc.session.id,
       prompt: svc.session.prompt ?? '',
       timeline: svc.session.timeline ?? [],
+      versions: svc.session.versionList(),
     });
     broadcast('state', svc.runner.snapshot());
     broadcast('tree', { tree: svc.workspace.listTree() });
@@ -348,6 +359,10 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       case '/api/version/undo-step':
         // v3.3：只往回退 N 轮，粒度是"轮"，不要求先保存版本
         return runner.undoRoundStep({ count: Number(body.count ?? 1) });
+
+      case '/api/version/delete':
+        // v3.6：从版本链里删掉一个版本（连同它的快照）
+        return runner.deleteVersion(String(body.id ?? url.searchParams.get('id') ?? ''));
 
       case '/api/timeline/clear':
         session.clearTimeline();
