@@ -41,6 +41,7 @@
           <button class="btn ghost small" data-preset="zen">极简</button>
         </div>
         <label class="lp-row">左侧栏 <input id="ly-sidebar" type="range" min="140" max="520" step="10" /><span id="ly-sidebar-val" class="muted tiny">260px</span></label>
+        <label class="lp-row">文件树 <input id="ly-tree" type="range" min="120" max="900" step="10" /><span id="ly-tree-val" class="muted tiny">380px</span></label>
         <label class="lp-row">思考栏 <input id="ly-stream" type="range" min="180" max="640" step="10" /><span id="ly-stream-val" class="muted tiny">340px</span></label>
         <label class="lp-row">输入区 <input id="ly-composer" type="range" min="205" max="560" step="5" /><span id="ly-composer-val" class="muted tiny">205px</span></label>
         <label class="lp-row">界面字号 <input id="ly-font-ui" type="range" min="11" max="17" step="0.5" /><span id="ly-font-ui-val" class="muted tiny">13px</span></label>
@@ -67,6 +68,9 @@
             <p class="empty">还没有文件。开始输入需求，我会自动建目录和文件。</p>
           </div>
         </section>
+        <!-- 文件树 / 版本时间线之间的横向分界线：拖动改高度、双击复原、滚轮也能调 -->
+        <div id="split-tree" class="splitter horizontal sidebar-split"
+             title="拖动调整文件树高度 · 双击复原 · 滚轮微调"></div>
         <section class="pane pane-timeline">
           <h3 class="pane-title">版本时间线<span id="version-hint" class="muted"></span></h3>
           <ol id="timeline" class="timeline">

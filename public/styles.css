@@ -2622,6 +2622,7 @@ kbd {
   --font-size-ui: 13px;
   --font-size-code: 12.5px;
   --composer-h: 190px;
+  --tree-h: 380px;
   --splitter: 5px;
 }
 
@@ -2693,6 +2694,17 @@ body.resizing .splitter::after {
 
 .splitter.horizontal::after {
   inset: 2px 0;
+}
+
+/* 滚轮调尺寸时闪一下：让人知道"这一下确实生效了"，
+   否则鼠标停在线上滚，画面变化不明显时容易以为没反应。 */
+.splitter.wheel-flash::after {
+  background: var(--accent);
+}
+
+/* 布局面板里的滑块：滚轮也能调，给个可滚动的视觉暗示 */
+.layout-panel input[type="range"] {
+  cursor: ew-resize;
 }
 
 body.resizing {
@@ -3385,13 +3397,21 @@ body.resizing .editor-host {
   text-overflow: ellipsis;
 }
 
-/* --- 25.2 左栏：文件树 / 时间线 各占一份，谁都不会挤掉谁（想法 14） --- */
+/* --- 25.2 左栏：文件树 / 时间线 各占一份，谁都不会挤掉谁（想法 14）
+       文件树高度由 --tree-h 控制（可拖那条分界线，也可用布局面板的滑块），
+       时间线吃掉剩下的空间；两栏各自都有下限，谁都压不死谁。 --- */
 .sidebar {
   display: grid;
-  grid-template-rows: minmax(110px, 1.4fr) minmax(96px, 1fr);
+  grid-template-rows: minmax(96px, var(--tree-h)) var(--splitter) minmax(110px, 1fr);
   gap: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+/* 侧栏里的那条横向分界线：让它铺满整个宽度，好点、好拖、好滚 */
+.sidebar .sidebar-split {
+  grid-column: 1 / -1;
+  width: 100%;
 }
 
 .sidebar .pane {

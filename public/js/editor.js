@@ -187,11 +187,18 @@ const Editor = {
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restore);
   },
 
-  /** 外部刷新内容（AI 写入 / 回退），不标记为脏。 */
-  async refresh(content, { added = [], force = false } = {}) {
+  /**
+   * 外部刷新内容（AI 写入 / 回退），不标记为脏。
+   *
+   * focus：只有"用户主动点文件"时才为 true。默认 false —— 生成过程中会不停刷新，
+   * 那时绝不能把焦点从输入框抢走（想法 10）。
+   */
+  async refresh(content, { added = [], force = false, focus = false } = {}) {
     if (!this.path) return;
     if (!force && this.dirty && this.mode === 'monaco' && this.inst) {
       // 用户有未保存改动时不覆盖编辑器内容，只更新缓存（内容见 S.files）
+      // 但"主动点文件"这个动作仍然要把焦点交进去
+      if (focus) this.inst.focus();
       return;
     }
     const prevActive = typeof document !== 'undefined' ? document.activeElement : null;
@@ -202,6 +209,8 @@ const Editor = {
       this.applyAddedLines(added);
       // 生成过程中不断刷新内容，也绝不能顺手把焦点抢走
       if (prevActive && prevActive !== document.activeElement) this.restoreFocus(prevActive);
+      // 但用户主动点文件时，焦点就该进编辑器 —— 放在 restoreFocus 之后，让它胜出
+      if (focus) this.inst.focus();
     } else {
       this.renderFallback(content, added);
     }

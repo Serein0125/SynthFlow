@@ -253,7 +253,9 @@ async function renderCode({ soft = false, focus = false } = {}) {
     await showDiffView(path);
   } else {
     if (Editor.path === path) {
-      await Editor.refresh(content, { added });
+      // focus 必须一路传下去：refresh 以前没有这个参数，于是"点一个已经打开的
+      // 文件"光标不会进编辑器 —— 用户点了文件却发现还得再点一下编辑器才能打字。
+      await Editor.refresh(content, { added, focus });
     } else {
       await Editor.open(path, content, { added, focus });
     }
@@ -1649,7 +1651,16 @@ function collectDirs(node, out = []) {
     Editor.init().then((okM) => {
       S.monacoReady = okM;
       if (!okM) toast('Monaco 编辑器未加载，已降级为只读高亮（功能不受影响）', 'warn', 6000);
-      if (S.current) renderCode();
+      if (S.current) {
+        // ★ Monaco 是异步加载的：加载期间如果已经打开过文件，那次走的是**降级渲染** ——
+        // 只设了 Editor.path，没有建对应的 Monaco model。
+        // 这时直接 renderCode() 会因为 Editor.path === S.current 而走 refresh 分支，
+        // 于是永远刷在 Monaco 那只默认的空 model（inmemory://model/1）上，
+        // 「按 URI 缓存每个文件的 model」就整个失效了。
+        // 把 Editor.path 清掉才会走 open 分支，补建真正的 model。
+        Editor.path = null;
+        renderCode();
+      }
     });
 
     const st = await get('/api/state');

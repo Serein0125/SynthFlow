@@ -1299,6 +1299,126 @@ try {
     console.log(`      ${dim(`滑块下限：左侧栏 ${mins.sidebar} / 思考栏 ${mins.stream} / 输入区 ${mins.composer}`)}`);
   });
 
+  /* --------------------- S2. 文件树/时间线分界线 + 滚轮调尺寸 --------------------- */
+
+  const panes = () => cdp.evaluate(`
+    const h = (s) => Math.round(document.querySelector(s).getBoundingClientRect().height);
+    return {
+      tree: h('.pane-tree'),
+      timeline: h('.pane-timeline'),
+      split: h('#split-tree'),
+      sidebar: h('.sidebar'),
+    };
+  `);
+
+  await test('★ 文件树与版本时间线之间的分界线可以拖动（且是 1:1，不是越拖越快）', async () => {
+    // 先把布局恢复默认，别受前面用例影响
+    await cdp.evaluate(`Layout.reset(); return true;`);
+    await sleep(400);
+    const before = await panes();
+    if (before.split <= 0) throw new Error('找不到那条分界线（#split-tree 高度为 0）');
+    if (before.tree < 100) throw new Error(`文件树初始高度异常：${before.tree}px`);
+
+    const box = await cdp.evaluate(`
+      const r = document.querySelector('#split-tree').getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    `);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1, buttons: 1 });
+    for (let i = 1; i <= 5; i += 1) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y + (80 * i) / 5, button: 'left', buttons: 1 });
+      await sleep(20);
+    }
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x, y: box.y + 80, button: 'left', buttons: 0 });
+    await sleep(300);
+
+    const after = await panes();
+    const delta = after.tree - before.tree;
+    if (Math.abs(delta - 80) > 14) {
+      throw new Error(`往下拖 80px，文件树实际变了 ${delta}px —— 拖动应该是 1:1 的`);
+    }
+    // 时间线要让出空间，而不是两栏互不相关
+    if (Math.abs((before.timeline - after.timeline) - 80) > 20) {
+      throw new Error(`文件树长了 ${delta}px，时间线只让出 ${before.timeline - after.timeline}px`);
+    }
+    console.log(`      ${dim(`文件树 ${before.tree} → ${after.tree}（拖 80px）· 时间线 ${before.timeline} → ${after.timeline}`)}`);
+  });
+
+  await test('★ 分界线上可以直接滚轮调（连滚多格都要有效）', async () => {
+    // 这里有个固有矛盾：滚一格，分界线自己就移动了，光标立刻不在它上面了。
+    // 所以实现里做了"短暂接管窗口滚轮"（leash），这条用例专门守住它 —— 只响应第一格是不合格的。
+    const before = await panes();
+    const box = await cdp.evaluate(`
+      const r = document.querySelector('#split-tree').getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    `);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y });
+    await sleep(150);
+    for (let i = 0; i < 3; i += 1) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: box.x, y: box.y, deltaX: 0, deltaY: -120 });
+      await sleep(160);
+    }
+    const after = await panes();
+    const grew = after.tree - before.tree;
+    if (grew < 20) throw new Error(`连滚 3 格，文件树只长了 ${grew}px —— 多半只响应了第一格`);
+    // 往下滚应该收回去
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: box.x, y: box.y, deltaX: 0, deltaY: 120 });
+    await sleep(300);
+    const back = await panes();
+    if (back.tree >= after.tree) throw new Error('往下滚没有把文件树改小');
+    console.log(`      ${dim(`滚轮：${before.tree} →（上滚 3 格）${after.tree} →（下滚 1 格）${back.tree}`)}`);
+  });
+
+  await test('★ 布局面板的滑块支持滚轮（不用先精确点中圆点）', async () => {
+    await cdp.evaluate(`document.querySelector('#layout-panel')?.classList.remove('hidden'); return true;`);
+    await sleep(300);
+    const before = await cdp.evaluate(`
+      const el = document.querySelector('#ly-tree');
+      const r = el.getBoundingClientRect();
+      return { value: Number(el.value), x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    `);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: before.x, y: before.y });
+    await sleep(120);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: before.x, y: before.y, deltaX: 0, deltaY: -120 });
+    await sleep(350);
+    const after = await cdp.evaluate(`
+      const el = document.querySelector('#ly-tree');
+      return {
+        value: Number(el.value),
+        label: document.querySelector('#ly-tree-val')?.textContent?.trim() ?? '',
+        cssVar: getComputedStyle(document.documentElement).getPropertyValue('--tree-h').trim(),
+        paneTree: Math.round(document.querySelector('.pane-tree').getBoundingClientRect().height),
+      };
+    `);
+    if (after.value <= before.value) throw new Error(`滚轮没有改变滑块值：${before.value} → ${after.value}`);
+    if (!after.label.startsWith(String(after.value))) throw new Error(`数值标签没跟着更新：滑块=${after.value} 标签=${after.label}`);
+    // 不能只是滑块动了，实际布局也要跟着动
+    if (Math.abs(after.paneTree - after.value) > 4) {
+      throw new Error(`滑块=${after.value} 但文件树实际高度=${after.paneTree}，布局没跟上`);
+    }
+    console.log(`      ${dim(`滑块滚轮 ${before.value} → ${after.value}，文件树实际 ${after.paneTree}px（--tree-h=${after.cssVar}）`)}`);
+  });
+
+  await test('★ 把分界线拖到极限时，时间线不会被挤没', async () => {
+    const r = await cdp.evaluate(`
+      const keep = Layout.s.treePane;
+      Layout.set('treePane', 100000);
+      const out = {
+        stored: Layout.s.treePane,
+        cssVar: getComputedStyle(document.documentElement).getPropertyValue('--tree-h').trim(),
+        paneTree: Math.round(document.querySelector('.pane-tree').getBoundingClientRect().height),
+        paneTimeline: Math.round(document.querySelector('.pane-timeline').getBoundingClientRect().height),
+        sidebar: Math.round(document.querySelector('.sidebar').getBoundingClientRect().height),
+      };
+      Layout.set('treePane', keep);
+      return out;
+    `);
+    if (r.paneTimeline < 100) throw new Error(`文件树拉到极限后时间线只剩 ${r.paneTimeline}px，等于被挤没了`);
+    if (r.paneTree + r.paneTimeline > r.sidebar + 8) {
+      throw new Error(`两栏加起来 ${r.paneTree + r.paneTimeline}px 超过了侧栏 ${r.sidebar}px —— 说明溢出了`);
+    }
+    console.log(`      ${dim(`拉到极限：文件树 ${r.paneTree}px + 时间线 ${r.paneTimeline}px = ${r.paneTree + r.paneTimeline}px（侧栏 ${r.sidebar}px）`)}`);
+  });
+
   await test('清理布局测试项目并切回', async () => {
     const r = await fetch(`${BASE}/api/project`, {
       method: 'POST',
