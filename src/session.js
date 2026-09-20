@@ -190,6 +190,10 @@ export class Session {
     // v3：用户手动改过的文件，下一轮要告知模型别覆盖（想法 1/A）
     this.manualEdits = [];
     this.maxTimeline = 40;
+    // v3.1（想法 11）：只有点「保存为版本」才产生版本。
+    // 这里记录"还没保存的改动"，并提供撤销所需的回合前快照。
+    this.pendingRound = null;
+    this.syncEnabled = true;
 
     const baseline = workspace.snapshot({ label: '基线', meta: { kind: 'baseline' } });
     this.versions.push({
@@ -443,6 +447,18 @@ export class Session {
     this.touch();
   }
 
+  /** 记录"还没保存为版本"的改动（想法 11）。 */
+  setPendingRound(rec) {
+    this.pendingRound = { ...(this.pendingRound ?? {}), ...rec };
+    this.touch();
+    return this.pendingRound;
+  }
+
+  clearPendingRound() {
+    this.pendingRound = null;
+    this.touch();
+  }
+
   /** 确认一个"待确认"版本（想法 2）。 */
   confirmVersion(versionId) {
     const v = versionId ? this.versions.find((x) => x.id === versionId) : this.currentVersion;
@@ -479,6 +495,8 @@ export class Session {
       stats: this.stats,
       timeline: this.timeline,
       manualEdits: this.manualEdits,
+      pendingRound: this.pendingRound,
+      syncEnabled: this.syncEnabled,
       versionSeq: this.versionSeq,
       activeIndex: this.activeIndex,
       promptHash: sha1(this.prompt),
@@ -518,8 +536,18 @@ export class Session {
     s.stats = { runs: 0, commits: 0, rollbacks: 0, forwards: 0, charsGenerated: 0, adopted: 0, dismissed: 0, modelCalls: 0, estTokens: 0, ...(data.stats ?? {}) };
     if (!Array.isArray(s.timeline)) s.timeline = [];
     if (!Array.isArray(s.manualEdits)) s.manualEdits = [];
+    if (!s.pendingRound) s.pendingRound = null;
+    if (typeof s.syncEnabled !== 'boolean') s.syncEnabled = true;
     s.maxTimeline = 40;
     return s;
+  }
+
+  /** 清空思考栏（想法 8）。 */
+  clearTimeline() {
+    const n = this.timeline.length;
+    this.timeline = [];
+    this.touch();
+    return { ok: true, cleared: n };
   }
 
   snapshotState() {

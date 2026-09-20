@@ -397,7 +397,89 @@ const specWorthy = intent.score >= 0.32 || enoughContext;
 
 ---
 
-## 12. 已知取舍
+## 12. v3.1 架构补充
+
+### 12.1 同步生成开关（想法 1）
+
+`runner.syncEnabled` 是一个**闸门**，放在 `onInput()` 里、所有定时器之前：
+
+```
+onInput -> analyzeIntent -> emit intent -> if (!syncEnabled) return   // 只上报意图，绝不排程
+                                        -> busy? 排队 : 排 spec/commit/settle
+```
+
+关掉时同时 `clearTimeout` 三个定时器并取消在跑的那一轮，所以"点停止"是立即生效的，
+不是等这一轮跑完。「立即生成」走的是 `commit()`，不经过这道闸门 —— 它本来就是手动触发。
+
+`POST /api/sync {enabled}` 切换，服务端回广播 `sync` 事件，前端据此切换两个按钮的文案与配色。
+
+### 12.2 手动版本模型（想法 11）
+
+原设计"每轮自动产生版本"被否掉了，改成：
+
+```
+#applyRun:
+  1. 先打一个 pre-round 快照（不写进版本链，只用于"撤销未保存的改动"）
+  2. 应用文件操作（文件仍然立即落盘 —— 这是"不中断"的前提）
+  3. saveMode === 'auto'  → recordCommit() 产生版本（旧行为，保留为选项）
+     saveMode === 'manual'（默认）→ session.setPendingRound({preSnapshotId, files, promptBefore, round++})
+  4. run:done 带 pendingSave / unsavedCount，界面在轮次块里放一个醒目的「保存为版本」
+
+POST /api/version/save       -> 现在才 snapshot + recordCommit，然后清空 pendingRound
+POST /api/version/undo-round -> restore(preSnapshotId)，把未保存的改动整体撤掉
+```
+
+关键点：**"没有版本"不等于"没有安全网"**。回退（⏪）走的是版本链，只能回到你保存过的版本；
+而"撤销未保存的改动"退回的是本轮开始前的状态。两者职责分离，界面上也分得很清楚
+（顶栏 ⏪ 是版本回退；未保存时 ⏪ 优先做撤销）。
+
+### 12.3 定位索引（想法 4）
+
+`projectmap.js` 的目标是回答一个具体问题：**用户说的那个东西在哪个文件里。**
+
+三层来源：
+
+1. **路由**：vue-router 的 `{path, component}` / 动态 `import()`、react-router 的 `<Route>` → `路由 → 文件`
+2. **注解**：Spring 的 `@RequestMapping/@GetMapping/...` + `*Controller` 类名 → `接口路径 → 文件`
+3. **符号**：跨语言的顶层声明正则（`class|interface|enum|record|function|def|struct|type|const`）→ `文件名 → 主要声明`
+
+`locate()` 在 name / path / route / symbols 四个维度上加权打分，同名文件只留最高分。
+**中英对照表**（`SYNONYMS`）解决"用户说中文、代码写英文"的错位：
+「简历列表页」要能匹配到 `resume.ts`，「后端接口」要能匹配到 `controller/service`。
+
+命中结果不只是"显示给你看"：`#consume()` 会把定位到的文件**排到上下文最前面**
+（`recentFiles` 队首），`selectContextFiles()` 按这个顺序优先塞进提示词 —— 这才是"快速定位"的实际收益。
+索引缓存在 `projects/<p>/projectmap.json`，签名（文件列表 + 大小）不变就复用。
+
+### 12.4 按需加载（想法 15 的根因）
+
+原来 boot 与 `refreshAll()` 都会 `for (const rel of tree.files) await pullFile(rel)` —— 顺序发几百个 HTTP 请求，
+在真实项目上界面直接失去响应（用户看到的就是"点文件没反应"）。
+现在只拉 `GET /api/tree` 的目录结构，文件内容**点开哪个拉哪个**（`openFile` 内部 `pullFile`），
+树上的 pending / 手改标记来自服务端元数据而不是文件内容。这一条同时修掉了"大项目卡死"和"点文件没反应"。
+
+### 12.5 前端重置（想法 13）
+
+切项目 = 换 session。服务端 `reloadServices()` 除了常规事件外会先广播一个 `reset`，
+带着新的 projectDir / staging / prompt / timeline。前端 `applyReset()` 做一次彻底清场：
+文件缓存、标签页、轮次、建议、选区、手改记录、折叠状态全部清空，编辑器模型解绑，然后再 `refreshAll()`。
+**不能只依赖 `timeline` 事件**：新会话时间线是空的，原来的实现遇到空数组直接 return，界面就留着旧内容了。
+
+### 12.6 暂存模式回退的最小化（顺手修的缺陷）
+
+原来 `restore()` 在暂存模式下会把快照里的**全部文件**写进 staging —— 一次回退就等于把整个项目复制一份。
+现在：
+
+```
+for (rel of snapshot.files)   if (readProject(rel) === content) continue   // 与项目一致就不落暂存层
+for (rel of projectFiles)     if (!(rel in snapshot.files)) deleted.add(rel) // 快照里没有 → 标记待删除
+```
+
+既省磁盘，语义也更准：暂存层里**只应该出现真正的差异**。
+
+---
+
+## 13. 已知取舍
 
 - 回退是**线性版本链 + 游标**：能自由往返，但在历史版本上继续生成会丢弃右侧分支（界面会告知丢弃了几个）。
   版本树会让 UI 与心智负担都变重，当前不值。
@@ -413,3 +495,7 @@ const specWorthy = intent.score >= 0.32 || enoughContext;
   但降级路径的"编辑"能力就没了 —— `/selftest.html` 会明确报出是哪一步失败。
 - 内置演示模型保留在代码里（`--provider mock`），因为它是离线回归测试的唯一手段；
   界面上已彻底隐藏，不影响正常使用。
+- **"没有版本"不等于"没有安全网"**：手动保存模式下时间线只显示你保存过的版本，
+  未保存的改动靠内部回合前快照兜底（撤销）。这是刻意的职责分离，不是遗漏。
+- **同步生成关掉后，意图判定仍在跑**（输入框下方那条进度条还会动）。保留它是因为
+  "我知道它理解到哪一步了"本身有价值；如果你希望彻底静默，可以再把 `intent` 事件也关掉。

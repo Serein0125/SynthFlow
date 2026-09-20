@@ -145,8 +145,8 @@ const Editor = {
     }
   },
 
-  /** 打开一个文件（内容来自服务端缓存）。 */
-  async open(path, content, { added = [] } = {}) {
+  /** 打开一个文件（内容来自服务端缓存）。focus 只在你主动点文件时才为 true。 */
+  async open(path, content, { added = [], focus = false } = {}) {
     this.path = path;
     const lang = monacoLangOf(path);
     this.setDirty(false);
@@ -159,7 +159,8 @@ const Editor = {
       this.inst.setModel(model);
       this.suppressChange = false;
       this.applyAddedLines(added);
-      this.inst.focus();
+      // 想法 10：只有用户主动点文件才把光标挪进编辑器，其它情况一律留在输入框
+      if (focus) this.inst.focus();
     } else {
       this.renderFallback(content, added);
     }

@@ -8,6 +8,7 @@ import { buildMessages } from './prompt.js';
 import { createProtocolParser } from './protocol.js';
 import { analyzeIntent, decidePromptChange } from './session.js';
 import { scanStyle } from './style.js';
+import { buildProjectMap, locate, locatorBrief } from './projectmap.js';
 import { addedLineNumbers, compactDiff, newId, nowIso, sha1 } from './util.js';
 
 export class Runner {
@@ -33,6 +34,8 @@ export class Runner {
     this.lastDecision = null;
     // 想法 B：用户在代码面板里选中的片段，下一轮需求优先作用于此
     this.selection = null;
+    // 想法 1（第三轮）：同步生成开关。关掉后打字只做意图判定，不会自动预演/生成。
+    this.syncEnabled = session.syncEnabled !== false;
     this.busy = false;
   }
 
@@ -73,6 +76,13 @@ export class Runner {
     clearTimeout(this.settleTimer);
 
     if (!next.trim()) return;
+
+    // 想法 1（第三轮）：同步生成被关掉时，只上报意图，不自动预演 / 不自动落盘。
+    // 「立即生成」按钮仍然可用 —— 那本来就是手动触发。
+    if (!this.syncEnabled) {
+      if (process.env.SF_DEBUG) console.error(`[onInput] 同步生成已关闭，只做意图判定 score=${intent.score.toFixed(2)}`);
+      return;
+    }
 
     // 生成中继续输入（想法 9）：不打断，等当前运行结束后增量续写
     if (this.busy) {
@@ -204,6 +214,15 @@ export class Runner {
       style = scanStyle(this.workspace);
     } catch { /* 风格扫描失败不影响生成 */ }
     const styleSummary = style?.summary && style.scanned >= 3 ? style.summary : null;
+    // 想法 4（第三轮）：页面/组件定位索引 —— 改已有项目时先找到该改哪个文件，
+    // 并把定位到的文件内容排到上下文最前面。
+    let projectMap = null;
+    let located = [];
+    try {
+      projectMap = buildProjectMap(this.workspace);
+      located = locate(projectMap, run.prompt, { k: 5 }).filter((h) => existingFiles[h.file] !== undefined);
+    } catch { /* 定位失败就退化成原来的 RAG */ }
+    const locator = locatorBrief(this.workspace, projectMap);
     const manualEdits = (s.manualEdits ?? []).filter((m) => existingFiles[m.path] !== undefined);
     const manualEditNote = manualEdits.length
       ? `【用户手动改过这些文件，请务必保留他的改动，不要当成脏数据覆盖回去】\n` +
@@ -230,13 +249,18 @@ export class Runner {
       skills,
       memoryBriefing: this.memory?.briefing() ?? '',
       existingFiles,
-      // 补丁重试时，把上次未命中的文件提到上下文最前面
-      recentFiles: run.forceFiles?.length ? [...run.forceFiles, ...this.recentFiles] : this.recentFiles,
+      // 定位到的页面/组件文件排最前，其次才是补丁重试指定的文件、最近碰过的文件
+      recentFiles: [
+        ...located.map((l) => l.file),
+        ...(run.forceFiles ?? []),
+        ...this.recentFiles,
+      ].filter((v, i, arr) => arr.indexOf(v) === i),
       adopted: s.segments.filter((x) => x.kind === 'adopt' && !x.reverted).map((x) => ({ text: x.text })),
       previousPrompt: this.committedPrompt,
       config: this.config,
       requireSuggestions: true,
       styleSummary,
+      locatorBrief: locator,
       projectNote,
       manualEditNote,
       selectionNote,
@@ -248,6 +272,7 @@ export class Runner {
       chars: messages.reduce((a, m) => a + m.content.length, 0),
       styleScanned: style?.scanned ?? 0,
       styled: Boolean(styleSummary),
+      located: located.map((l) => ({ file: l.file, route: l.route, name: l.name, kind: l.kind })),
     };
     this.emit('run:context', { runId: run.id, ...run.context });
 
@@ -353,6 +378,12 @@ export class Runner {
     const s = this.session;
     s.status = 'applying';
     const promptBefore = this.committedPrompt;
+    // 想法 11：落盘前先打一个"本轮之前"的快照，用于"撤销未保存的改动"。
+    // 注意这不是版本 —— 时间线上不会出现它。
+    let preSnapshot = null;
+    try {
+      preSnapshot = this.workspace.snapshot({ label: `pre-round ${run.id}`, runId: run.id, meta: { kind: 'pre-round' } });
+    } catch { /* 快照失败不影响写入 */ }
     const results = [];
     for (const op of run.ops) {
       let res;
@@ -366,21 +397,32 @@ export class Runner {
     }
     const okFiles = results.filter((r) => r.ok).map((r) => r.path);
     const failed = results.filter((r) => !r.ok);
-    const snap = this.workspace.snapshot({
-      label: run.prompt.slice(0, 60),
-      runId: run.id,
-      meta: { mode: run.mode, files: okFiles },
-    });
-    const version = s.recordCommit({
-      runId: run.id,
-      promptBefore,
-      promptAfter: run.prompt,
-      files: okFiles,
-      summary: `${run.retryOf ? '补丁重试 · ' : ''}${run.mode === 'regenerate' ? '生成' : run.mode === 'continue' ? '增量续写' : '增量修改'} ${okFiles.length} 个文件${failed.length ? `（${failed.length} 个失败）` : ''}`,
-      snapshotId: snap.id,
-      // 想法 2：saveMode=confirm 时先标记"待确认"，界面上让用户点保留/丢弃
-      confirmed: this.config.saveMode !== 'confirm',
-    });
+    const summary = `${run.retryOf ? '补丁重试 · ' : ''}${run.mode === 'regenerate' ? '生成' : run.mode === 'continue' ? '增量续写' : '增量修改'} ${okFiles.length} 个文件${failed.length ? `（${failed.length} 个失败）` : ''}`;
+    const manualMode = this.config.saveMode !== 'auto';
+    let version = null;
+    if (manualMode) {
+      // 想法 11：只有点「保存为版本」才产生版本，这里只记一笔"未保存的改动"
+      s.setPendingRound({
+        preSnapshotId: preSnapshot?.id ?? null,
+        runId: run.id,
+        files: [...new Set([...(s.pendingRound?.files ?? []), ...okFiles])],
+        promptBefore,
+        promptAfter: run.prompt,
+        round: (s.pendingRound?.round ?? 0) + 1,
+        at: nowIso(),
+      });
+    } else {
+      const snap = this.workspace.snapshot({ label: run.prompt.slice(0, 60), runId: run.id, meta: { mode: run.mode, files: okFiles } });
+      version = s.recordCommit({
+        runId: run.id,
+        promptBefore,
+        promptAfter: run.prompt,
+        files: okFiles,
+        summary,
+        snapshotId: snap.id,
+        confirmed: true,
+      });
+    }
     this.committedPrompt = run.prompt;
     s.status = 'idle';
     // 用过的选区就消费掉，避免一直粘在后续轮次上
@@ -405,7 +447,7 @@ export class Runner {
     this.rag?.build({ force: true });
     s.save();
 
-    this.emit('run:applied', { runId: run.id, results: results.map(stripDiff), versionId: version.id, files: okFiles });
+    this.emit('run:applied', { runId: run.id, results: results.map(stripDiff), versionId: version?.id ?? null, files: okFiles, unsaved: manualMode });
     this.emit('tree', { tree: this.safeTree() });
     this.emit('versions', s.versionList());
     // 想法 3：把这一轮（思考/建议/文件操作）写进会话，刷新页面后还能看到
@@ -416,7 +458,7 @@ export class Runner {
       at: nowIso(),
       ms,
       files: okFiles,
-      versionId: version.id,
+      versionId: version?.id ?? null,
       thoughts: run.thoughts,
       suggestions: this.#filterSuggestions(run.suggestions),
       ops: run.ops.map((o) => ({ path: o.path, action: o.action, mode: o.mode })),
@@ -431,11 +473,12 @@ export class Runner {
       mode: run.mode,
       files: okFiles,
       failed: failed.map((f) => ({ path: f.path, error: f.error })),
-      versionId: version.id,
+      versionId: version?.id ?? null,
       chars: run.chars,
       usage,
-      droppedBranches: version.droppedBranches ?? 0,
-      pendingConfirm: version.confirmed === false,
+      droppedBranches: version?.droppedBranches ?? 0,
+      pendingSave: manualMode && okFiles.length > 0,
+      unsavedCount: manualMode ? (s.pendingRound?.round ?? 0) : 0,
       staging: this.workspace.staging,
     });
     this.emit('state', this.snapshot());
@@ -491,6 +534,77 @@ export class Runner {
     );
     if (!r) this.emit('toast', { level: 'warn', message: '补丁重试未能启动' });
     return Boolean(r);
+  }
+
+  /** 打开/关闭"同步思考 + 同步生成"（想法 1）。关闭时同时停掉在跑的那一轮。 */
+  setSync(enabled, { silent = false } = {}) {
+    this.syncEnabled = Boolean(enabled);
+    clearTimeout(this.specTimer);
+    clearTimeout(this.commitTimer);
+    clearTimeout(this.settleTimer);
+    if (!this.syncEnabled) {
+      this.pendingInput = false;
+      if (this.busy) this.cancel('sync-off');
+      this.session.status = 'idle';
+    }
+    if (!silent) {
+      this.emit('sync', { syncEnabled: this.syncEnabled });
+      this.emit('toast', {
+        level: this.syncEnabled ? 'ok' : 'warn',
+        message: this.syncEnabled
+          ? '已开启同步生成：打字停顿就会预演，判定写完自动落盘'
+          : '已关闭同步生成：打字不会触发思考与生成，需要时点「立即生成」',
+      });
+    }
+    return { ok: true, syncEnabled: this.syncEnabled };
+  }
+
+  /** 把本轮改动保存成一个版本（想法 11：只有显式保存才产生版本）。 */
+  saveVersion({ label = '' } = {}) {
+    const s = this.session;
+    const pending = s.pendingRound;
+    const files = pending?.files?.length ? pending.files : this.recentFiles.slice(0, 20);
+    const snap = this.workspace.snapshot({ label: label || `手动保存 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`, meta: { kind: 'manual-save' } });
+    const version = s.recordCommit({
+      runId: pending?.runId ?? null,
+      promptBefore: pending?.promptBefore ?? this.committedPrompt,
+      promptAfter: pending?.promptAfter ?? s.prompt,
+      files,
+      summary: label || (pending ? `保存第 ${pending.round ?? ''} 轮改动`.trim() : '手动保存'),
+      snapshotId: snap.id,
+      kind: 'manual',
+      confirmed: true,
+    });
+    s.clearPendingRound();
+    s.save();
+    this.emit('versions', s.versionList());
+    this.emit('state', this.snapshot());
+    this.emit('toast', { level: 'ok', message: `已保存为版本 ${version.id}（可随时回退）` });
+    return { ok: true, versionId: version.id, versions: s.versionList() };
+  }
+
+  /** 撤销"还没保存的那些轮次"的改动（回到最近一次保存的状态）。 */
+  undoRound() {
+    const s = this.session;
+    const pending = s.pendingRound;
+    if (!pending?.preSnapshotId) return { ok: false, error: '没有可撤销的未保存改动' };
+    let restore;
+    try {
+      restore = this.workspace.restore(pending.preSnapshotId);
+    } catch (err) {
+      return { ok: false, error: `撤销失败：${err.message}` };
+    }
+    s.clearPendingRound();
+    s.prompt = pending.promptBefore ?? s.prompt;
+    this.committedPrompt = s.currentVersion?.promptAfter ?? '';
+    this.rag?.build({ force: true });
+    s.save();
+    this.emit('tree', { tree: this.safeTree() });
+    this.emit('versions', s.versionList());
+    this.emit('prompt', { text: s.prompt, reason: 'undo-round' });
+    this.emit('state', this.snapshot());
+    this.emit('toast', { level: 'warn', message: `已撤销未保存的改动（恢复 ${restore.restored} 个文件）` });
+    return { ok: true, ...restore };
   }
 
   /** 提交：优先就地"采纳"预演结果，避免重复调用模型（省钱 + 更快）。 */
@@ -717,6 +831,10 @@ export class Runner {
       draft: this.draft ? { runId: this.draft.runId, files: this.draft.ops.map((o) => o.path), mode: this.draft.mode, ms: this.draft.ms } : null,
       versions: s.versionList(),
       pendingConfirm: s.pendingConfirm,
+      unsaved: s.pendingRound
+        ? { round: s.pendingRound.round, files: s.pendingRound.files ?? [], at: s.pendingRound.at, canUndo: Boolean(s.pendingRound.preSnapshotId) }
+        : null,
+      syncEnabled: this.syncEnabled,
       intent: this.lastIntent,
       decision: this.lastDecision ? { mode: this.lastDecision.mode, ratio: this.lastDecision.ratio, reason: this.lastDecision.reason } : null,
       workspace: {
@@ -741,6 +859,8 @@ export class Runner {
         patchRetry: this.config.patchRetry,
         saveMode: this.config.saveMode,
         suggest: this.config.suggest,
+        compactStyle: this.config.compactStyle,
+        streamLimitKB: this.config.streamLimitKB,
         writeMode: this.config.writeMode,
         projectDir: this.config.projectDir,
       },
@@ -785,6 +905,8 @@ export function normalizeTiming(config = {}) {
     autoCommit: config.autoCommit !== false,
     autoAdoptHigh: config.autoAdoptHigh === true,
     patchRetry: config.patchRetry !== false,
+    // 想法 11：默认只有显式保存才产生版本
+    saveMode: config.saveMode === 'auto' ? 'auto' : 'manual',
   };
 }
 

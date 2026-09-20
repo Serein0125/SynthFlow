@@ -36,6 +36,7 @@ export function buildMessages(ctx) {
     previousPrompt = '',
     requireSuggestions = false,
     styleSummary = null,
+    locatorBrief = null,
     projectNote = null,
     manualEditNote = null,
     selectionNote = null,
@@ -76,6 +77,7 @@ export function buildMessages(ctx) {
     );
   }
   if (styleSummary) sys.push(styleSummary);
+  if (locatorBrief) sys.push(locatorBrief);
   if (projectNote) sys.push(projectNote);
   if (manualEditNote) sys.push(manualEditNote);
   if (selectionNote) sys.push(selectionNote);

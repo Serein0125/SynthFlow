@@ -451,31 +451,58 @@ export class Workspace {
     }
   }
 
+  /** 只读目标项目本身（不看暂存层）。 */
+  readProject(rel) {
+    try {
+      const { abs } = this.absRead(rel);
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return fs.readFileSync(abs, 'utf8');
+    } catch { /* ignore */ }
+    return null;
+  }
+
   /** 回退：清空当前写入层，再按快照内容重建（暂存模式下真实项目不会被触碰）。 */
   restore(snapshotId) {
     const dir = path.join(this.snapshotsDir, snapshotId);
     const man = readJsonSafe(path.join(dir, 'manifest.json'), null);
     if (!man) throw new Error(`快照不存在: ${snapshotId}`);
+    const want = man.files ?? {};
     if (this.staging) {
-      // 暂存模式：清掉暂存层，合并视图自然回落到项目真实内容
       this.clearStaging();
-    } else {
-      // 直接模式：工作区由 SynthFlow 独占管理，整目录重建才等价于"回到那一版"
-      for (const rel of this.listFiles()) {
-        try {
-          fs.rmSync(this.abs(rel).abs, { force: true });
-        } catch { /* ignore */ }
+      // 暂存模式下只把"与项目不同"的文件放进暂存层：
+      // 否则一次回退会把整个项目复制进 staging，白白占一份磁盘。
+      for (const rel of Object.keys(want)) {
+        const src = path.join(dir, 'files', rel);
+        if (!fs.existsSync(src)) continue;
+        const content = fs.readFileSync(src, 'utf8');
+        if (this.readProject(rel) === content) continue;
+        this.write(rel, content);
       }
-      this.cleanupEmptyDirs(this.root);
+      // 快照里没有、但项目里有的文件 → 标记为"待删除"
+      for (const rel of this.listProjectFiles()) {
+        if (!(rel in want)) this.deleted.add(rel);
+      }
+      if (this.deleted.size) this.saveState();
+      return { snapshotId, restored: this.pendingRels().size, files: [...this.pendingRels()], meta: man };
     }
+    // 直接模式：工作区由 SynthFlow 独占管理，整目录重建才等价于"回到那一版"
+    for (const rel of this.listFiles()) {
+      try {
+        fs.rmSync(this.abs(rel).abs, { force: true });
+      } catch { /* ignore */ }
+    }
+    this.cleanupEmptyDirs(this.root);
     const written = [];
-    for (const rel of Object.keys(man.files ?? {})) {
+    for (const rel of Object.keys(want)) {
       const src = path.join(dir, 'files', rel);
       if (!fs.existsSync(src)) continue;
       this.write(rel, fs.readFileSync(src, 'utf8'));
       written.push(rel);
     }
     return { snapshotId, restored: written.length, files: written, meta: man };
+  }
+
+  listProjectFiles() {
+    return listFilesRecursive(this.root, { ignore: IGNORE_DIRS }).filter(isTextFile);
   }
 
   cleanupEmptyDirs(base = this.root) {

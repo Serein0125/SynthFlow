@@ -41,7 +41,9 @@ const Panels = {
     q('#cfg-autoCommit').checked = config.autoCommit !== false;
     q('#cfg-autoAdoptHigh').checked = Boolean(config.autoAdoptHigh);
     q('#cfg-patchRetry').checked = config.patchRetry !== false;
-    q('#cfg-saveMode').value = config.saveMode ?? 'confirm';
+    q('#cfg-saveMode').value = config.saveMode === 'auto' ? 'auto' : 'manual';
+    q('#cfg-streamLimitKB').value = config.streamLimitKB ?? 1024;
+    q('#cfg-compactStyle').value = config.compactStyle ?? 'balanced';
 
     // —— 建议开关（想法 5）——
     const sug = config.suggest ?? {};
@@ -103,6 +105,8 @@ const Panels = {
         autoAdoptHigh: q('#cfg-autoAdoptHigh').checked,
         patchRetry: q('#cfg-patchRetry').checked,
         saveMode: q('#cfg-saveMode').value,
+        streamLimitKB: Number(q('#cfg-streamLimitKB').value),
+        compactStyle: q('#cfg-compactStyle').value,
         customInstructions: q('#cfg-custom').value,
         suggest: {
           clarify: q('#sg-clarify').checked,
@@ -116,10 +120,42 @@ const Panels = {
       };
       try {
         await post('/api/config', payload);
+        if (typeof payload.streamLimitKB === 'number') S.streamLimitKB = payload.streamLimitKB;
+        if (el.compactStyle) el.compactStyle.value = payload.compactStyle;
         setStatus('done', '设置已保存', '');
         toast('设置已生效', 'ok', 2200);
       } catch (err) {
         toast(`保存失败：${err.message}`, 'err');
+      }
+    });
+
+    // 想法 7：浏览文件夹
+    on('#pj-browse', 'click', () => this.openPicker(q('#pj-dir').value.trim()));
+    this.bindPicker();
+
+    // 想法 4：定位索引测试
+    on('#loc-test', 'click', async () => {
+      const query = q('#loc-query').value.trim();
+      if (!query) return;
+      try {
+        const res = await get(`/api/locate?q=${encodeURIComponent(query)}`);
+        q('#loc-result').innerHTML = res.hits.length
+          ? res.hits
+              .map((h) => `<div class="rag-hit"><b>${h.kind === 'page' ? '页面' : '组件'} · ${esc(h.name ?? '')}</b>${h.route ? ` <span class="muted">${esc(h.route)}</span>` : ''}<div><code>${esc(h.file)}</code> <span class="muted">得分 ${h.score}</span></div></div>`)
+              .join('')
+          : '<p class="muted">没有定位到文件（试试用页面名、组件名或路由路径）</p>';
+      } catch (err) {
+        toast(`定位失败：${err.message}`, 'err');
+      }
+    });
+    on('#loc-rebuild', 'click', async () => {
+      try {
+        const res = await post('/api/projectmap');
+        toast(`定位索引已重建：${res.stats.pages} 个页面 / ${res.stats.components} 个组件`, 'ok', 3600);
+        const pages = (res.pages ?? []).slice(0, 8).map((p) => `<div class="rag-hit"><b>${esc(p.route ?? '')}</b> <code>${esc(p.file)}</code></div>`).join('');
+        q('#loc-result').innerHTML = pages || '<p class="muted">没有识别到页面（可能不是 vue-router / react-router 项目）</p>';
+      } catch (err) {
+        toast(`重建失败：${err.message}`, 'err');
       }
     });
 
@@ -353,6 +389,77 @@ const Panels = {
     q('#sk-name').focus();
   },
 
+  /* ============================ 目录选择弹窗（想法 7） ============================ */
+
+  pickerDir: '',
+
+  async openPicker(dir) {
+    if (!el.pickerModal) return;
+    el.pickerModal.classList.remove('hidden');
+    await this.browse(dir ?? this.pickerDir ?? '');
+  },
+
+  closePicker() {
+    el.pickerModal?.classList.add('hidden');
+  },
+
+  async browse(dir) {
+    try {
+      const data = await get(`/api/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`);
+      this.pickerDir = data.dir;
+      el.pickerPath.value = data.dir;
+      el.pickerHint.textContent = data.isProject
+        ? '看起来是个项目根目录（检测到 package.json 或 .git）'
+        : '继续往下找，或者直接点下面「用这个目录」';
+      el.pickerDrives.innerHTML = (data.drives ?? [])
+        .map((d) => `<button class="btn ghost tiny pick-drive" data-dir="${esc(d)}">${esc(d)}</button>`)
+        .join('');
+      el.pickerDrives.querySelectorAll('.pick-drive').forEach((b) => b.addEventListener('click', () => this.browse(b.dataset.dir)));
+      el.pickerList.innerHTML = (data.dirs ?? [])
+        .map((d) => `<li class="picker-item" data-dir="${esc(d.path)}"><span class="pi-icon">📁</span><span class="pi-name">${esc(d.name)}</span></li>`)
+        .join('') || '<li class="muted" style="padding:8px">（没有子目录）</li>';
+      el.pickerList.querySelectorAll('.picker-item').forEach((li) => {
+        li.addEventListener('click', () => this.browse(li.dataset.dir));
+      });
+      el.pickerUp.disabled = !data.parent;
+      el.pickerUp.dataset.parent = data.parent ?? '';
+    } catch (err) {
+      toast(`读取目录失败：${err.message}`, 'err', 5000);
+    }
+  },
+
+  async usePickerDir(mode) {
+    const dir = el.pickerPath.value.trim();
+    if (!dir) return;
+    try {
+      const res = await post('/api/project', { dir, mode });
+      this.closePicker();
+      toast(`已切换到 ${res.projectDir}（${res.writeMode === 'staging' ? '暂存模式' : '直接写入'}）`, 'ok', 4200);
+    } catch (err) {
+      toast(`切换失败：${err.message}`, 'err', 6000);
+    }
+  },
+
+  bindPicker() {
+    if (!el.pickerModal) return;
+    el.pickerClose.addEventListener('click', () => this.closePicker());
+    el.pickerModal.addEventListener('click', (e) => {
+      if (e.target === el.pickerModal) this.closePicker();
+    });
+    el.pickerUp.addEventListener('click', () => {
+      const p = el.pickerUp.dataset.parent;
+      if (p) this.browse(p);
+    });
+    el.pickerGo.addEventListener('click', () => this.browse(el.pickerPath.value.trim()));
+    el.pickerPath.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') this.browse(el.pickerPath.value.trim());
+    });
+    el.pickerUse.addEventListener('click', () => this.usePickerDir('staging'));
+    el.pickerDirect.addEventListener('click', () => {
+      if (window.confirm('直接写入模式下，AI 生成的内容会立刻改你的项目文件（不打草稿）。确定吗？')) this.usePickerDir('direct');
+    });
+  },
+
   /* ============================ 命令面板 ============================ */
 
   paletteItems: [],
@@ -438,14 +545,20 @@ function flattenFiles(node) {
 }
 
 async function refreshAll() {
+  // 想法 15：不再把整个项目的文件内容一次性拉下来（大项目会卡死），只刷新树与元数据
   const tree = await get('/api/tree');
-  for (const rel of tree.files ?? []) await pullFile(rel);
   renderTree(tree.tree);
   updateWorkspaceStats();
-  renderPending({ items: [], staging: tree.staging });
   const pending = await get('/api/pending');
   renderPending(pending);
   const versions = await get('/api/versions');
   renderVersions(versions);
-  if (S.current) renderCode();
+  // 当前打开的文件重新拉一次；其它文件等用户点开时再按需加载
+  if (S.current) {
+    await pullFile(S.current);
+    await renderCode();
+  } else {
+    const first = flattenFiles(tree.tree ?? {})[0];
+    if (first) await openFile(first);
+  }
 }

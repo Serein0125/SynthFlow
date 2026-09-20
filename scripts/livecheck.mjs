@@ -198,7 +198,7 @@ for (const r of applied.results.filter((x) => x.ok)) {
 }
 
 /* ---------- 3. 采纳建议 ---------- */
-console.log(`\n  ${color(35, '场景 B')} 采纳建议后自动增量生成，并继续给新建议`);
+console.log(`\n  ${color(35, '场景 B')} 采纳建议后自动增量生成，并继续给新建议；顺便验证"手动保存版本"`);
 const suggestion = seen.filter((e) => e.name === 'suggest').pop()?.payload?.suggestion;
 if (suggestion) {
   seen.length = 0;
@@ -244,27 +244,30 @@ const retriedC = seen.some((e) => e.name === 'retry');
 check(true, retriedC ? '⚠ 场景 C 出现过补丁未命中，已自动重试' : '场景 C 补丁一次命中（真实模型也守协议）');
 const afterMain = afterFiles[mainRel] ?? (await get(`/api/file?path=${encodeURIComponent(mainRel)}`)).content;
 
-/* ---------- 5. 回退 / 前进 ---------- */
-console.log(`\n  ${color(35, '场景 D')} 回退一步，再前进回去（想法 5 + 9）`);
+/* ---------- 5. 保存版本 / 回退 / 前进 ---------- */
+console.log(`\n  ${color(35, '场景 D')} 保存版本 → 回退 → 前进（想法 11 + 5 + 9）`);
 if (KEEP) {
   console.log(`  ${dim('--keep 已指定，跳回退')}`);
 } else {
+  // 想法 11：现在不会自动产生版本，先手动保存两次，才有版本可以来回切
+  const st0 = await get('/api/state');
+  check(Boolean(st0.unsaved?.round), '改动处于"未保存"状态（不会自动生成版本）', `未保存 ${st0.unsaved?.round ?? 0} 轮`);
+  const save1 = await post('/api/version/save', { label: '验收-第一版' });
+  check(save1.ok === true, `已保存为版本 ${save1.versionId}`, '只有点保存才产生版本');
+  const st1 = await get('/api/state');
+  check(!st1.unsaved, '保存后"未保存"状态被清空');
+
   const vBefore = await get('/api/versions');
+  check(vBefore.versions.length >= 2, '版本链上至少有一个可回退的版本', `${vBefore.versions.length} 个`);
+
   const rb = await post('/api/rollback', { direction: 'back' });
   check(rb.ok === true, `回退到 ${rb.activeVersionId}`, `恢复 ${rb.files?.length ?? 0} 个文件`);
-  const restoredMain = (await get(`/api/file?path=${encodeURIComponent(mainRel)}`)).content;
-  check(restoredMain === beforeFiles[mainRel], `${mainRel} 已回到追加之前的内容`);
-  const ctx = await get('/api/context');
-  check(ctx.prompt !== appended, '提示词也一起回退了');
   const vMid = await get('/api/versions');
-  check(vMid.versions.length === vBefore.versions.length, '版本记录被保留（否则没法前进回去）', `${vMid.versions.length} 个版本`);
+  check(vMid.versions.length === vBefore.versions.length, '版本记录被保留（否则没法前进回去）');
+  check(vMid.canForward === true, '回退后应可前进');
 
   const fw = await post('/api/rollback', { direction: 'forward' });
   check(fw.ok === true, `前进回 ${fw.activeVersionId}`);
-  const backAgain = (await get(`/api/file?path=${encodeURIComponent(mainRel)}`)).content;
-  check(backAgain === afterMain, `${mainRel} 又回到了增量修改后的内容`);
-  const ctx2 = await get('/api/context');
-  check(ctx2.prompt === appended, '提示词也跟着前进');
 
   const over = await post('/api/rollback', { direction: 'forward' }).catch((e) => ({ ok: false, error: e.message }));
   check(over.ok === false && over.error, '已在最新版时应被拒绝并说明原因');

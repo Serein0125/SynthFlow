@@ -1,7 +1,28 @@
 // SynthFlow 前端 · 主逻辑：SSE 事件接线、文件树、轮次流、输入框、启动流程。
 // 依赖加载顺序：core.js → editor.js → layout.js → panels.js → app.js
 
-/* ============================ 文件树 ============================ */
+/* ============================ 文件树（想法 12：可折叠 + 图标） ============================ */
+
+/** 文件类型 → 图标字形与配色类，模仿 VS Code 的文件树。 */
+const FILE_ICONS = {
+  js: ['JS', 'i-js'], mjs: ['JS', 'i-js'], cjs: ['JS', 'i-js'], jsx: ['JS', 'i-js'],
+  ts: ['TS', 'i-ts'], tsx: ['TS', 'i-ts'],
+  vue: ['V', 'i-vue'], svelte: ['S', 'i-svelte'],
+  json: ['{}', 'i-json'], md: ['M', 'i-md'], markdown: ['M', 'i-md'],
+  css: ['#', 'i-css'], scss: ['#', 'i-css'], less: ['#', 'i-css'],
+  html: ['<>', 'i-html'], htm: ['<>', 'i-html'],
+  py: ['PY', 'i-py'], go: ['GO', 'i-go'], rs: ['RS', 'i-rs'], java: ['JV', 'i-java'],
+  sh: ['$', 'i-sh'], ps1: ['$', 'i-sh'], yml: ['Y', 'i-yml'], yaml: ['Y', 'i-yml'],
+  sql: ['DB', 'i-sql'], svg: ['SV', 'i-img'], png: ['IM', 'i-img'], jpg: ['IM', 'i-img'],
+};
+const iconOf = (name) => FILE_ICONS[name.split('.').pop()?.toLowerCase() ?? ''] ?? ['·', 'i-def'];
+
+function toggleDir(path) {
+  if (S.collapsedDirs.has(path)) S.collapsedDirs.delete(path);
+  else S.collapsedDirs.add(path);
+  LS.set('collapsedDirs', [...S.collapsedDirs]);
+  renderTree();
+}
 
 function renderTree(tree) {
   if (tree) S.tree = tree;
@@ -11,26 +32,34 @@ function renderTree(tree) {
   const walk = (node, depth, parent) => {
     for (const child of node.children ?? []) {
       const row = document.createElement('div');
-      row.className = `tree-item ${child.type === 'dir' ? 'tree-dir' : 'tree-file'}`;
       row.style.paddingLeft = `${8 + depth * 12}px`;
       if (child.type === 'dir') {
+        const collapsed = S.collapsedDirs.has(child.path);
+        row.className = `tree-item tree-dir${collapsed ? ' collapsed' : ''}`;
         row.innerHTML = `<span class="name">${esc(child.name)}</span>`;
+        row.title = `${child.path}（点击展开/折叠）`;
+        row.addEventListener('click', (e) => {
+          e.stopPropagation();
+          toggleDir(child.path);
+        });
         parent.appendChild(row);
         const kids = document.createElement('div');
-        kids.className = 'tree-children';
+        kids.className = `tree-children${collapsed ? ' hidden' : ''}`;
         parent.appendChild(kids);
         walk(child, depth + 1, kids);
       } else {
+        const [glyph, cls] = iconOf(child.name);
         const dots = [
           S.diffs[child.path] ? '<span class="dot" title="本轮有改动"></span>' : '',
           child.pending ? '<span class="dot pending" title="待应用到项目"></span>' : '',
           (S.manualEdits ?? []).some((m) => m.path === child.path) ? '<span class="dot manual" title="你手动改过"></span>' : '',
         ].join('');
-        row.innerHTML = `<span class="name">${esc(child.name)}</span>${dots}`;
+        row.className = 'tree-item tree-file';
+        row.innerHTML = `<span class="fico ${cls}">${esc(glyph)}</span><span class="name">${esc(child.name)}</span>${dots}`;
         row.dataset.path = child.path;
         row.title = child.path;
         if (S.current === child.path) row.classList.add('selected');
-        row.addEventListener('click', () => openFile(child.path));
+        row.addEventListener('click', () => openFile(child.path, { focus: true }));
         parent.appendChild(row);
       }
     }
@@ -92,31 +121,95 @@ function updateDiffBadge() {
 }
 
 function renderCompareOptions() {
-  if (!el.compareSelect) return;
-  const curIdx = S.versions.findIndex((v) => v.id === S.activeVersionId);
-  const options = S.versions
-    .map((v, i) => ({ v, i }))
-    .filter(({ i }) => i !== curIdx)
-    .map(({ v }) => `<option value="${esc(v.id)}">${v.id === 'v0' ? '空项目基线' : esc(v.id)} · ${esc((v.summary ?? '').slice(0, 24))}</option>`)
-    .join('');
-  const prev = curIdx > 0 ? S.versions[curIdx - 1].id : 'v0';
-  el.compareSelect.innerHTML = `<option value="">本轮差异（对 ${esc(prev)}）</option>${options}`;
-  el.compareSelect.value = S.compareFrom;
+  // 想法 9：已移除"与任意历史版本对比"。差异视图固定对比"上一个已保存版本"。
 }
 
-async function openFile(path, { autoscroll = false } = {}) {
+async function showDiffView(path) {
+  const curIdx = S.versions.findIndex((v) => v.id === S.activeVersionId);
+  const fromId = curIdx > 0 ? S.versions[curIdx - 1].id : 'v0';
+  const liveCompact = S.live[path]?.diff;
+  let data = null;
+  try {
+    data = await get(`/api/compare?path=${encodeURIComponent(path)}&from=${encodeURIComponent(fromId)}`);
+  } catch {
+    data = null;
+  }
+  const modified = liveCompact ? (S.live[path].content ?? '') : S.files[path] ?? '';
+  const original = data?.original ?? '';
+  await Editor.showDiff({
+    original,
+    modified,
+    compact: liveCompact ?? data?.compact ?? [],
+    language: langOf(path),
+  });
+  if (el.fileMeta) {
+    const stat = liveCompact
+      ? { added: liveCompact.filter((d) => d.type === 'ins').length, removed: liveCompact.filter((d) => d.type === 'del').length }
+      : data?.stat ?? { added: 0, removed: 0 };
+    el.fileMeta.textContent = `与 ${fromId} 对比 · +${stat.added} / -${stat.removed}`;
+  }
+}
+
+function setView(view) {
+  S.view = view;
+  LS.set('view', view);
+  updateDiffBadge();
+  renderCode({ focus: view === 'code' ? false : false });
+}
+
+function renderUnsaved(state) {
+  if (state?.unsaved !== undefined) S.unsaved = state.unsaved;
+  if (state?.syncEnabled !== undefined) setSyncUi(state.syncEnabled);
+  const n = S.unsaved?.round ?? 0;
+  if (el.unsavedBadge) {
+    el.unsavedBadge.textContent = n ? String(n) : '';
+    el.unsavedBadge.classList.toggle('hidden', n === 0);
+  }
+  if (el.btnSaveVersion) {
+    el.btnSaveVersion.classList.toggle('primary', n > 0);
+    el.btnSaveVersion.title = n
+      ? `有 ${n} 轮改动还没保存为版本（${(S.unsaved.files ?? []).length} 个文件）—— 点这里保存`
+      : '把当前改动保存为一个版本（Ctrl+Alt+S）';
+  }
+}
+
+function setSyncUi(enabled) {
+  S.syncEnabled = enabled !== false;
+  const on = S.syncEnabled;
+  if (el.btnStop) {
+    el.btnStop.classList.toggle('primary', on);
+    el.btnStop.classList.toggle('ghost', !on);
+    el.btnStop.textContent = on ? '⏸ 停止生成' : '⏸ 已停止';
+  }
+  if (el.btnSync) {
+    el.btnSync.classList.toggle('primary', !on);
+    el.btnSync.classList.toggle('ghost', on);
+    el.btnSync.textContent = on ? '▶ 同步生成：开' : '▶ 同步生成：关';
+  }
+  if (el.prompt) {
+    el.prompt.placeholder = on
+      ? '直接开始打字…（不用点发送：停顿约 1 秒我就开始预演，判定你写完了就自动落盘）'
+      : '同步生成已暂停 —— 打字不会触发思考与生成。写好了点「⚡ 立即生成」，或点「▶ 同步生成」恢复自动。';
+  }
+}
+
+async function openFile(path, { autoscroll = false, focus = false } = {}) {
   S.current = path;
   if (!S.openTabs.includes(path)) S.openTabs.push(path);
   if (S.openTabs.length > 8) S.openTabs.shift();
-  if (!S.live[path] && typeof S.files[path] !== 'string') await pullFile(path);
+  // 想法 15：文件内容按需拉取（不在启动时把整个项目拉一遍，否则大项目会卡死）
+  if (!S.live[path] && typeof S.files[path] !== 'string') {
+    if (el.fileMeta) el.fileMeta.textContent = '加载中…';
+    await pullFile(path);
+  }
   if (autoscroll && S.live[path]) S.live[path].autoscroll = true;
   renderTabs();
-  await renderCode();
+  await renderCode({ focus });
   updateWorkspaceStats();
   document.querySelectorAll('.tree-item').forEach((r) => r.classList.toggle('selected', r.dataset.path === path));
 }
 
-async function renderCode({ soft = false } = {}) {
+async function renderCode({ soft = false, focus = false } = {}) {
   const path = S.current;
   if (!path) {
     el.editorEmpty?.classList.remove('hidden');
@@ -140,48 +233,16 @@ async function renderCode({ soft = false } = {}) {
   } else if (Editor.path === path) {
     await Editor.refresh(content, { added });
   } else {
-    await Editor.open(path, content, { added });
+    await Editor.open(path, content, { added, focus });
   }
+  // 想法 9：不管走哪条分支，都要把显示的主机切对，否则从"差异"点回"代码"会卡在差异视图
+  Editor.showHost('code');
   if (el.fileMeta) {
     const lines = content.split('\n').length;
     const mark = added.length ? ` · 本轮 +${added.length}` : '';
     el.fileMeta.textContent = `${lines} 行 · ${content.length} 字符${mark}${live ? ' · 正在写入' : ''}${Editor.dirty ? ' · 未保存' : ''}`;
   }
-  if (soft && !Editor.dirty) updateDiffBadge();
-  else updateDiffBadge();
-}
-
-async function showDiffView(path) {
-  const curIdx = S.versions.findIndex((v) => v.id === S.activeVersionId);
-  const fromId = S.compareFrom || (curIdx > 0 ? S.versions[curIdx - 1].id : 'v0');
-  const liveCompact = S.live[path]?.diff;
-  let data = null;
-  try {
-    data = await get(`/api/compare?path=${encodeURIComponent(path)}&from=${encodeURIComponent(fromId)}`);
-  } catch {
-    data = null;
-  }
-  const modified = liveCompact ? (S.live[path].content ?? '') : S.files[path] ?? '';
-  const original = data?.original ?? '';
-  await Editor.showDiff({
-    original,
-    modified,
-    compact: liveCompact ?? data?.compact ?? [],
-    language: langOf(path),
-  });
-  if (el.fileMeta) {
-    const stat = liveCompact
-      ? { added: liveCompact.filter((d) => d.type === 'ins').length, removed: liveCompact.filter((d) => d.type === 'del').length }
-      : data?.stat ?? { added: 0, removed: 0 };
-    el.fileMeta.textContent = `与 ${S.compareFrom || fromId} 对比 · +${stat.added} / -${stat.removed}`;
-  }
-}
-
-function setView(view) {
-  S.view = view;
-  LS.set('view', view);
   updateDiffBadge();
-  renderCode();
 }
 
 /* ============================ 版本时间线 ============================ */
@@ -192,10 +253,8 @@ function renderVersions(payload) {
   if (payload.activeVersionId) S.activeVersionId = payload.activeVersionId;
   if (typeof payload.canBack === 'boolean') S.canBack = payload.canBack;
   if (typeof payload.canForward === 'boolean') S.canForward = payload.canForward;
-  if (payload.pendingConfirm) S.pendingConfirm = payload.pendingConfirm;
   if (el.btnUndo) el.btnUndo.disabled = !S.canBack;
   if (el.btnRedo) el.btnRedo.disabled = !S.canForward;
-  renderCompareOptions();
   if (!el.timeline) return;
   el.timeline.innerHTML = '';
   const curIdx = S.versions.findIndex((x) => x.id === S.activeVersionId);
@@ -203,12 +262,10 @@ function renderVersions(payload) {
     const li = document.createElement('li');
     const isActive = i === curIdx;
     const ahead = i > curIdx;
-    const unconfirmed = v.confirmed === false;
-    li.className = `timeline-item${isActive ? ' current' : ''}${ahead ? ' reverted' : ''}${unconfirmed ? ' unconfirmed' : ''}`;
+    li.className = `timeline-item${isActive ? ' current' : ''}${ahead ? ' reverted' : ''}`;
     const files = (v.files ?? []).length ? ` · ${(v.files ?? []).length} 个文件` : '';
     li.innerHTML =
-      `<b>${esc(v.id)}</b><span>${esc(v.summary || (v.kind === 'baseline' ? '空项目基线' : v.id))}${v.kind === 'baseline' ? '' : esc(files)}</span>` +
-      (unconfirmed ? '<i class="unconfirmed-tag">待确认</i>' : '');
+      `<b>${esc(v.id)}</b><span>${esc(v.summary || (v.kind === 'baseline' ? '空项目基线' : v.id))}${v.kind === 'baseline' ? '' : esc(files)}</span>`;
     li.title = `提示词：${(v.promptAfter ?? '').slice(0, 140)}`;
     li.addEventListener('click', () => {
       if (isActive) return;
@@ -436,9 +493,12 @@ function addContextBlock(d) {
   const body = roundBody();
   const div = document.createElement('div');
   div.className = 'opblock';
+  const located = (d.located ?? []).slice(0, 3).map((l) => l.route || l.name || l.file).join('、');
   div.innerHTML = `<div class="opblock-head"><span class="op">上下文</span> 项目文件 ${d.files} 个 · 检索命中 ${d.ragHits} 段${
     d.skills?.length ? ` · 技能 ${esc(d.skills.join('/'))}` : ''
-  }${d.styled ? ` · 已套用项目风格（扫了 ${d.styleScanned} 个文件）` : ''} · 约 ${d.chars} 字符</div>`;
+  }${d.styled ? ` · 已套用项目风格（扫了 ${d.styleScanned} 个文件）` : ''}${
+    located ? ` · <span class="warn-text">定位到 ${esc(located)}</span>` : ''
+  } · 约 ${d.chars} 字符</div>`;
   body.appendChild(div);
 }
 
@@ -668,7 +728,7 @@ on('state', (st) => {
   if (st.versions) renderVersions(st.versions);
   if (st.workspace?.staging !== undefined) renderPending({ items: S.pending, staging: st.workspace.staging });
   if (st.manualEdits) S.manualEdits = st.manualEdits;
-  if (st.memory?.chips) renderChips(st.memory.chips);
+  renderUnsaved(st);
   const stats = st.session?.stats;
   if (stats) {
     if (typeof stats.modelCalls === 'number') S.usage.calls = stats.modelCalls;
@@ -681,6 +741,8 @@ on('state', (st) => {
 
 on('timeline', (d) => d?.timeline && rehydrateTimeline(d.timeline));
 on('pending', (d) => renderPending(d));
+on('reset', (d) => applyReset(d));
+on('sync', (d) => setSyncUi(d?.syncEnabled));
 
 on('intent', (d) => renderIntent(d.intent, d.decision));
 
@@ -700,7 +762,6 @@ on('run:start', (d) => {
 });
 
 on('run:context', (d) => d && addContextBlock(d));
-on('think:start', () => {});
 on('think:delta', (d) => appendThink(d.delta));
 on('think:end', () => finishThink());
 on('suggest', (d) => addSuggestion(d.suggestion));
@@ -789,30 +850,16 @@ on('run:done', (d) => {
     done.className = 'opblock';
     done.innerHTML = `<div class="opblock-head"><span class="op">完成</span> ${esc(MODE_TEXT[d.mode] ?? '生成')} · ${d.files?.length ?? 0} 个文件${
       d.versionId ? ` · 版本 ${esc(d.versionId)}` : ''
-    }${d.pendingConfirm ? ' · <span class="warn-text">待确认</span>' : ''}</div>`;
-    round.el.querySelector('.run-body')?.appendChild(done);
-    if (d.pendingConfirm && d.versionId) {
-      const head = round.el.querySelector('.run-head');
+    }</div>`;
+    const body = round.el.querySelector('.run-body');
+    body?.appendChild(done);
+    // 想法 11：这一轮没有产生版本 —— 明确告诉用户"还没保存"，并给一个显眼的按钮
+    if (d.pendingSave) {
       const bar = document.createElement('div');
-      bar.className = 'save-confirm';
-      bar.innerHTML = `<span>这轮的改动要保留为一个版本吗？</span><button class="btn primary small sv-save">保留 ${esc(d.versionId)}</button><button class="btn ghost small sv-drop">丢弃这轮改动</button>`;
-      bar.querySelector('.sv-save').addEventListener('click', async () => {
-        await post('/api/version/confirm', { versionId: d.versionId }).catch((e) => toast(e.message, 'err'));
-        bar.remove();
-        setStatus('done', `已保留 ${d.versionId}`, '');
-      });
-      bar.querySelector('.sv-drop').addEventListener('click', async () => {
-        try {
-          const res = await post('/api/version/discard', { versionId: d.versionId });
-          if (res.ok) {
-            bar.remove();
-            toast(`已丢弃 ${d.versionId}，代码回到上一版`, 'warn', 3600);
-          }
-        } catch (err) {
-          toast(`丢弃失败：${err.message}`, 'err');
-        }
-      });
-      head.insertAdjacentElement('afterend', bar);
+      bar.className = 'save-hint';
+      bar.innerHTML = `<span>这轮改动<b>还没有保存为版本</b>（未保存 ${d.unsavedCount ?? 1} 轮）</span><span class="spacer"></span><button class="btn primary small sv-save">💾 保存为版本</button>`;
+      bar.querySelector('.sv-save').addEventListener('click', () => saveVersion(bar));
+      body?.appendChild(bar);
     }
     streamScroll();
   }
@@ -820,7 +867,8 @@ on('run:done', (d) => {
     S.usage.last = d.usage.tokens ?? 0;
     renderUsage();
   }
-  setStatus('done', `已写入 ${d.files?.length ?? 0} 个文件`, `${d.ms}ms · 版本 ${d.versionId ?? '-'}`);
+  setStatus('done', `已写入 ${d.files?.length ?? 0} 个文件`, `${d.ms}ms${d.versionId ? ` · 版本 ${d.versionId}` : ' · 未保存为版本'}`);
+  checkStreamLimit();
 });
 
 on('run:promoted', (d) => setStatus('gen', '采纳预演结果', d.reason ?? ''));
@@ -870,6 +918,32 @@ on('rollback', (d) => {
 on('file:saved', (d) => setStatus('done', `已保存 ${d.path}`, d.manual ? '已记入"手动改动"，AI 不会覆盖' : ''));
 on('toast', (d) => toast(d.message, d.level ?? 'ok'));
 
+/* ============================ 保存 / 版本（想法 11） ============================ */
+
+async function saveVersion(bar) {
+  try {
+    const res = await post('/api/version/save', {});
+    if (res.ok) {
+      bar?.remove();
+      S.unsaved = null;
+      renderUnsaved({ unsaved: null });
+      setStatus('done', `已保存为版本 ${res.versionId}`, '现在可以用 ⏪ 回退到这一版');
+      toast(`已保存为版本 ${res.versionId}`, 'ok', 3200);
+    }
+  } catch (err) {
+    toast(`保存版本失败：${err.message}`, 'err');
+  }
+}
+
+async function undoUnsaved() {
+  try {
+    const res = await post('/api/version/undo-round');
+    if (!res.ok) toast(res.error ?? '没有可撤销的改动', 'warn', 3000);
+  } catch (err) {
+    toast(`撤销失败：${err.message}`, 'err');
+  }
+}
+
 /* ============================ 保存 ============================ */
 
 async function saveCurrent({ silent = false, reason = '' } = {}) {
@@ -909,6 +983,12 @@ function applyTheme(mode = S.theme) {
 
 document.addEventListener('keydown', (e) => {
   const mod = e.altKey || e.ctrlKey;
+  // 想法 11：Ctrl+Alt+S = 保存为版本（Ctrl+S 留给编辑器里的"保存文件"）
+  if (e.ctrlKey && e.altKey && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    saveVersion();
+    return;
+  }
   if (mod && !e.shiftKey && e.key.toLowerCase() === 'z') {
     e.preventDefault();
     doVersion('back');
@@ -937,7 +1017,8 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!el.palette.classList.contains('hidden')) return Panels.closePalette();
     if (!el.helpModal.classList.contains('hidden')) return el.helpModal.classList.add('hidden');
-    if (el.skillsModal && !el.skillsModal.classList.contains('hidden')) return el.skillsModal.classList.add('hidden');
+    if (el.pickerModal && !el.pickerModal.classList.contains('hidden')) return Panels.closePicker();
+    if (el.compactModal && !el.compactModal.classList.contains('hidden')) return el.compactModal.classList.add('hidden');
     if (!el.modal.classList.contains('hidden')) return el.modal.classList.add('hidden');
     if (!el.layoutPanel.classList.contains('hidden')) return el.layoutPanel.classList.add('hidden');
     if (S.busy) {
@@ -967,39 +1048,271 @@ async function doVersion(direction, versionId) {
   }
 }
 
-function renderChips(chips) {
-  if (!el.chips) return;
-  el.chips.innerHTML = '';
-  const base = (chips ?? []).slice(0, 6);
-  const defaults = [
-    { text: '用中文注释', count: 0 },
-    { text: '加错误处理', count: 0 },
-    { text: '拆成组件', count: 0 },
-    { text: '补单元测试', count: 0 },
-  ];
-  const list = base.length >= 3 ? base : [...base, ...defaults].slice(0, 6);
-  for (const c of list) {
-    const btn = document.createElement('button');
-    btn.className = 'chip';
-    btn.textContent = c.count ? `${c.text} ×${c.count}` : c.text;
-    btn.title = '追加到提示词';
-    btn.addEventListener('click', () => {
-      el.prompt.value = `${el.prompt.value.trimEnd()}${el.prompt.value.trim() ? '\n' : ''}${c.text}`;
-      updateCounter();
-      lastInputAt = Date.now();
-      sendInput(true);
-      el.prompt.focus();
-    });
-    el.chips.appendChild(btn);
+/* ============================ 思考栏长度控制（想法 8） ============================ */
+
+function streamBytes() {
+  if (!el.streamBody) return 0;
+  return (el.streamBody.textContent ?? '').length;
+}
+
+function checkStreamLimit() {
+  if (!el.streamLimit) return;
+  const limit = Math.max(64, S.streamLimitKB || 1024) * 1024;
+  const used = streamBytes();
+  const over = used > limit;
+  el.streamLimit.classList.toggle('hidden', !over);
+  if (over && el.streamLimitText) {
+    el.streamLimitText.textContent = `思考栏已 ${(used / 1024 / 1024).toFixed(2)} MB，超过上限 ${(limit / 1024 / 1024).toFixed(2)} MB`;
   }
+  return over;
+}
+
+/** 压缩历史：只保留最近 3 轮的完整内容，更早的折叠成一行。 */
+function compressStream() {
+  const rounds = S.rounds.slice(0, -3);
+  let compressed = 0;
+  for (const r of rounds) {
+    const body = r.el.querySelector('.run-body');
+    if (!body || body.dataset.compressed === '1') continue;
+    const lines = body.querySelectorAll('.think, .suggestion, .opblock, .stray').length;
+    body.innerHTML = `<div class="opblock compressed"><div class="opblock-head"><span class="op">已压缩</span> 第 ${r.idx} 轮 · ${lines} 个块（点轮次标题可展开查看历史摘要）</div></div>`;
+    body.dataset.compressed = '1';
+    roundCollapseSet(r, true);
+    compressed += 1;
+  }
+  toast(compressed ? `已压缩 ${compressed} 轮历史内容` : '没有可压缩的历史（只保留最近 3 轮完整）', compressed ? 'ok' : 'warn', 2600);
+  checkStreamLimit();
+}
+
+function roundCollapseSet(round, collapsed) {
+  round.collapsed = collapsed;
+  round.el.classList.toggle('collapsed', collapsed);
+}
+
+async function clearStream() {
+  if (el.streamBody) {
+    el.streamBody.innerHTML = '<p class="empty">思考栏已清空。下一轮生成会重新开始记录。</p>';
+  }
+  S.rounds = [];
+  S.currentRound = null;
+  S.suggestions = [];
+  updateUnread();
+  updateRoundLabel();
+  try {
+    await post('/api/timeline/clear');
+  } catch { /* 服务端清不掉也不影响本地视图 */ }
+  checkStreamLimit();
+  toast('思考栏已清空（会话记录也一并清除）', 'ok', 2600);
+}
+
+/* ============================ 提示词工具（想法 5 / 6） ============================ */
+
+async function doCompact() {
+  const text = el.prompt?.value ?? '';
+  if (!text.trim()) {
+    toast('输入框是空的，没什么可整合的', 'warn', 2400);
+    return;
+  }
+  if (!el.btnCompact) return;
+  el.btnCompact.disabled = true;
+  el.btnCompact.textContent = '✨ 整合中…';
+  if (el.compactHint) el.compactHint.textContent = '正在让模型整理你的需求…';
+  setStatus('gen', '正在整合提示词…', `${text.length} 字`);
+  try {
+    const res = await post('/api/prompt/compact', { text, style: el.compactStyle?.value ?? 'balanced' });
+    S.compactUndo = text;
+    el.compactStat.textContent = `${res.charsBefore} 字 → ${res.charsAfter} 字 · 用时 ${(res.ms / 1000).toFixed(1)}s · 偏好「${res.style}」`;
+    el.compactBefore.textContent = res.before;
+    el.compactAfter.textContent = res.text;
+    el.compactUndo.classList.remove('hidden');
+    el.compactModal.classList.remove('hidden');
+    setStatus('done', '整合完成', `${res.charsBefore} → ${res.charsAfter} 字`);
+  } catch (err) {
+    toast(`整合失败：${err.message}`, 'err', 7000);
+    setStatus('err', '整合失败', err.message);
+  } finally {
+    el.btnCompact.disabled = false;
+    el.btnCompact.textContent = '✨ 一键整合';
+    if (el.compactHint) el.compactHint.textContent = '';
+  }
+}
+
+function exportPrompt() {
+  const text = el.prompt?.value ?? '';
+  if (!text.trim()) {
+    toast('输入框是空的，没什么可导出的', 'warn', 2400);
+    return;
+  }
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+  const header = [
+    '---',
+    `title: SynthFlow 提示词`,
+    `exported: ${new Date().toISOString()}`,
+    `project: ${S.projectDir || 'workspace'}`,
+    `chars: ${text.length}`,
+    '---',
+    '',
+  ].join('\n');
+  const blob = new Blob([`${header}${text}\n`], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `synthflow-prompt-${stamp}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  toast('已导出为 .md（在浏览器的下载目录里）', 'ok', 3600);
+}
+
+function importPromptFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    let text = String(reader.result ?? '');
+    // 去掉我们导出时写的 frontmatter
+    text = text.replace(/^---\n[\s\S]*?\n---\n?/, '').trim();
+    if (!text) {
+      toast('文件里没有可用内容', 'warn', 2600);
+      return;
+    }
+    const box = el.prompt;
+    box.value = box.value.trim() ? `${box.value.trimEnd()}\n\n${text}` : text;
+    updateCounter();
+    lastInputAt = Date.now();
+    if (S.syncEnabled) sendInput(true);
+    box.focus();
+    toast(`已导入 ${file.name}（${text.length} 字）`, 'ok', 3200);
+  };
+  reader.readAsText(file, 'utf-8');
+}
+
+/* ============================ 会话重置（想法 13） ============================ */
+
+async function applyReset(payload) {
+  // 切项目 = 换会话：思考栏、输入框、文件缓存全部清空，避免上一个项目的内容残留
+  S.files = {};
+  S.live = {};
+  S.diffs = {};
+  S.openTabs = [];
+  S.current = null;
+  S.rounds = [];
+  S.currentRound = null;
+  S.suggestions = [];
+  S.unsaved = null;
+  S.selection = null;
+  S.manualEdits = [];
+  S.collapsedDirs = new Set();
+  renderSelectionChip();
+  if (el.streamBody) el.streamBody.innerHTML = '<p class="empty">已切换到新项目。这里的思考与建议会从零开始。</p>';
+  if (el.timeline) el.timeline.innerHTML = '';
+  if (el.tabs) el.tabs.innerHTML = '';
+  if (el.prompt) el.prompt.value = payload?.prompt ?? '';
+  updateCounter();
+  updateUnread();
+  updateRoundLabel();
+  if (el.editorEmpty) el.editorEmpty.classList.remove('hidden');
+  if (el.code) el.code.innerHTML = '';
+  Editor.path = null;
+  Editor.setDirty(false);
+  checkStreamLimit();
+  await refreshAll();
+  toast('已切换到新项目，界面已重置', 'ok', 3200);
+}
+
+function renderChips() {
+  // 想法 3：不再显示"历史字段出现次数"的快捷片段，这块位置交给同步/停止按钮
 }
 
 function bindUi() {
   el.prompt?.addEventListener('input', () => {
     lastInputAt = Date.now();
     updateCounter();
-    sendInput();
-    if (el.prompt.value.trim()) setStatus('typing', '输入中…', '等你停下来我就开始预演');
+    if (S.syncEnabled) sendInput();
+    if (el.prompt.value.trim()) setStatus('typing', '输入中…', S.syncEnabled ? '等你停下来我就开始预演' : '同步生成已暂停，点「立即生成」才开始');
+  });
+
+  // 想法 3：同步生成 / 停止生成 两个按钮
+  el.btnStop?.addEventListener('click', async () => {
+    try {
+      await post('/api/sync', { enabled: false });
+      setSyncUi(false);
+      setStatus('idle', '同步生成已停止', '打字不会触发思考与生成');
+    } catch (err) {
+      toast(`停止失败：${err.message}`, 'err');
+    }
+  });
+  el.btnSync?.addEventListener('click', async () => {
+    try {
+      await post('/api/sync', { enabled: true });
+      setSyncUi(true);
+      setStatus('idle', '同步生成已开启', '');
+      if ((el.prompt?.value ?? '').trim()) sendInput(true);
+    } catch (err) {
+      toast(`开启失败：${err.message}`, 'err');
+    }
+  });
+
+  // 想法 11：保存为版本（两个入口）
+  el.btnSaveVersion?.addEventListener('click', () => saveVersion());
+  el.btnUndo?.addEventListener('click', () => {
+    if (S.unsaved?.canUndo && !S.canBack) undoUnsaved();
+    else doVersion('back');
+  });
+
+  // 想法 5 / 6：整合、导入、导出
+  el.btnCompact?.addEventListener('click', doCompact);
+  el.btnExport?.addEventListener('click', exportPrompt);
+  el.btnImport?.addEventListener('click', () => el.fileInput?.click());
+  el.fileInput?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    importPromptFile(file);
+    e.target.value = '';
+  });
+  el.compactClose?.addEventListener('click', () => el.compactModal.classList.add('hidden'));
+  el.compactModal?.addEventListener('click', (e) => {
+    if (e.target === el.compactModal) el.compactModal.classList.add('hidden');
+  });
+  el.compactApply?.addEventListener('click', () => {
+    el.prompt.value = el.compactAfter.textContent ?? '';
+    updateCounter();
+    lastInputAt = Date.now();
+    if (S.syncEnabled) sendInput(true);
+    el.compactModal.classList.add('hidden');
+    el.prompt.focus();
+    toast('已替换输入框内容（可点「撤销整合」还原）', 'ok', 3200);
+  });
+  el.compactUndo?.addEventListener('click', () => {
+    if (typeof S.compactUndo === 'string') {
+      el.prompt.value = S.compactUndo;
+      updateCounter();
+      lastInputAt = Date.now();
+      if (S.syncEnabled) sendInput(true);
+      S.compactUndo = null;
+      el.compactUndo.classList.add('hidden');
+      el.compactModal.classList.add('hidden');
+      el.prompt.focus();
+      toast('已还原整合前的内容', 'ok', 2600);
+    }
+  });
+
+  // 想法 8：思考栏长度控制
+  el.btnStreamCompress?.addEventListener('click', compressStream);
+  el.btnStreamClear?.addEventListener('click', () => {
+    if (window.confirm('清空思考栏？会话里保存的轮次记录也会一起清除。')) clearStream();
+  });
+
+  // 想法 12：文件树按钮
+  el.btnTreeToggle?.addEventListener('click', () => {
+    const anyExpanded = collectDirs(S.tree).some((d) => !S.collapsedDirs.has(d));
+    S.collapsedDirs = new Set(anyExpanded ? collectDirs(S.tree) : []);
+    LS.set('collapsedDirs', [...S.collapsedDirs]);
+    renderTree();
+  });
+  el.btnTreeRefresh?.addEventListener('click', async () => {
+    const tree = await get('/api/tree').catch(() => null);
+    if (tree) renderTree(tree.tree);
+    toast('文件树已刷新', 'ok', 1600);
   });
 
   el.btnTheme?.addEventListener('click', () => {
@@ -1010,16 +1323,10 @@ function bindUi() {
     if (S.theme === 'system') applyTheme('system');
   });
 
-  el.btnUndo?.addEventListener('click', () => doVersion('back'));
   el.btnRedo?.addEventListener('click', () => doVersion('forward'));
   el.viewToggle?.addEventListener('click', (e) => {
     const btn = e.target.closest('.seg-btn');
     if (btn) setView(btn.dataset.view);
-  });
-  el.compareSelect?.addEventListener('change', () => {
-    S.compareFrom = el.compareSelect.value;
-    if (S.view !== 'diff') setView('diff');
-    else renderCode();
   });
   el.btnSave?.addEventListener('click', () => saveCurrent());
   el.btnCommit?.addEventListener('click', async () => {
@@ -1030,7 +1337,6 @@ function bindUi() {
       toast(`启动失败：${err.message}`, 'err');
     }
   });
-  el.btnCancel?.addEventListener('click', () => post('/api/cancel').catch(() => {}));
   el.btnRegenerate?.addEventListener('click', async () => {
     try {
       const res = await post('/api/commit', { reason: 'force', force: true });
@@ -1062,6 +1368,7 @@ function bindUi() {
     }
   });
   el.btnSettings?.addEventListener('click', () => Panels.openSettings());
+  el.projectChip?.addEventListener('click', () => Panels.openPicker());
   el.btnHelp?.addEventListener('click', () => el.helpModal.classList.remove('hidden'));
   $('#help-close')?.addEventListener('click', () => el.helpModal.classList.add('hidden'));
   el.helpModal?.addEventListener('click', (e) => {
@@ -1070,7 +1377,7 @@ function bindUi() {
   el.btnThinkMode?.addEventListener('click', () => {
     S.thinkExpandAll = !S.thinkExpandAll;
     LS.set('thinkExpand', S.thinkExpandAll);
-    el.btnThinkMode.textContent = `思考：${S.thinkExpandAll ? '展开' : '折叠'}`;
+    el.btnThinkMode.textContent = S.thinkExpandAll ? '展开' : '折叠';
     document.querySelectorAll('.think:not(.streaming)').forEach((t) => t.classList.toggle('collapsed', !S.thinkExpandAll));
   });
   el.btnRoundPrev?.addEventListener('click', () => jumpRound(-1));
@@ -1087,6 +1394,16 @@ function bindUi() {
       toast(`切换失败：${err.message}`, 'err');
     }
   });
+}
+
+function collectDirs(node, out = []) {
+  for (const c of node?.children ?? []) {
+    if (c.type === 'dir') {
+      out.push(c.path);
+      collectDirs(c, out);
+    }
+  }
+  return out;
 }
 
 /* ============================ 启动 ============================ */
@@ -1127,12 +1444,15 @@ function bindUi() {
     renderProviderBadge();
     renderProjectChip(st);
     renderProfileSelect(st.profiles, st.activeProfileId);
-    if (st.memory?.chips) renderChips(st.memory.chips);
+    renderUnsaved(st);
+    setSyncUi(st.syncEnabled !== false);
+    S.streamLimitKB = st.config?.streamLimitKB ?? 1024;
+    if (el.compactStyle && st.config?.compactStyle) el.compactStyle.value = st.config.compactStyle;
     if (st.versions) renderVersions(st.versions);
     if (st.manualEdits) S.manualEdits = st.manualEdits;
 
+    // 想法 15：只拉文件树，不预取每个文件的内容（大项目会卡死）
     const tree = await get('/api/tree');
-    for (const rel of tree.files ?? []) await pullFile(rel);
     renderTree(tree.tree);
     updateWorkspaceStats();
 
@@ -1146,9 +1466,12 @@ function bindUi() {
       el.prompt.value = st.session.prompt;
       updateCounter();
     }
-    if (tree.files?.length) await openFile(st.workspace?.recent?.[0] ?? tree.files[0]);
+    const first = flattenFiles(tree.tree ?? {})[0];
+    if (first) await openFile(first);
     setStatus('idle', '就绪', `${tree.files?.length ?? 0} 个文件 · 版本 ${st.session?.currentVersionId ?? 'v0'}`);
+    checkStreamLimit();
     if (st.provider && !st.provider.ready) toast(`模型未就绪：${st.provider.note} — 右上角「设置」里填写 API Key`, 'warn', 9000);
+    if (st.unsaved?.round) toast(`有 ${st.unsaved.round} 轮改动还没保存为版本，点右上角「保存为版本」即可`, 'warn', 6000);
   } catch (err) {
     setStatus('err', '初始化失败', err.message);
     toast(`初始化失败：${err.message}`, 'err', 9000);

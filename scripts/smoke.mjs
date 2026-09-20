@@ -422,6 +422,8 @@ fs.rmSync(RUN_ROOT, { recursive: true, force: true });
 const runWs = new Workspace(RUN_ROOT, { storeDir: path.join(TMP, 'runstore') });
 const runSess = new Session({ workspace: runWs, config: {} });
 const events = [];
+// 想法 11 之后默认是"手动保存版本"，所以这里显式用 auto 来验证"自动版本"那条路径；
+// 手动保存语义另有专门用例。
 const cfg = {
   provider: 'mock',
   baseUrl: '',
@@ -433,6 +435,7 @@ const cfg = {
   commitIdleMs: 60,
   intentThreshold: 0.6,
   autoCommit: true,
+  saveMode: 'auto',
 };
 const runner = new Runner({
   session: runSess,
@@ -1137,6 +1140,36 @@ await test('前端能在最小 DOM 上真正启动，并且事件处理不抛异
   assert.match(memo.get('#pending-text')?.textContent ?? '', /待应用|暂存/, '暂存条文案应更新');
 });
 
+await test('暂存模式回退：只把"与项目不同"的文件放进暂存层，不复制整个项目', () => {
+  const projDir = path.join(TMP, 'realproj3');
+  const stageDir = path.join(TMP, 'realproj3-stage');
+  fs.rmSync(projDir, { recursive: true, force: true });
+  fs.rmSync(stageDir, { recursive: true, force: true });
+  ensureDir(projDir);
+  for (let i = 0; i < 12; i += 1) fs.writeFileSync(path.join(projDir, `f${i}.js`), `const v${i} = ${i};\n`, 'utf8');
+  const ws = new Workspace(projDir, { storeDir: path.join(TMP, 'realproj3-store'), overlayDir: stageDir });
+  fs.writeFileSync(path.join(stageDir, 'f1.js'), 'const v1 = 999;\n');
+  const snap = ws.snapshot({ label: '有改动时' });
+  assert.equal(ws.pending().length, 1, '此时只有 f1.js 待应用');
+
+  ws.restore(snap.id);
+  assert.equal(ws.pending().length, 1, '只有真正有差异的 f1.js 应该待在暂存层');
+  const staged = fs.existsSync(stageDir) ? fs.readdirSync(stageDir) : [];
+  assert.deepEqual(staged, ['f1.js'], `暂存目录里不应该出现与项目一致的文件副本，实际: ${staged.join(', ')}`);
+  assert.equal(fs.readFileSync(path.join(stageDir, 'f1.js'), 'utf8'), 'const v1 = 999;\n', '有差异的文件必须被恢复');
+  assert.equal(ws.read('f1.js').content, 'const v1 = 999;\n', '合并视图应看到快照内容');
+
+  // 快照里没有的文件 → 回退后应标记为待删除
+  ws.applyOp({ path: 'f5.js', mode: 'patch', patches: [{ search: 'const v5 = 5;', replace: 'const v5 = 55;' }] });
+  const snap2 = ws.snapshot({ label: '改了 f5' });
+  ws.discardPending();
+  fs.rmSync(path.join(projDir, 'f5.js'));
+  ws.restore(snap2.id);
+  assert.equal(fs.existsSync(path.join(projDir, 'f5.js')), false, '项目里的文件在恢复前不应被凭空创建');
+  assert.ok(ws.exists('f5.js'), '恢复后合并视图里应当能看到 f5.js');
+  assert.equal(fs.existsSync(path.join(stageDir, 'f5.js')), true, 'f5.js 因为项目里没有，才需要落到暂存层');
+});
+
 /* ============================ 11. v3 新能力 ============================ */
 section('11. v3 新能力：多配置档 / 暂存模式 / 风格扫描 / 轮次持久化 / 建议开关 / 版本确认');
 
@@ -1156,9 +1189,80 @@ await test('旧版单份配置会平滑迁移成配置档列表', () => {
   assert.equal(cfg.activeProfileId, cfg.profiles[0].id);
   assert.equal(cfg.apiKey, 'sk-old', '当前生效模型应指向该配置档');
   assert.equal(cfg.specDelayMs, 900);
-  assert.equal(cfg.saveMode, 'confirm', 'v3 默认每轮询问');
+  assert.equal(cfg.saveMode, 'manual', 'v3.1 默认只有显式保存才产生版本');
   assert.equal(cfg.suggest.risk, true, '风险提示默认开启');
   assert.equal(cfg.suggest.test, false, '测试建议默认关闭（避免刷屏）');
+  assert.equal(cfg.compactStyle, 'balanced', '整合偏好默认均衡');
+  assert.equal(cfg.streamLimitKB, 1024, '思考栏默认上限 1MB');
+});
+
+await test('想法 11：手动保存模型 —— 不点保存就不产生版本，但能撤销未保存的改动', async () => {
+  const dir = path.join(TMP, 'manualver');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'manualver-store') });
+  const s = new Session({ workspace: ws, config: {} });
+  const ev = [];
+  const r = new Runner({
+    session: s,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'manualver-store')),
+    config: { ...cfg, saveMode: 'manual', autoCommit: false },
+    emit: (n, p) => ev.push({ name: n, payload: p }),
+  });
+  let n = 0;
+  r.provider = {
+    name: 'stub', label: '桩', ready: true, note: '',
+    async *stream() {
+      n += 1;
+      yield { type: 'delta', text: `<<<SF file path="src/f${n}.js" action="create">>>\nconst v${n} = ${n};\n<<<SF /file>>>\n` };
+    },
+  };
+  const saveModeCfg = r.config.saveMode;
+  assert.equal(saveModeCfg, 'manual');
+
+  s.setPrompt('第一轮：建个文件。');
+  await r.commit({ reason: 'test' });
+  await waitFor(() => ev.some((e) => e.name === 'run:done') && !r.busy, 15000, '第一轮');
+  assert.equal(s.versions.length, 1, '只有基线，不应该自动产生版本');
+  assert.ok(ws.exists('src/f1.js'), '文件本身要立刻落盘（不中断的前提）');
+  assert.equal(s.pendingRound?.round, 1, '应记录"未保存的改动"');
+  const done1 = ev.filter((e) => e.name === 'run:done').pop().payload;
+  assert.equal(done1.versionId, null, 'run:done 不应带出版本号');
+  assert.equal(done1.pendingSave, true, '应提示"还没保存为版本"');
+
+  // 再跑一轮，两轮都不保存
+  ev.length = 0;
+  s.setPrompt('第二轮：再建一个。');
+  await r.commit({ reason: 'test' });
+  await waitFor(() => ev.some((e) => e.name === 'run:done') && !r.busy, 15000, '第二轮');
+  assert.equal(s.versions.length, 1, '两轮之后依然没有版本');
+  assert.equal(s.pendingRound?.round, 2, '未保存轮数应累加');
+  assert.equal((s.pendingRound.files ?? []).length, 2, '未保存的文件应累计');
+
+  // 保存 → 这时才产生一个版本，且包含两轮的成果
+  const saved = r.saveVersion({ label: '存一下' });
+  assert.equal(saved.ok, true);
+  assert.equal(s.versions.length, 2, '保存后应出现一个版本');
+  assert.equal(s.pendingRound, null, '保存后清空未保存状态');
+  assert.match(s.versions[1].summary, /存一下/);
+  assert.equal(s.versions[1].files.length, 2, '版本应记录两轮涉及的文件');
+
+  // 继续改，然后撤销未保存的改动 → 回到刚保存的状态
+  ev.length = 0;
+  s.setPrompt('第三轮：改点东西。');
+  await r.commit({ reason: 'test' });
+  await waitFor(() => ev.some((e) => e.name === 'run:done') && !r.busy, 15000, '第三轮');
+  assert.ok(ws.exists('src/f3.js'));
+  const undone = r.undoRound();
+  assert.equal(undone.ok, true);
+  assert.equal(ws.exists('src/f3.js'), false, '撤销应删掉未保存时新建的文件');
+  assert.ok(ws.exists('src/f1.js'), '已保存版本里的文件必须留着');
+  assert.ok(ws.exists('src/f2.js'), '已保存版本里的文件必须留着');
+  assert.equal(s.versions.length, 2, '撤销不改变版本链');
+  assert.equal(s.pendingRound, null);
+  const noop = r.undoRound();
+  assert.equal(noop.ok, false, '没有未保存改动时应明确拒绝');
 });
 
 await test('多配置档可以保存与切换（apiKey 不会被误清空）', () => {

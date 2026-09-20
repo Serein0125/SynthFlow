@@ -10,7 +10,8 @@ import { RagIndex } from './rag.js';
 import { Memory } from './memory.js';
 import { Runner } from './runner.js';
 import { scanStyle, styleStats } from './style.js';
-import { createProvider, loadConfig, saveConfig, newProfile, PRESETS } from './llm.js';
+import { buildProjectMap, locate, mapStats } from './projectmap.js';
+import { compactPromptText, createProvider, loadConfig, saveConfig, newProfile, PRESETS } from './llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -191,6 +192,14 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     cfg = loadConfig(root);
     if (providerOverride) cfg.provider = providerOverride;
     svc = buildServices();
+    // 想法 13：切项目等于换会话，前端必须整体重置，不能留着上一个项目的思考栏和输入框
+    broadcast('reset', {
+      projectDir: svc.projectDir,
+      staging: svc.workspace.staging,
+      sessionId: svc.session.id,
+      prompt: svc.session.prompt ?? '',
+      timeline: svc.session.timeline ?? [],
+    });
     broadcast('state', svc.runner.snapshot());
     broadcast('tree', { tree: svc.workspace.listTree() });
     broadcast('versions', svc.session.versionList());
@@ -293,6 +302,88 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
 
       case '/api/cancel':
         return { ok: true, cancelled: runner.cancel('user') };
+
+      case '/api/sync':
+        // 想法 1：一键关掉/开启"同步思考与同步生成"
+        return runner.setSync(body.enabled !== false && body.enabled !== undefined ? body.enabled : !runner.syncEnabled);
+
+      case '/api/version/save':
+        // 想法 11：只有这个接口才会产生版本
+        return runner.saveVersion({ label: body.label });
+
+      case '/api/version/undo-round':
+        return runner.undoRound();
+
+      case '/api/timeline/clear':
+        session.clearTimeline();
+        session.save();
+        broadcast('timeline', { timeline: [] });
+        return { ok: true, timeline: [] };
+
+      case '/api/locate': {
+        const q = url.searchParams.get('q') ?? body.q ?? '';
+        const map = buildProjectMap(workspace);
+        return { query: q, hits: locate(map, q, { k: 8 }), stats: mapStats(workspace) };
+      }
+
+      case '/api/projectmap': {
+        if (req.method === 'POST') {
+          const map = buildProjectMap(workspace, { force: true });
+          return { ok: true, stats: mapStats(workspace), pages: map.pages.slice(0, 30), components: map.components.slice(0, 30) };
+        }
+        const map = buildProjectMap(workspace);
+        return { stats: mapStats(workspace), pages: map.pages.slice(0, 40), components: map.components.slice(0, 40) };
+      }
+
+      case '/api/prompt/compact': {
+        const text = String(body.text ?? session.prompt ?? '').trim();
+        if (!text) throw Object.assign(new Error('提示词为空，没什么可整合的'), { status: 400 });
+        const provider = runner.provider;
+        if (!provider.ready) throw Object.assign(new Error(`模型未就绪：${provider.note}`), { status: 400 });
+        const style = body.style ?? cfg.compactStyle ?? 'balanced';
+        const t0 = Date.now();
+        let out = '';
+        try {
+          out = await compactPromptText(provider, {
+            text,
+            style,
+            extra: session.manualEdits?.length ? `（这些文件用户手动改过：${session.manualEdits.map((m) => m.path).join(', ')}）` : '',
+          });
+        } catch (err) {
+          throw Object.assign(new Error(`整合失败：${err.message}`), { status: 502 });
+        }
+        if (!out) throw Object.assign(new Error('模型返回了空结果，可能是提示词太短或调用被中断'), { status: 502 });
+        return { ok: true, text: out, before: text, style, ms: Date.now() - t0, charsBefore: text.length, charsAfter: out.length };
+      }
+
+      case '/api/browse': {
+        // 想法 7：服务端目录浏览，用于"选文件夹"弹窗（浏览器拿不到真实路径）
+        const raw = url.searchParams.get('dir') ?? body.dir ?? '';
+        const target = raw ? path.resolve(raw) : path.parse(root).root;
+        let entries = [];
+        try {
+          entries = fs.readdirSync(target, { withFileTypes: true });
+        } catch (err) {
+          throw Object.assign(new Error(`无法读取目录：${err.message}`), { status: 400 });
+        }
+        const dirs = entries
+          .filter((e) => e.isDirectory() && !e.name.startsWith('$') && e.name !== 'System Volume Information')
+          .map((e) => ({ name: e.name, path: path.join(target, e.name) }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const parent = path.dirname(target);
+        let drives = [];
+        if (process.platform === 'win32' && /^[A-Za-z]:\\?$/.test(target)) {
+          drives = 'CDEFGHIJKLMNOPQRSTUVWXYZ'.split('').filter((d) => fs.existsSync(`${d}:\\`)).map((d) => `${d}:\\`);
+        }
+        return {
+          dir: target,
+          parent: parent === target ? null : parent,
+          dirs: dirs.slice(0, 500),
+          drives,
+          isProject: fs.existsSync(path.join(target, 'package.json')) || fs.existsSync(path.join(target, '.git')),
+          root,
+        };
+      }
 
       case '/api/rollback':
         return runner.moveVersion(body.direction ?? 'back', body.versionId);
@@ -696,8 +787,10 @@ function publicConfig(cfg) {
     autoCommit: cfg.autoCommit,
     autoAdoptHigh: Boolean(cfg.autoAdoptHigh),
     patchRetry: cfg.patchRetry !== false,
-    saveMode: cfg.saveMode ?? 'confirm',
+    saveMode: cfg.saveMode ?? 'manual',
     suggest: cfg.suggest,
+    compactStyle: cfg.compactStyle ?? 'balanced',
+    streamLimitKB: cfg.streamLimitKB ?? 1024,
     customInstructions: cfg.customInstructions ?? '',
     projectDir: cfg.projectDir ?? '',
     writeMode: cfg.writeMode ?? 'direct',

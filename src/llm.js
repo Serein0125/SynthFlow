@@ -89,11 +89,17 @@ export function loadConfig(projectRoot) {
     autoAdoptHigh: stored.autoAdoptHigh === true,
     patchRetry: stored.patchRetry !== false,
 
-    // —— 版本保存（想法 2）——
-    saveMode: stored.saveMode === 'auto' ? 'auto' : 'confirm',
+    // —— 版本保存（想法 11：默认只有显式点保存才产生版本）——
+    saveMode: stored.saveMode === 'auto' ? 'auto' : 'manual',
 
     // —— 建议开关（想法 5）——
     suggest: { ...DEFAULT_SUGGEST, ...(stored.suggest ?? {}) },
+
+    // —— 提示词整合偏好（想法 5 第三轮）——
+    compactStyle: ['concise', 'balanced', 'detailed'].includes(stored.compactStyle) ? stored.compactStyle : 'balanced',
+
+    // —— 思考栏长度上限（想法 8，单位 KB，默认 1MB）——
+    streamLimitKB: Number(stored.streamLimitKB ?? 1024),
 
     // —— 项目与写入 ——
     projectDir: stored.projectDir || '',
@@ -852,6 +858,21 @@ function mockSuggestionSet(prompt, kind) {
 
 async function* mockStream(req) {
   const prompt = req.userPrompt ?? '';
+  // "提示词整合"这类辅助任务：给一个确定性的归一化结果，别吐协议标记
+  if (req.purpose === 'compact' || req.mode === 'compact') {
+    const lines = String(prompt)
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const seen = new Set();
+    const kept = [];
+    for (const l of lines) if (!seen.has(l)) {
+      seen.add(l);
+      kept.push(l);
+    }
+    yield { type: 'delta', text: `# 目标\n${kept[0] ?? '（空）'}\n\n# 具体要求\n${kept.slice(1).map((l) => `- ${l}`).join('\n') || '- （无）'}\n` };
+    return;
+  }
   const kind = pickTemplate(prompt);
   const incremental = req.mode === 'continue' || req.mode === 'incremental';
   const existing = req.existingFiles ?? {};
@@ -954,6 +975,46 @@ async function* openaiStream(req, cfg) {
       } catch { /* 跳过心跳/半包 */ }
     }
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * 一次性补全（用于"提示词一键整合"这类不流式的辅助任务）
+ * ------------------------------------------------------------------ */
+
+const COMPACT_STYLE = {
+  concise: '尽量精简，能合并的合并，删掉重复与废话，保留全部**约束与事实**，控制在原文 40% 以内。',
+  balanced: '合并重复、消解矛盾、按主题分段，保留全部约束与细节，篇幅可与原文相当。',
+  detailed: '尽量完整保留用户的每一处细节与措辞，只做归并排序与结构化，不要删减信息。',
+};
+
+export async function compactPromptText(provider, { text, style = 'balanced', extra = '' } = {}) {
+  const system =
+    '你是提示词整理助手。用户会把一段边想边写、包含多个意图（需求、修改指令、优化要求、让我给建议等）的杂乱输入交给你。\n' +
+    '请把它整合成**一条**清晰、结构化、可直接交给编程模型执行的提示词。\n' +
+    '要求：\n' +
+    '1. 归并同类项，去掉重复与自我否定，保留所有**约束、事实、专有名词、文件路径**。\n' +
+    '2. 按"目标 / 具体要求 / 约束与风格 / 验收标准"这样的结构分段（没有的段落不要硬凑）。\n' +
+    '3. 不要新增用户没提过的需求；不确定的地方保留原话。\n' +
+    '4. 只输出整合后的提示词正文：不要解释、不要前言、不要 markdown 代码围栏。\n' +
+    `5. 篇幅偏好：${COMPACT_STYLE[style] ?? COMPACT_STYLE.balanced}`;
+  const user = `${extra ? `${extra}\n\n` : ''}【用户的原始输入】\n${text}`;
+  let out = '';
+  for await (const evt of provider.stream({
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    purpose: 'compact',
+    userPrompt: text,
+    mode: 'compact',
+    existingFiles: {},
+  })) {
+    if (evt?.type === 'delta' && evt.text) out += evt.text;
+  }
+  return out
+    .replace(/^\s*```[a-zA-Z]*\s*\n/, '')
+    .replace(/\n```\s*$/, '')
+    .trim();
 }
 
 /* ------------------------------------------------------------------ */
