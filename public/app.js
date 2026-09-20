@@ -1398,9 +1398,24 @@ async function applyReset(payload) {
   updateCounter();
   updateUnread();
   updateRoundLabel();
-  if (el.editorEmpty) el.editorEmpty.classList.remove('hidden');
+
+  // ★ 编辑区必须**真的**重置。
+  // 以前这里只做了三件事：清掉降级用的 <code> 元素、把 Editor.path 置空、
+  // 把"空项目提示"露出来 —— 但从来没调用 renderCode()，也没碰 Monaco 的实例。
+  // Monaco 里仍然挂着上一个项目的 model，于是切到新项目（尤其是空白项目）之后：
+  //   · 代码区还显示着上一个项目的文件内容
+  //   · #current-path 还写着旧路径
+  //   · "空项目提示"和 Monaco 面板同时显示
+  // 用户看到"界面根本每变"，就会以为切换失败，甚至对着那个**旧文件**提需求 ——
+  // 而新项目里压根没这个文件，AI 只能报补丁未命中，看起来就像"创建不了文件"。
+  //
+  // renderCode() 在 S.current 为空时会 showHost('none') 把 Monaco 整个藏起来，
+  // 并把路径栏、差异徽标一起归零 —— 这才是"重置"。所以要调用它，而不是手动改 DOM。
   Editor.path = null;
   Editor.setDirty(false);
+  // 差异视图是"本轮改动"的概念，换了会话就没有比较基准了，回到代码视图
+  S.view = 'code';
+  await renderCode();
   // 意图条也归零，否则会留着上一个项目的判定结果
   if (el.intentFill) el.intentFill.style.width = '0%';
   if (el.intentText) el.intentText.textContent = '等待输入…';

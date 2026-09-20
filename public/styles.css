@@ -3384,7 +3384,6 @@ body.resizing .editor-host {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-}
 
 /* --- 25.2 左栏：文件树 / 时间线 各占一份，谁都不会挤掉谁（想法 14） --- */
 .sidebar {
@@ -3400,6 +3399,12 @@ body.resizing .editor-host {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+  /* 必须把老 flex 布局留下的上限清掉。
+     .pane:last-child 上还挂着 max-height: 42%（那是 display:flex 时代的写法），
+     换成 grid 之后行本身已经按 1.4fr:1fr 分好了高度，这条百分比又会**按自己的网格区再缩一次**：
+     42% × 357px = 150px，时间线被砍掉一半。
+     两者特异性相同，靠"后出现"覆盖，所以这条必须留在 25.2 后面。 */
+  max-height: none;
 }
 
 .sidebar .pane .pane-title {

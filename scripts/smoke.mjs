@@ -997,6 +997,62 @@ await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
   }
 });
 
+await test('★ styles.css 结构完整：括号平衡，关键规则不会被孤立 } 吞掉', () => {
+  // 真实事故：一次编辑在 .prompt-tools 后面留下了一个孤立的 }。
+  // 浏览器遇到它会报解析错误并**丢掉紧随其后的那条规则** —— 被丢掉的是
+  // `.sidebar { display: grid }`，于是左栏退回老的 flex 布局，
+  // 版本时间线被文件树挤到 90px 上下。
+  // 更要命的是它很隐蔽：时间线里条目多的会话能凑够高度，测试就"碰巧通过"了，
+  // 只有切到条目少的新项目才暴露。所以这里做结构性检查，而不是靠界面高度倒推。
+  const lines = stylesCss.split('\n');
+  let depth = 0;
+  let inComment = false;
+  let minDepth = 0;
+  const depthAtRuleStart = new Map(); // 选择器 -> [深度...]
+  const strayClose = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i];
+    for (let j = 0; j < raw.length; j += 1) {
+      const c = raw[j];
+      const n = raw[j + 1];
+      if (!inComment && c === '/' && n === '*') { inComment = true; j += 1; continue; }
+      if (inComment && c === '*' && n === '/') { inComment = false; j += 1; continue; }
+      if (inComment) continue;
+      if (c === '{') {
+        const sel = (raw.split('{')[0] ?? '').trim();
+        if (depth === 0 && /^[.#a-zA-Z\[]/.test(sel)) {
+          if (!depthAtRuleStart.has(sel)) depthAtRuleStart.set(sel, []);
+          depthAtRuleStart.get(sel).push(i + 1);
+        }
+        depth += 1;
+      } else if (c === '}') {
+        depth -= 1;
+        if (depth < 0) { strayClose.push(i + 1); depth = 0; }
+      }
+    }
+    if (depth < minDepth) minDepth = depth;
+  }
+
+  assert.deepEqual(strayClose, [], `styles.css 第 ${strayClose.join('、')} 行有孤立的 }（会吞掉紧跟其后的规则）`);
+  assert.equal(depth, 0, `styles.css 结束时还有 ${depth} 个 { 没闭合`);
+  assert.equal(minDepth, 0, 'styles.css 中途出现了未配对的 }');
+  assert.ok(!inComment, 'styles.css 结束时仍在注释里（/* 没闭合）');
+
+  // 这几条必须在**顶层**出现过 —— 它们一旦被某个不匹配的 @media 或未闭合块吞掉，
+  // 布局就会静默退回旧行为，而界面只是"看起来有点挤"，很难联想到 CSS 解析问题。
+  const mustBeTopLevel = ['.sidebar', '.composer', '.editor', '.body'];
+  const swallowed = mustBeTopLevel.filter((sel) => !depthAtRuleStart.has(sel));
+  assert.deepEqual(swallowed, [], `这些规则没有出现在顶层（被吞了）: ${swallowed.join(', ')}`);
+
+  // 左栏必须是 grid（想法 14：文件树与时间线按比例分，谁都不挤掉谁）
+  const sidebarRule = stylesCss.match(/\.sidebar\s*\{[^}]*display:\s*grid[^}]*\}/);
+  assert.ok(sidebarRule, '.sidebar 必须显式声明 display:grid —— 否则退回 flex，时间线会被文件树挤扁');
+  assert.match(sidebarRule[0], /grid-template-rows:[^;]*minmax\(/, '.sidebar 必须用 minmax 给两栏各自的下限');
+  // 老 flex 布局留下的 max-height 必须被覆盖掉，否则会按网格区再缩一次
+  assert.match(stylesCss, /\.sidebar\s+\.pane\s*\{[^}]*max-height:\s*none/, '.sidebar .pane 必须把 max-height 清成 none');
+});
+
 await test('亮色主题覆盖了全部关键令牌，不会出现"白底白字"', () => {
   const light = stylesCss.match(/\[data-theme="light"\]\s*\{([\s\S]*?)\n\}/);
   assert.ok(light, '找不到 [data-theme="light"] 令牌块');

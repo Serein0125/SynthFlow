@@ -1536,6 +1536,127 @@ try {
     await cdp.waitFor(`document.querySelector('#project-chip').textContent.length > 0`, { timeout: 10000, label: '界面恢复' });
   });
 
+  /* ---------- U. 切到空白项目：工作区必须真的清空（用户报"代码区不刷新"） ---------- */
+  section('U. 切到空白项目后工作区必须真的清空');
+
+  const fullProj = path.join(OUT, 'fullproj');
+  const blankProj = path.join(OUT, 'blankproj');
+  fs.rmSync(fullProj, { recursive: true, force: true });
+  fs.rmSync(blankProj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(fullProj, 'src'), { recursive: true });
+  fs.mkdirSync(blankProj, { recursive: true });
+  fs.writeFileSync(path.join(fullProj, 'src', 'kept.js'), 'export const kept = "旧项目的文件";\n', 'utf8');
+  fs.writeFileSync(path.join(fullProj, 'README.md'), '# 旧项目\n', 'utf8');
+
+  const switchTo = async (dir) => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir, mode: 'direct' }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切换失败：${res.error ?? ''}`);
+    await sleep(900);
+  };
+
+  await test('★ 切到空白项目后，代码区/路径栏/标签页全部清空（不能留着旧项目的文件）', async () => {
+    // 用户报的原话："切到新的一个空白项目后，工作面板的代码区域不会刷新"
+    // 根因：applyReset 只清了降级用的 <code> 元素、把 Editor.path 置空，
+    // 但**从没调用 renderCode()**，Monaco 实例仍挂着旧项目的 model ——
+    // 于是旧文件原样显示，"空项目提示"和 Monaco 面板还同时可见。
+    await switchTo(fullProj);
+    await cdp.evaluate(`
+      const f = [...document.querySelectorAll('#file-tree .tree-file')].find((n) => n.dataset.path === 'src/kept.js');
+      if (f) f.click();
+      return true;
+    `);
+    await sleep(900);
+
+    const before = await cdp.evaluate(`
+      return {
+        path: document.querySelector('#current-path')?.textContent?.trim() ?? '',
+        hostVisible: document.querySelector('#editor-host')?.getClientRects().length > 0,
+      };
+    `);
+    if (!before.path.includes('kept.js')) throw new Error(`前置条件不成立：没能打开旧项目的文件（path=${before.path}）`);
+    if (!before.hostVisible) throw new Error('前置条件不成立：Monaco 面板没显示');
+
+    // ★ 切到空白项目
+    await switchTo(blankProj);
+
+    const after = await cdp.evaluate(`
+      const vis = (sel) => { const e = document.querySelector(sel); return Boolean(e && e.getClientRects().length > 0); };
+      const M = window.monaco;
+      const editing = (M && window.Editor && window.Editor.inst) ? (window.Editor.inst.getModel()?.getValue() ?? '') : '';
+      return {
+        hostVisible: vis('#editor-host'),
+        emptyVisible: vis('#editor-empty'),
+        path: document.querySelector('#current-path')?.textContent?.trim() ?? '',
+        tabs: document.querySelectorAll('#tabs .tab').length,
+        treeFiles: document.querySelectorAll('#file-tree .tree-file').length,
+        editing,
+        sCurrent: (typeof S !== 'undefined') ? S.current : 'x',
+      };
+    `);
+    if (after.hostVisible) throw new Error('代码区还显示着 Monaco 面板 —— 切到空白项目后应该藏起来');
+    if (!after.emptyVisible) throw new Error('没有显示"还没选文件"的空态提示');
+    if (after.path !== '未选择文件') throw new Error(`路径栏还写着旧路径：${after.path}`);
+    if (after.tabs !== 0) throw new Error(`标签页没清空，还剩 ${after.tabs} 个`);
+    if (after.treeFiles !== 0) throw new Error(`文件树没清空，还剩 ${after.treeFiles} 个文件`);
+    if (after.sCurrent !== null) throw new Error(`S.current 没清空：${after.sCurrent}`);
+    if (after.editing.includes('旧项目的文件')) throw new Error('★ Monaco 里还留着旧项目文件的内容');
+    console.log(`      ${dim(`切到空白项目：Monaco 已隐藏、路径栏=${after.path}、标签 0、文件树 0`)}`);
+  });
+
+  await test('★ 空白项目里能正常创建文件（用户报"无法创建文件目录"）', async () => {
+    await switchTo(blankProj);
+    const before = await cdp.evaluate(`return window.__sfProbeWire === true`);
+    if (!before) {
+      await cdp.evaluate(`
+        window.__sfProbeWire = true;
+        window.__sfProbeStarts = 0;
+        window.addEventListener('sf:run:start', () => { window.__sfProbeStarts += 1; });
+        return true;
+      `);
+    }
+    const n0 = await cdp.evaluate(`return window.__sfProbeStarts ?? 0`);
+    await cdp.evaluate($type('#prompt', '在当前项目新建 src/fresh.js，导出 const fresh = 1。'));
+    await sleep(1300);
+    await cdp.evaluate($click('#btn-commit'));
+    await cdp.waitFor(`(window.__sfProbeStarts ?? 0) > ${n0}`, { timeout: 40000, label: '生成启动' });
+    await cdp.waitFor(`!document.querySelector('#run-badge').textContent.includes('正在')`, { timeout: 180000, label: '生成结束' });
+    await sleep(1500);
+
+    const onDisk = fs.existsSync(path.join(blankProj, 'src')) ? fs.readdirSync(path.join(blankProj, 'src')) : [];
+    if (!onDisk.length) throw new Error('空白项目里生成之后，磁盘上什么都没创建 —— 这就是用户说的"无法创建文件"');
+    const st = await cdp.evaluate(`
+      return {
+        treeFiles: [...document.querySelectorAll('#file-tree .tree-file .name')].map((n) => n.textContent.trim()),
+        path: document.querySelector('#current-path')?.textContent?.trim() ?? '',
+        status: document.querySelector('#status-text')?.textContent?.trim() ?? '',
+      };
+    `);
+    if (!st.treeFiles.length) throw new Error('文件创建了，但文件树没更新 —— 用户会以为没创建成功');
+    if (st.status === '出错了') throw new Error(`创建过程报错了：${await cdp.evaluate($text('#status-detail'))}`);
+    console.log(`      ${dim(`磁盘: ${onDisk.join(', ')} · 文件树: ${st.treeFiles.join(', ')} · 编辑器路径: ${st.path}`)}`);
+  });
+
+  await test('清理空白项目测试并切回', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: originalProject, mode: originalMode }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切回失败：${res.error ?? ''}`);
+    for (const d of [fullProj, blankProj]) {
+      fs.rmSync(d, { recursive: true, force: true });
+      const slug = `${path.basename(d).replace(/[^\w-]/g, '') || 'project'}-${sha1(d).slice(0, 8)}`;
+      fs.rmSync(path.join(ROOT, '.synthflow', 'projects', slug), { recursive: true, force: true });
+    }
+    await cdp.waitFor(`document.querySelector('#project-chip').textContent.length > 0`, { timeout: 10000, label: '界面恢复' });
+  });
+
   /* ------------------------------ 收尾 ------------------------------ */
   section('收尾');
   // 无论中间成功失败，都要把项目切回测试前的状态，别把用户的应用留在测试目录上
