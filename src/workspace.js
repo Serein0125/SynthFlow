@@ -34,6 +34,9 @@ const IGNORE_DIRS = [
 
 const MAX_READ_BYTES = 512 * 1024; // 超过这个大小的文件不读进内存（避免误读大产物）
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+// 单次快照的总量与数量上限：防止"切到一个大目录 → 把整个项目复制进版本库"
+const SNAPSHOT_TOTAL_BYTES = 8 * 1024 * 1024;
+const SNAPSHOT_MAX_FILES = 1500;
 
 export function isTextFile(rel) {
   const base = path.basename(rel);
@@ -81,6 +84,8 @@ export function locateBlock(haystack, needle) {
 }
 
 export class Workspace {
+  #scan = null;
+
   /**
    * @param {string} root 目标目录（真实项目或生成目录）
    * @param {{storeDir?:string, overlayDir?:string, maxSnapshots?:number}} [opts]
@@ -92,8 +97,10 @@ export class Workspace {
     this.staging = this.overlayDir !== this.root;
     this.maxSnapshots = opts.maxSnapshots ?? 60;
     this.stateFile = path.join(this.storeDir, 'staging.json');
-    ensureDir(this.root);
-    if (this.staging) ensureDir(this.overlayDir);
+    // 注意：不能用 mkdirSync(root, {recursive:true}) 去"确保"根目录存在 ——
+    // 对盘符根目录（D:\）它会直接 EPERM。只在真的不存在时才建。
+    if (!fs.existsSync(this.root)) ensureDir(this.root);
+    if (this.staging && !fs.existsSync(this.overlayDir)) ensureDir(this.overlayDir);
     ensureDir(this.snapshotsDir);
     ensureDir(this.historyDir);
     const st = readJsonSafe(this.stateFile, { deleted: [] });
@@ -171,6 +178,7 @@ export class Workspace {
     ensureDir(path.dirname(abs));
     fs.writeFileSync(abs, content, 'utf8');
     if (this.deleted.delete(r)) this.saveState();
+    this.invalidateScan();
     return { rel: r, bytes: Buffer.byteLength(content, 'utf8') };
   }
 
@@ -188,31 +196,66 @@ export class Workspace {
     } else if (fs.existsSync(this.abs(r).abs)) {
       fs.rmSync(this.abs(r).abs, { force: true, recursive: true });
     }
+    this.invalidateScan();
     return r;
   }
 
-  /** 合并视图下的全部文件。 */
-  listFiles() {
-    const set = new Set(listFilesRecursive(this.root, { ignore: IGNORE_DIRS }).filter(isTextFile));
-    if (this.staging) {
-      for (const f of listFilesRecursive(this.overlayDir, { ignore: IGNORE_DIRS })) {
-        if (isTextFile(f)) set.add(f);
+  /**
+   * 一次扫描拿到全部元数据（路径 + 大小 + mtime），缓存起来复用。
+   * 之前 listFiles / totalBytes / listTree 各自遍历一遍，而且 totalBytes 和 listTree
+   * 为了拿 size 会把**每个文件的内容读一遍** —— 2500 个文件的项目上 /api/state 要 2.3 秒。
+   * 现在统一走 statSync，并带缓存；我们自己的写操作会主动失效。
+   */
+  scan({ force = false } = {}) {
+    // 大目录下"每次状态刷新都重扫一遍"也会卡；TTL 放宽到 4 秒，
+    // 我们自己的写操作会立刻 invalidate，用户手动刷新走 ?force=1。
+    const TTL = 4000;
+    if (!force && this.#scan && Date.now() - this.#scan.at < TTL) return this.#scan;
+    const entries = new Map(); // rel -> {bytes, mtime}
+    const collect = (base, isOverlay) => {
+      for (const rel of listFilesRecursive(base, { ignore: IGNORE_DIRS })) {
+        if (!isTextFile(rel)) continue;
+        let st;
+        try {
+          st = fs.statSync(path.join(base, rel));
+        } catch {
+          continue;
+        }
+        if (st.size > MAX_READ_BYTES) continue;
+        // 暂存层优先：同名文件以 overlay 的为准
+        if (!isOverlay && entries.has(rel)) continue;
+        entries.set(rel, { bytes: st.size, mtime: st.mtimeMs, staged: isOverlay });
       }
-    }
-    for (const d of this.deleted) set.delete(d);
-    return [...set].filter((rel) => {
-      try {
-        const over = this.staging ? this.abs(rel).abs : null;
-        const abs = over && fs.existsSync(over) ? over : this.absRead(rel).abs;
-        return fs.statSync(abs).size <= MAX_READ_BYTES;
-      } catch {
-        return false;
-      }
-    }).sort();
+    };
+    if (this.staging) collect(this.overlayDir, true);
+    collect(this.root, false);
+    for (const d of this.deleted) entries.delete(d);
+    let bytes = 0;
+    for (const v of entries.values()) bytes += v.bytes;
+    this.#scan = { at: Date.now(), entries, bytes, files: [...entries.keys()].sort() };
+    return this.#scan;
+  }
+
+  invalidateScan() {
+    this.#scan = null;
+  }
+
+  /** 合并视图下的全部文件。force 会跳过缓存重新扫描。 */
+  listFiles({ force = false } = {}) {
+    return this.scan({ force }).files;
+  }
+
+  totalBytes({ force = false } = {}) {
+    return this.scan({ force }).bytes;
+  }
+
+  fileStats(rel) {
+    return this.scan().entries.get(rel) ?? null;
   }
 
   listTree() {
-    const files = this.listFiles();
+    const snap = this.scan();
+    const pending = this.pendingRels();
     const root = { name: path.basename(this.root), path: '', type: 'dir', children: [] };
     const dirIndex = new Map([['', root]]);
     const ensureDirNode = (dirPath) => {
@@ -223,14 +266,11 @@ export class Workspace {
       dirIndex.set(dirPath, node);
       return node;
     };
-    for (const f of files) {
+    for (const f of snap.files) {
       const dir = f.split('/').slice(0, -1).join('/');
-      let size = 0;
-      try {
-        size = this.read(f)?.bytes ?? 0;
-      } catch { /* ignore */ }
-      const node = { name: f.split('/').pop(), path: f, type: 'file', size, lang: f.split('.').pop() };
-      if (this.pendingRels().has(f)) node.pending = true;
+      const meta = snap.entries.get(f);
+      const node = { name: f.split('/').pop(), path: f, type: 'file', size: meta?.bytes ?? 0, lang: f.split('.').pop() };
+      if (pending.has(f)) node.pending = true;
       ensureDirNode(dir).children.push(node);
     }
     const sortNode = (n) => {
@@ -240,16 +280,6 @@ export class Workspace {
     };
     sortNode(root);
     return root;
-  }
-
-  totalBytes() {
-    let total = 0;
-    for (const f of this.listFiles()) {
-      try {
-        total += this.read(f)?.bytes ?? 0;
-      } catch { /* ignore */ }
-    }
-    return total;
   }
 
   /* ------------------------- 暂存层（改动待应用） ------------------------- */
@@ -267,8 +297,7 @@ export class Workspace {
   pending() {
     if (!this.staging) return [];
     const out = [];
-    for (const rel of this.pendingRels()) {
-      let overlay = null;
+    for (const rel of this.pendingRels()) {      let overlay = null;
       let base = null;
       try {
         const o = this.abs(rel).abs;
@@ -332,6 +361,7 @@ export class Workspace {
     }
     this.deleted = new Set();
     this.saveState();
+    this.invalidateScan();
   }
 
   /* ------------------------------ 补丁应用 ------------------------------ */
@@ -412,17 +442,47 @@ export class Workspace {
     ensureDir(filesDir);
     const manifest = {};
     let bytes = 0;
+    let skipped = 0;
     for (const rel of this.listFiles()) {
+      if (Object.keys(manifest).length >= SNAPSHOT_MAX_FILES || bytes >= SNAPSHOT_TOTAL_BYTES) {
+        skipped += 1;
+        continue;
+      }
       const f = this.read(rel);
       if (!f || f.tooLarge) continue;
+      if (bytes + f.bytes > SNAPSHOT_TOTAL_BYTES && Object.keys(manifest).length > 0) {
+        skipped += 1;
+        continue;
+      }
       const dest = path.join(filesDir, rel);
       ensureDir(path.dirname(dest));
       fs.writeFileSync(dest, f.content, 'utf8');
       manifest[rel] = sha1(f.content);
       bytes += f.bytes;
     }
-    const rec = { id, seq, label, turnId, segmentIds, runId, createdAt: nowIso(), fileCount: Object.keys(manifest).length, bytes, meta };
+    const rec = {
+      id, seq, label, turnId, segmentIds, runId, createdAt: nowIso(),
+      fileCount: Object.keys(manifest).length, bytes, skipped, meta,
+    };
     writeJsonAtomic(path.join(dir, 'manifest.json'), { ...rec, files: manifest });
+    list.push(rec);
+    writeJsonAtomic(path.join(this.snapshotsDir, 'index.json'), { snapshots: list });
+    this.prune();
+    return rec;
+  }
+
+  /**
+   * 空快照：什么都不复制，只用于"暂存模式的基线"。
+   * 暂存层为空 = 项目原样，所以回退到它只需要清空暂存层 —— 不需要真的把项目复制一份。
+   */
+  emptySnapshot({ label = '基线（项目原样）', meta = {} } = {}) {
+    const list = this.listSnapshots();
+    const seq = list.length ? Math.max(...list.map((s) => s.seq)) + 1 : 1;
+    const id = `v${seq}_${newId('snap').split('_')[1]}`;
+    const dir = path.join(this.snapshotsDir, id);
+    ensureDir(path.join(dir, 'files'));
+    const rec = { id, seq, label, createdAt: nowIso(), fileCount: 0, bytes: 0, skipped: 0, meta: { ...meta, kind: 'staging-baseline' } };
+    writeJsonAtomic(path.join(dir, 'manifest.json'), { ...rec, files: {} });
     list.push(rec);
     writeJsonAtomic(path.join(this.snapshotsDir, 'index.json'), { snapshots: list });
     this.prune();
@@ -468,6 +528,11 @@ export class Workspace {
     const want = man.files ?? {};
     if (this.staging) {
       this.clearStaging();
+      // "暂存模式的基线"= 项目原样。它本来就不含任何文件，
+      // 所以回退到它只需要清空暂存层，绝不能把项目里的文件全标记成"待删除"。
+      if (man.meta?.kind === 'staging-baseline') {
+        return { snapshotId, restored: 0, files: [], meta: man };
+      }
       // 暂存模式下只把"与项目不同"的文件放进暂存层：
       // 否则一次回退会把整个项目复制进 staging，白白占一份磁盘。
       for (const rel of Object.keys(want)) {

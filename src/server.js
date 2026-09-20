@@ -157,7 +157,9 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     const workspace = new Workspace(projectDir, { storeDir: projectStore, overlayDir });
     const memory = new Memory(globalStore);
     const rag = new RagIndex(workspace, { skillsDir: path.join(globalStore, 'skills') });
-    rag.build();
+    // 注意：这里**不**建索引。切到大目录时建索引会同步读几百 MB 并卡死事件循环，
+    // 索引改成首次真正检索时懒建（RagIndex.search 内部触发）。
+    const fileCount = workspace.listFiles().length;
 
     const sessionsDir = path.join(projectStore, 'sessions');
     let session = null;
@@ -183,7 +185,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       ...(registry.list ?? []).filter((p) => p.dir !== projectDir)].slice(0, 12);
     fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
 
-    return { projectDir, projectStore, writeMode, overlayDir, workspace, memory, rag, session, runner, registry };
+    return { projectDir, projectStore, writeMode, overlayDir, workspace, memory, rag, session, runner, registry, fileCount };
   }
 
   svc = buildServices();
@@ -274,12 +276,16 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
           monaco: monacoAvailable,
         };
 
-      case '/api/state':
+      case '/api/state': {
+        const snap = runner.snapshot();
         return {
-          ...runner.snapshot(),
-          config: { ...runner.snapshot().config, ...publicConfig(cfg) },
+          ...snap,
+          config: { ...snap.config, ...publicConfig(cfg) },
           presets: visiblePresets(),
+          // 必须合并而不是覆盖 snapshot.paths —— 否则 staging / writeMode / files 会丢，
+          // 前端在状态刷新时就会把项目徽标与暂存状态擦成空白。
           paths: {
+            ...snap.paths,
             projectRoot: root,
             projectDir: svc.projectDir,
             workspace: svc.projectDir,
@@ -292,6 +298,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
           profiles: maskedProfiles(),
           activeProfileId: cfg.activeProfileId,
         };
+      }
 
       case '/api/input':
         runner.onInput({ text: body.text ?? '', idleMs: body.idleMs ?? 0 });
@@ -411,8 +418,9 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
 
       case '/api/tree':
         return {
+          // force: 用户手动刷新时重扫一遍，平时走缓存（大目录下差别是秒级的）
           tree: workspace.listTree(),
-          files: workspace.listFiles(),
+          files: workspace.listFiles({ force: url.searchParams.get('force') === '1' }),
           bytes: workspace.totalBytes(),
           human: bytesToHuman(workspace.totalBytes()),
           staging: workspace.staging,
@@ -651,21 +659,43 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
   function setProject(body) {
     const dir = String(body.dir ?? '').trim();
     const mode = body.mode === 'staging' ? 'staging' : 'direct';
+    let warning = null;
     if (dir) {
       const abs = path.resolve(dir);
-      if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
-        throw Object.assign(new Error(`目录不存在: ${abs}`), { status: 400 });
+      let st = null;
+      try {
+        st = fs.statSync(abs);
+      } catch { /* 下面统一报错 */ }
+      if (!st || !st.isDirectory()) {
+        throw Object.assign(new Error(`目录不存在或不是文件夹: ${abs}`), { status: 400 });
+      }
+      // 盘符根目录 / 用户主目录这种"巨大且不该当项目"的目录，先劝一句
+      const isRoot = path.dirname(abs) === abs;
+      if (isRoot) {
+        warning = `${abs} 是磁盘根目录，把它当项目会扫描海量无关文件。建议选到具体的项目文件夹。`;
       }
       saveConfig(root, { projectDir: abs, writeMode: mode });
     } else {
       saveConfig(root, { projectDir: '', writeMode: 'direct' });
     }
-    reloadServices();
+    const t0 = Date.now();
+    try {
+      reloadServices();
+    } catch (err) {
+      // 切换失败要把话说清楚，而不是丢一个 500 让界面卡在那儿
+      throw Object.assign(new Error(`切换失败：${err.message}`), { status: 500 });
+    }
+    const ms = Date.now() - t0;
+    if (!warning && svc.fileCount > 1200) {
+      warning = `这个目录有 ${svc.fileCount} 个文件，体积偏大；检索与风格扫描会自动限量，但建议选到更精确的项目根目录。`;
+    }
     broadcast('toast', {
-      level: 'ok',
-      message: dir ? `已切换到项目目录：${svc.projectDir}（${svc.writeMode === 'staging' ? '暂存模式，改动需确认后应用' : '直接写入'}）` : '已切回默认 workspace 目录',
+      level: warning ? 'warn' : 'ok',
+      message: dir
+        ? `已切换到 ${svc.projectDir}（${svc.writeMode === 'staging' ? '暂存模式' : '直接写入'}）· ${svc.fileCount} 个文件 · 用时 ${ms}ms`
+        : '已切回默认 workspace 目录',
     });
-    return { ok: true, projectDir: svc.projectDir, writeMode: svc.writeMode, staging: svc.workspace.staging };
+    return { ok: true, projectDir: svc.projectDir, writeMode: svc.writeMode, staging: svc.workspace.staging, fileCount: svc.fileCount, ms, warning };
   }
 
   function visiblePresets() {

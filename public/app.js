@@ -635,13 +635,17 @@ function renderProfileSelect(profiles, activeId) {
 
 function renderProjectChip(state) {
   if (!el.projectChip) return;
-  const dir = state.paths?.projectDir ?? '';
-  S.projectDir = dir;
-  S.staging = Boolean(state.workspace?.staging);
-  const short = dir.split(/[\\/]/).filter(Boolean).slice(-2).join('/');
-  el.projectChip.textContent = `📁 ${short}${S.staging ? ' · 暂存' : ''}`;
-  el.projectChip.title = `目标项目：${dir}\n${S.staging ? '暂存模式：AI 改动需你确认后才写入项目' : '直接写入模式'}`;
-  el.projectChip.classList.toggle('warn', S.staging);
+  const dir = state?.paths?.projectDir ?? '';
+  // 有些事件（比如 /api/config 触发的 state）可能不带 paths，
+  // 这时必须保留已知的项目名，不能把它擦成空白 —— 用户会瞬间不知道自己在哪里。
+  if (dir) {
+    S.projectDir = dir;
+    S.staging = Boolean(state.paths?.staging ?? state.workspace?.staging);
+    const short = dir.split(/[\\/]/).filter(Boolean).slice(-2).join('/');
+    el.projectChip.textContent = `📁 ${short}${S.staging ? ' · 暂存' : ''}`;
+    el.projectChip.title = `目标项目：${dir}\n${S.staging ? '暂存模式：AI 改动需你确认后才写入项目' : '直接写入模式'}\n点击可以切换项目`;
+    el.projectChip.classList.toggle('warn', S.staging);
+  }
 }
 
 /* ============================ 输入 ============================ */
@@ -697,6 +701,8 @@ function connect() {
     'suggest', 'suggest:adopted', 'file:start', 'file:delta', 'file:end', 'run:text', 'retry',
     'run:applied', 'run:done', 'run:error', 'run:cancelled', 'spec:done', 'run:promoted', 'tree', 'versions',
     'timeline', 'pending', 'prompt', 'toast', 'rollback', 'file:saved',
+    // 这两个之前漏了订阅 —— 结果切换项目时前端不会重置、同步开关状态也同步不过来
+    'reset', 'sync',
   ];
   for (const n of names) {
     es.addEventListener(n, (ev) => {
@@ -1122,7 +1128,7 @@ async function doCompact() {
   if (el.compactHint) el.compactHint.textContent = '正在让模型整理你的需求…';
   setStatus('gen', '正在整合提示词…', `${text.length} 字`);
   try {
-    const res = await post('/api/prompt/compact', { text, style: el.compactStyle?.value ?? 'balanced' });
+    const res = await post('/api/prompt/compact', { text, style: el.compactStyle?.value ?? 'balanced' }, { timeoutMs: 240000 });
     S.compactUndo = text;
     el.compactStat.textContent = `${res.charsBefore} 字 → ${res.charsAfter} 字 · 用时 ${(res.ms / 1000).toFixed(1)}s · 偏好「${res.style}」`;
     el.compactBefore.textContent = res.before;
@@ -1207,19 +1213,32 @@ async function applyReset(payload) {
   S.manualEdits = [];
   S.collapsedDirs = new Set();
   renderSelectionChip();
+  if (payload?.projectDir) {
+    S.projectDir = payload.projectDir;
+    S.staging = Boolean(payload.staging);
+    renderProjectChip({ paths: { projectDir: payload.projectDir, staging: payload.staging } });
+  }
   if (el.streamBody) el.streamBody.innerHTML = '<p class="empty">已切换到新项目。这里的思考与建议会从零开始。</p>';
   if (el.timeline) el.timeline.innerHTML = '';
   if (el.tabs) el.tabs.innerHTML = '';
+  if (el.code) el.code.innerHTML = '';
   if (el.prompt) el.prompt.value = payload?.prompt ?? '';
   updateCounter();
   updateUnread();
   updateRoundLabel();
   if (el.editorEmpty) el.editorEmpty.classList.remove('hidden');
-  if (el.code) el.code.innerHTML = '';
   Editor.path = null;
   Editor.setDirty(false);
+  // 意图条也归零，否则会留着上一个项目的判定结果
+  if (el.intentFill) el.intentFill.style.width = '0%';
+  if (el.intentText) el.intentText.textContent = '等待输入…';
+  if (el.decisionText) el.decisionText.textContent = '';
+  S.lastIntent = null;
   checkStreamLimit();
+  // 重新灌入新项目的轮次（一般是空的）
+  if (Array.isArray(payload?.timeline) && payload.timeline.length) rehydrateTimeline(payload.timeline);
   await refreshAll();
+  setStatus('idle', '已切换项目', payload?.projectDir ?? '');
   toast('已切换到新项目，界面已重置', 'ok', 3200);
 }
 

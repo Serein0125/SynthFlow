@@ -824,6 +824,13 @@ export class Runner {
     const s = this.session;
     return {
       session: s.snapshotState(),
+      // 每个 state 事件都要带上"当前项目"，否则前端在状态刷新时会把项目名擦成空白
+      paths: {
+        projectDir: this.workspace.root,
+        staging: this.workspace.staging,
+        writeMode: this.workspace.staging ? 'staging' : 'direct',
+        files: this.workspace.listFiles().length,
+      },
       provider: { name: this.provider.name, label: this.provider.label, ready: this.provider.ready, note: this.provider.note, model: this.config.model },
       profile: { id: this.config.activeProfileId, name: (this.config.profiles ?? []).find((p) => p.id === this.config.activeProfileId)?.name ?? '' },
       busy: this.busy,

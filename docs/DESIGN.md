@@ -549,7 +549,70 @@ launch Edge(headless, 独立 profile) -> 读 DevToolsActivePort -> /json/list ->
 
 ---
 
-## 14. 已知取舍
+## 14. 切换项目的性能与一致性（v3.3）
+
+### 14.1 一次切换原本要做的同步工作
+
+```
+POST /api/project
+  saveConfig()
+  reloadServices()
+    ├─ new Workspace(root)            ← 全目录扫描
+    ├─ new RagIndex(...).build()      ← 读全部文本文件建索引，然后写 index.json
+    ├─ new Session(...)               ← 打"基线快照"：把项目每个文件复制一份！
+    ├─ new Runner(...)
+    └─ broadcast(reset/state/tree/versions/timeline/pending)
+         └─ snapshot() → listFiles() + totalBytes()  ← 又把每个文件读一遍
+         └─ listTree()                              ← 又读一遍
+```
+
+四遍全量 I/O，全是同步的，全部堵在事件循环上。2500 文件实测 6.1 秒、+29 MB；
+按 `D:\` 盘（101 MB 文本）推算 30~60 秒、+250 MB。
+
+### 14.2 四个修复
+
+| 问题 | 修复 |
+| --- | --- |
+| 基线快照复制整个项目 | 暂存模式下基线用**空快照**（含义就是"项目原样"），回退=清空暂存层，零复制。直接模式仍打真实快照，但有 8 MB / 1500 文件上限 |
+| 索引落盘写出几十 MB | 索引**只存内存**，首次检索时懒建（~34ms）。省掉了 50 MB 级文件，重建成本可以忽略 |
+| `totalBytes()`/`listTree()` 读每个文件 | 新增 `Workspace.scan()`：**一次遍历 + statSync** 拿到 `{bytes, mtime}`，带 4 秒 TTL 缓存；我们自己的 write/remove/clearStaging 会立刻 `invalidateScan()` |
+| `mkdir('D:\')` 抛 EPERM | 只在目录真不存在时才创建 |
+
+### 14.3 一个隐蔽的状态契约 bug
+
+`/api/state` 里写的是：
+
+```js
+return { ...runner.snapshot(), paths: { projectRoot, projectDir, ... } }
+```
+
+后面的 `paths` **整体覆盖**了 `snapshot().paths`。于是 SSE 的 `state` 事件里 `paths` 只有
+HTTP 接口补的那几个字段，`staging / writeMode / files` 全丢，`projectDir` 也可能是空的 ——
+前端每次状态刷新都会把项目徽标渲染成空白。
+
+两处修复：`/api/state` 改成**合并** `{...snap.paths, ...}`；`runner.snapshot()` 自己也带上完整
+`paths`（这样任何携带 snapshot 的事件都是自洽的）。前端 `renderProjectChip()` 再加一层保护：
+拿到空值时保留已知项目名，而不是擦成空白。
+
+### 14.4 事件订阅契约
+
+`reset` 和 `sync` 两个事件在服务端广播了，但前端 `connect()` 的订阅名单里**没有它们**，
+所以：
+- 切项目后前端不会重置（思考栏/输入框留着上一个项目的内容）
+- 同步开关的状态同步不过来
+
+教训：**"广播了什么"和"订阅了什么"是两份名单，必须有一处对得上。**
+现在测试台 Q 段会真的切一次项目并断言界面被重置，这类漏订阅不会再溜过去。
+
+### 14.5 测试台要负责收尾
+
+Q 段测试会真的切换项目。第一版忘了收尾，结果把用户的应用留在了 `D:\` 上。
+现在在**测试开始时**记下当前项目，在 `finally` 风格的收尾段无条件切回去并打印结果。
+自动化测试改动外部状态时，必须自己负责恢复 —— 这一条比测试本身更重要。
+
+---
+
+## 15. 已知取舍
 
 - 回退是**线性版本链 + 游标**：能自由往返，但在历史版本上继续生成会丢弃右侧分支（界面会告知丢弃了几个）。
   版本树会让 UI 与心智负担都变重，当前不值。
@@ -569,3 +632,5 @@ launch Edge(headless, 独立 profile) -> 读 DevToolsActivePort -> /json/list ->
   未保存的改动靠内部回合前快照兜底（撤销）。这是刻意的职责分离，不是遗漏。
 - **同步生成关掉后，意图判定仍在跑**（输入框下方那条进度条还会动）。保留它是因为
   "我知道它理解到哪一步了"本身有价值；如果你希望彻底静默，可以再把 `intent` 事件也关掉。
+- **切到超大目录仍会慢**（`D:\` 这种 2900 文件约 500ms）。不会卡死也不会占磁盘，
+  但确实不该把盘符根目录当项目 —— 选择器现在会先劝阻，服务端也会返回警告。

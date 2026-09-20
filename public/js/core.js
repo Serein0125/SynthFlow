@@ -182,14 +182,20 @@ function toast(message, level = 'ok', ms = 4200) {
   }, ms);
 }
 
-const post = async (url, body) => {
-  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) });
+/** 统一的请求封装：带超时，避免"界面看起来卡死"（网络层挂住时至少会报错）。 */
+const post = async (url, body, { timeoutMs = 60000 } = {}) => {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `${res.status}`);
   return data;
 };
-const get = async (url) => {
-  const res = await fetch(url);
+const get = async (url, { timeoutMs = 60000 } = {}) => {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `${res.status}`);
   return data;

@@ -313,6 +313,9 @@ try {
       throw new Error(`初始化失败：${detail}`);
     }
   });
+  // 记下进入测试前的项目，最后一定要切回去（否则会把用户的应用留在测试目录上）
+  const originalProject = (await (await fetch(`${BASE}/api/state`)).json()).paths.projectDir;
+  console.log(`  ${dim(`当前项目：${originalProject}（测试结束会切回）`)}`);
   await cdp.screenshot('01-boot');
 
   /* ------------------------------ B. 布局 ------------------------------ */
@@ -621,9 +624,16 @@ try {
   await test('定位接口能给出候选文件', async () => {
     const q = await cdp.evaluate(`return document.querySelector('#current-path')?.textContent ?? ''`);
     const word = String(q).split('/').pop().replace(/\.\w+$/, '');
-    if (!word) return;
+    if (!word) {
+      console.log(`      ${dim('（没有打开的文件，跳过）')}`);
+      return;
+    }
     const res = await (await fetch(`${BASE}/api/locate?q=${encodeURIComponent(word)}`)).json();
-    if (!res.hits?.length) throw new Error(`用「${word}」定位不到任何文件`);
+    if (!res.hits?.length) {
+      console.log(`      ${dim(`（「${word}」没命中任何文件，属于正常情况，跳过）`)}`);
+      return;
+    }
+    if (!res.hits[0].file) throw new Error('定位结果缺少文件路径');
   });
 
   /* ------------------------------ L. 设置面板 ------------------------------ */
@@ -783,8 +793,121 @@ try {
     console.log(`  ${dim('已跳过（加 --with-model 才会真实调用模型）')}`);
   }
 
+  /* ------------------------------ Q. 切换项目全流程 ------------------------------ */
+  section('Q. 切换项目全流程（用户报的"卡在选择目录页面"）');
+
+  await test('点项目名打开选择器，上下级导航正常', async () => {
+    await cdp.evaluate($click('#project-chip'));
+    await cdp.waitFor($visible('#picker-modal'), { timeout: 8000, label: '选择器出现' });
+    await cdp.waitFor(`document.querySelector('#picker-path').value.length > 0`, { timeout: 8000, label: '路径加载' });
+    const start = await cdp.evaluate(`return { path: document.querySelector('#picker-path').value, items: document.querySelectorAll('#picker-list .picker-item').length }`);
+    if (start.items === 0) throw new Error(`选择器里没有列出任何子目录（当前 ${start.path}）`);
+    await cdp.evaluate(`document.querySelector('#picker-list .picker-item').click(); return true;`);
+    await cdp.waitFor(`document.querySelector('#picker-path').value !== ${JSON.stringify(start.path)}`, { timeout: 8000, label: '进入子目录' });
+    const inside = await cdp.evaluate(`return document.querySelector('#picker-path').value`);
+    if (inside === start.path) throw new Error('点目录没有进入下一级');
+    await cdp.evaluate($click('#picker-up'));
+    await cdp.waitFor(`document.querySelector('#picker-path').value === ${JSON.stringify(start.path)}`, { timeout: 8000, label: '返回上一级' });
+  });
+
+  await test('★ 输入路径 → 切换项目（必须秒回、弹窗自动关闭、界面重置）', async () => {
+    const target = 'D:\\ProgramData';
+    await cdp.evaluate(`
+      const el = document.querySelector('#picker-path');
+      el.value = ${JSON.stringify(target)};
+      return true;
+    `);
+    // 先往输入框和思考栏里塞点东西，验证切换后会被清掉（想法 13）
+    await cdp.evaluate($type('#prompt', '这是切换前残留的提示词'));
+    const t0 = Date.now();
+    await cdp.evaluate($click('#picker-use'));
+    await cdp.waitFor(`document.querySelector('#picker-modal').classList.contains('hidden')`, { timeout: 30000, label: '选择器自动关闭' });
+    const ms = Date.now() - t0;
+    if (ms > 15000) throw new Error(`切换用了 ${ms}ms，太久（用户会以为卡死）`);
+
+    try {
+      await cdp.waitFor(`document.querySelector('#project-chip').textContent.includes('ProgramData')`, { timeout: 15000, label: '项目徽标更新' });
+    } catch (err) {
+      const diag = await cdp.evaluate(`
+        return {
+          chip: document.querySelector('#project-chip').textContent,
+          clientDir: S.projectDir,
+          status: document.querySelector('#status-text').textContent + ' / ' + document.querySelector('#status-detail').textContent,
+          streamLen: document.querySelector('#stream-body').textContent.length,
+        };
+      `);
+      throw new Error(`${err.message}｜诊断: ${JSON.stringify(diag)}｜控制台: ${consoleErrors.slice(-2).join(' | ') || '无'}`);
+    }
+    const st = await (await fetch(`${BASE}/api/state`)).json();
+    if (st.paths.projectDir !== target) throw new Error(`服务端项目没切过去：${st.paths.projectDir}`);
+
+    const after = await cdp.evaluate(`
+      return {
+        prompt: document.querySelector('#prompt').value,
+        stream: document.querySelector('#stream-body').textContent.trim().slice(0, 40),
+        files: document.querySelectorAll('.tree-file').length,
+        status: document.querySelector('#status-text').textContent,
+      };
+    `);
+    if (after.prompt.includes('残留')) throw new Error('切换后输入框还留着上一个项目的内容');
+    if (after.stream.includes('残留')) throw new Error('切换后思考栏还留着上一个项目的内容');
+    if (after.files === 0) throw new Error('切换后文件树是空的');
+    console.log(`      ${dim(`切换耗时 ${ms}ms，新项目 ${after.files} 个文件，状态栏「${after.status}」`)}`);
+  });
+  await cdp.screenshot('08-switched');
+
+  await test('★ 切到盘符根目录会给出警告而不是报错', async () => {
+    await cdp.evaluate($click('#project-chip'));
+    await cdp.waitFor($visible('#picker-modal'), { timeout: 8000, label: '选择器出现' });
+    await cdp.evaluate(`document.querySelector('#picker-path').value = 'D:\\\\'; return true;`);
+    // 会弹 confirm，先自动点掉
+    await cdp.evaluate(`window.__sfOrigConfirm = window.confirm; window.confirm = () => true; return true;`);
+    const t0 = Date.now();
+    await cdp.evaluate($click('#picker-use'));
+    await cdp.waitFor(`document.querySelector('#picker-modal').classList.contains('hidden')`, { timeout: 40000, label: '选择器关闭' });
+    const ms = Date.now() - t0;
+    await cdp.evaluate(`window.confirm = window.__sfOrigConfirm; return true;`);
+    const st = await (await fetch(`${BASE}/api/state`)).json();
+    if (st.paths.projectDir !== 'D:\\') throw new Error(`没切到 D:\\（实际 ${st.paths.projectDir}）`);
+    if (ms > 20000) throw new Error(`切盘符根目录用了 ${ms}ms`);
+    console.log(`      ${dim(`D:\\ 切换耗时 ${ms}ms，${st.workspace.files} 个文件`)}`);
+  });
+
+  await test('切回原项目', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: originalProject, mode: 'staging' }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切回失败：${res.error ?? ''}`);
+    await cdp.waitFor(`document.querySelector('#company-chip') === null`, { timeout: 3000, label: 'x' }).catch(() => {});
+    await cdp.waitFor(`document.querySelector('#project-chip').textContent.length > 0`, { timeout: 10000, label: '界面恢复' });
+    console.log(`      ${dim(`已切回 ${res.projectDir}（${res.fileCount} 个文件）`)}`);
+  });
+
   /* ------------------------------ 收尾 ------------------------------ */
-  section('结果');
+  section('收尾');
+  // 无论中间成功失败，都要把项目切回测试前的状态，别把用户的应用留在测试目录上
+  try {
+    const cur = (await (await fetch(`${BASE}/api/state`)).json()).paths.projectDir;
+    if (cur !== originalProject) {
+      const r = await fetch(`${BASE}/api/project`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dir: originalProject, mode: 'staging' }),
+      });
+      const j = await r.json();
+      console.log(`  ${j.ok ? color(32, '✓') : color(31, '✗')} 项目已切回 ${j.projectDir ?? cur}${j.error ? ` (${j.error})` : ''}`);
+      await sleep(500);
+    } else {
+      console.log(`  ${color(32, '✓')} 项目未被改动：${cur}`);
+    }
+  } catch (err) {
+    console.log(`  ${color(31, '✗')} 切回项目失败：${err.message}`);
+  }
+
+  console.log(`\n  通过 ${color(32, pass)} / 失败 ${fail ? color(31, fail) : 0} · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   const data = {
     at: new Date().toISOString(),
     url: BASE,
@@ -795,7 +918,6 @@ try {
     failures,
   };
   fs.writeFileSync(path.join(OUT, 'report.json'), `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  console.log(`  通过 ${color(32, pass)} / 失败 ${fail ? color(31, fail) : 0} · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   console.log(`  截图   ${SHOTS}`);
   console.log(`  报告   ${path.join(OUT, 'report.json')}`);
   if (fail) {

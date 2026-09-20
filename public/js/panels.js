@@ -404,13 +404,20 @@ const Panels = {
   },
 
   async browse(dir) {
+    const t0 = Date.now();
     try {
-      const data = await get(`/api/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`);
+      el.pickerHint.textContent = '读取中…';
+      const data = await get(`/api/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`, { timeoutMs: 20000 });
       this.pickerDir = data.dir;
       el.pickerPath.value = data.dir;
-      el.pickerHint.textContent = data.isProject
-        ? '看起来是个项目根目录（检测到 package.json 或 .git）'
-        : '继续往下找，或者直接点下面「用这个目录」';
+      const isRoot = /^[A-Za-z]:\\?$/.test(data.dir);
+      const ms = Date.now() - t0;
+      el.pickerHint.textContent = isRoot
+        ? `⚠ ${data.dir} 是磁盘根目录，别把它当项目 —— 请进到具体的项目文件夹再点「用这个目录」`
+        : data.isProject
+          ? `✓ 看起来是项目根目录（检测到 package.json 或 .git）· ${data.dirs.length} 个子目录 · ${ms}ms`
+          : `继续往下找，或者直接点「用这个目录」· ${data.dirs.length} 个子目录 · ${ms}ms`;
+      el.pickerHint.className = isRoot ? 'muted tiny warn-text' : 'muted tiny';
       el.pickerDrives.innerHTML = (data.drives ?? [])
         .map((d) => `<button class="btn ghost tiny pick-drive" data-dir="${esc(d)}">${esc(d)}</button>`)
         .join('');
@@ -424,19 +431,34 @@ const Panels = {
       el.pickerUp.disabled = !data.parent;
       el.pickerUp.dataset.parent = data.parent ?? '';
     } catch (err) {
-      toast(`读取目录失败：${err.message}`, 'err', 5000);
+      el.pickerHint.textContent = `读取失败：${err.message}`;
+      el.pickerHint.className = 'muted tiny warn-text';
     }
   },
 
   async usePickerDir(mode) {
     const dir = el.pickerPath.value.trim();
     if (!dir) return;
+    // 盘符根目录 / 用户主目录：先劝一句再走，避免"切过去卡半天"
+    const isRoot = /^[A-Za-z]:\\?$/.test(dir);
+    if (isRoot && !window.confirm(`${dir} 是磁盘根目录。\n把它当项目会扫描海量无关文件，切换会很慢。\n\n确定要用它吗？`)) return;
+    const btns = [el.pickerUse, el.pickerDirect, el.pickerClose];
+    const oldLabels = btns.map((b) => b.textContent);
+    btns.forEach((b) => { b.disabled = true; });
+    el.pickerUse.textContent = '⏳ 正在切换…';
+    el.pickerHint.textContent = '正在加载项目（扫描文件、建立会话），大目录可能要几秒…';
     try {
-      const res = await post('/api/project', { dir, mode });
+      const res = await post('/api/project', { dir, mode }, { timeoutMs: 120000 });
       this.closePicker();
-      toast(`已切换到 ${res.projectDir}（${res.writeMode === 'staging' ? '暂存模式' : '直接写入'}）`, 'ok', 4200);
+      // 成功提示由服务端广播（带文件数与耗时），这里只在有警告时补一句
+      if (res.warning) toast(res.warning, 'warn', 9000);
     } catch (err) {
-      toast(`切换失败：${err.message}`, 'err', 6000);
+      const msg = err.name === 'TimeoutError' ? '切换超时（目录可能太大），请换一个更具体的项目目录' : err.message;
+      el.pickerHint.textContent = `✗ ${msg}`;
+      el.pickerHint.className = 'muted tiny warn-text';
+      toast(`切换失败：${msg}`, 'err', 8000);
+    } finally {
+      btns.forEach((b, i) => { b.disabled = false; b.textContent = oldLabels[i]; });
     }
   },
 

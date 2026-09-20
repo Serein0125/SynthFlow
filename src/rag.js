@@ -16,35 +16,45 @@ export class RagIndex {
     this.skillsDir = opts.skillsDir ?? path.join(this.storeDir, 'skills');
     this.indexFile = path.join(this.storeDir, 'index.json');
     this.maxChunkChars = opts.maxChunkChars ?? 1800;
+    // 上限：切到大目录时不能把整个盘都读进来建索引
+    this.maxFiles = opts.maxFiles ?? 800;
+    this.maxFileBytes = opts.maxFileBytes ?? 200 * 1024;
+    this.maxChunks = opts.maxChunks ?? 4000;
     this.docs = [];
     this.postings = new Map(); // token -> Map(docId -> tf)
     this.docLen = new Map();
     this.avgLen = 1;
     this.builtAt = 0;
     this.signature = '';
+    this.built = false;
+    this.skipped = 0;
     ensureDir(this.skillsDir);
   }
 
   /** 扫描工作区 + 记忆 + 技能，构建倒排索引。 */
   build({ force = false } = {}) {
-    const files = listFilesRecursive(this.workspace.root).filter((f) => /\.(js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|md|css|scss|html|py|go|rs|java|php|sql|yml|yaml|toml|sh)$/i.test(f));
+    const CODE = /\.(js|mjs|cjs|ts|tsx|jsx|vue|svelte|py|go|rs|java|kt|php|rb)$/i;
+    const NOISE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock)$|\.min\.|\.bundle\.|\.map$/i;
+    let all = listFilesRecursive(this.workspace.root).filter((f) => /\.(js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|md|css|scss|html|py|go|rs|java|php|sql|yml|yaml|toml|sh)$/i.test(f) && !NOISE.test(f));
+    // 大目录里先保证代码文件进索引，别被一堆 json/锁文件占满名额
+    all = all.sort((a, b) => (CODE.test(b) ? 1 : 0) - (CODE.test(a) ? 1 : 0));
+    const files = all.slice(0, this.maxFiles);
+    this.skipped = Math.max(0, all.length - files.length);
     const sig = sha1(files.map((f) => `${f}:${safeStat(f)}`).join('|'));
     if (!force && sig === this.signature && this.docs.length) return { reused: true, chunks: this.docs.length };
-    const cached = readJsonSafe(this.indexFile, null);
-    if (!force && cached && cached.signature === sig) {
-      this.docs = cached.docs;
-      this.avgLen = cached.avgLen;
-      this.signature = sig;
-      this.builtAt = cached.builtAt;
-      this.reindex();
-      return { reused: true, chunks: this.docs.length, fromCache: true };
-    }
+    // 注意：索引只放在内存里，不落盘。
+    // 早期版本会把每个片段（含正文）写进 index.json —— 一个 2900 文件的项目就能写出 50 MB，
+    // 而重建只要 ~300ms，完全不值得为它占磁盘。切项目后第一次检索时懒建即可。
 
     const docs = [];
     for (const rel of files) {
+      if (docs.length >= this.maxChunks) break;
       let content = '';
       try {
-        content = fs.readFileSync(path.join(this.workspace.root, rel), 'utf8');
+        const abs = this.workspace.absRead(rel).abs;
+        const st = fs.statSync(abs);
+        if (st.size > this.maxFileBytes) continue;
+        content = fs.readFileSync(abs, 'utf8');
       } catch {
         continue;
       }
@@ -68,7 +78,7 @@ export class RagIndex {
     this.signature = sig;
     this.builtAt = Date.now();
     this.reindex();
-    writeJsonAtomic(this.indexFile, { signature: sig, builtAt: this.builtAt, avgLen: this.avgLen, docs });
+    this.built = true;
     return { reused: false, chunks: docs.length };
   }
 
@@ -89,8 +99,13 @@ export class RagIndex {
     this.avgLen = lens.length ? lens.reduce((a, b) => a + b, 0) / lens.length : 1;
   }
 
-  /** BM25 检索。 */
+  /** BM25 检索。索引没建就懒建（切换项目时不再阻塞，等真正需要检索才建）。 */
   search(query, { k = 5, kind = null, maxChars = 6000 } = {}) {
+    if (!this.built) {
+      try {
+        this.build();
+      } catch { /* 建索引失败就当没有检索结果 */ }
+    }
     const q = tokenize(query);
     if (!q.length || !this.docs.length) return [];
     const k1 = 1.2;
@@ -170,7 +185,16 @@ export class RagIndex {
   }
 
   stats() {
-    return { chunks: this.docs.length, terms: this.postings.size, builtAt: this.builtAt, skills: this.skills().length };
+    // 注意：这里绝不触发 build —— 它会被 /api/state 之类的高频接口调用
+    return {
+      chunks: this.docs.length,
+      terms: this.postings.size,
+      builtAt: this.builtAt,
+      built: this.built,
+      skills: this.skills().length,
+      skipped: this.skipped,
+      maxFiles: this.maxFiles,
+    };
   }
 }
 

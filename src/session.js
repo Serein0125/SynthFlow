@@ -195,7 +195,11 @@ export class Session {
     this.pendingRound = null;
     this.syncEnabled = true;
 
-    const baseline = workspace.snapshot({ label: '基线', meta: { kind: 'baseline' } });
+    // 想法 & 修复：暂存模式下"基线"就是项目原样，用一个空快照表示即可 ——
+    // 千万别在这里对真实项目做全量快照（切到大目录会复制几百 MB 并卡死服务端）。
+    const baseline = workspace.staging
+      ? workspace.emptySnapshot({ label: '基线（项目原样，未暂存任何改动）' })
+      : workspace.snapshot({ label: '基线', meta: { kind: 'baseline' } });
     this.versions.push({
       id: 'v0',
       seq: 0,
