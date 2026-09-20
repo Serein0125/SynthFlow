@@ -7,6 +7,7 @@ import { createProvider } from './llm.js';
 import { buildMessages } from './prompt.js';
 import { createProtocolParser } from './protocol.js';
 import { analyzeIntent, decidePromptChange } from './session.js';
+import { scanStyle } from './style.js';
 import { addedLineNumbers, compactDiff, newId, nowIso, sha1 } from './util.js';
 
 export class Runner {
@@ -26,10 +27,12 @@ export class Runner {
     this.commitTimer = null;
     this.settleTimer = null;
     this.pendingInput = false;
-    this.committedPrompt = session.versions[session.versions.length - 1]?.promptAfter ?? '';
+    this.committedPrompt = session.versions[session.activeIndex]?.promptAfter ?? '';
     this.recentFiles = [];
     this.lastIntent = null;
     this.lastDecision = null;
+    // 想法 B：用户在代码面板里选中的片段，下一轮需求优先作用于此
+    this.selection = null;
     this.busy = false;
   }
 
@@ -88,9 +91,17 @@ export class Runner {
       return;
     }
 
-    // 预演：只要有基本轮廓就先跑，用户能看到"我还在打字它已经在写"
-    if (intent.score >= 0.32) {
+    // 预演：只要有基本轮廓就先跑，用户能看到"我还在打字它已经在写"。
+    // 注意门槛不能只看分数：结尾是连接词（「…把时间戳格式化」）会被扣 0.38 分，
+    // 长句也会被压到 0.32 以下 —— 而那恰恰是最该提前开工的时刻。
+    // 所以再加一条：已经写了足够长、并且有明确动作词，就值得预演。
+    const enoughContext = intent.signals.length >= 12 && intent.signals.hasVerb;
+    const specWorthy = intent.score >= 0.32 || enoughContext;
+    if (specWorthy) {
+      if (process.env.SF_DEBUG) console.error(`[onInput] score=${intent.score.toFixed(2)} len=${next.length} busy=${this.busy} -> 预演@${this.config.specDelayMs}ms`);
       this.specTimer = setTimeout(() => this.#startRun('spec', decision), this.config.specDelayMs);
+    } else if (process.env.SF_DEBUG) {
+      console.error(`[onInput] score=${intent.score.toFixed(2)} len=${next.length} -> 不预演 reasons=${intent.reasons.join('/')}`);
     }
     // 提交：判定句子写完了
     if (intent.complete) {
@@ -134,6 +145,7 @@ export class Runner {
   /* ------------------------------ 运行控制 ------------------------------ */
 
   #startRun(kind, decision = {}, extra = {}) {
+    if (process.env.SF_DEBUG) console.error(`[startRun] kind=${kind} busy=${this.busy} draft=${Boolean(this.draft)}`);
     if (this.busy) return this.run;
     const s = this.session;
     const prompt = s.compilePrompt();
@@ -186,6 +198,28 @@ export class Runner {
     }
     const ragHits = this.rag ? this.rag.search(run.prompt, { k: 4 }).filter((h) => h.kind === 'code') : [];
     const skills = this.rag ? this.rag.matchSkills(run.prompt) : [];
+    // 想法 4：扫描项目现有风格（有缓存，文件没变就直接复用）
+    let style = null;
+    try {
+      style = scanStyle(this.workspace);
+    } catch { /* 风格扫描失败不影响生成 */ }
+    const styleSummary = style?.summary && style.scanned >= 3 ? style.summary : null;
+    const manualEdits = (s.manualEdits ?? []).filter((m) => existingFiles[m.path] !== undefined);
+    const manualEditNote = manualEdits.length
+      ? `【用户手动改过这些文件，请务必保留他的改动，不要当成脏数据覆盖回去】\n` +
+        manualEdits.map((m) => `- ${m.path}（用户改过 ${m.count} 次，最近 ${String(m.at).slice(11, 19)}）`).join('\n') +
+        `\n如果要改这些文件，请使用 search/replace 补丁，并且 SEARCH 必须取自下面【现有文件内容】里的最新版本。`
+      : null;
+    const projectNote = this.workspace.staging
+      ? `【当前是"暂存模式"】你写出的改动会先进入暂存层，用户确认后才会应用到真实项目 ` +
+        `${this.workspace.root}。项目里的已有文件都是真实的，请先读再改，不要假设某文件不存在；` +
+        `不要重建已有的目录结构，也不要顺手"优化"与本次需求无关的文件。`
+      : null;
+    const selectionNote = this.selection
+      ? `【用户选中的代码片段（本次需求优先只作用于这一段）】${this.selection.path} 第 ${this.selection.startLine}-${this.selection.endLine} 行：\n` +
+        `\`\`\`${this.selection.lang ?? ''}\n${String(this.selection.text).slice(0, 4000)}\n\`\`\`\n` +
+        `如果需求与这段代码相关，请**优先只修改这一段周边**，用 search/replace 补丁，不要顺带重构整个文件。`
+      : null;
     const messages = buildMessages({
       prompt: run.prompt,
       mode: run.mode,
@@ -202,8 +236,19 @@ export class Runner {
       previousPrompt: this.committedPrompt,
       config: this.config,
       requireSuggestions: true,
+      styleSummary,
+      projectNote,
+      manualEditNote,
+      selectionNote,
     });
-    run.context = { ragHits: ragHits.length, skills: skills.map((k) => k.name), files: Object.keys(existingFiles).length, chars: messages.reduce((a, m) => a + m.content.length, 0) };
+    run.context = {
+      ragHits: ragHits.length,
+      skills: skills.map((k) => k.name),
+      files: Object.keys(existingFiles).length,
+      chars: messages.reduce((a, m) => a + m.content.length, 0),
+      styleScanned: style?.scanned ?? 0,
+      styled: Boolean(styleSummary),
+    };
     this.emit('run:context', { runId: run.id, ...run.context });
 
     const currentFile = { path: null };
@@ -223,7 +268,7 @@ export class Runner {
         s.stats.charsGenerated += (sug.body ?? '').length;
         // 想法 6（v2）：正式生成阶段的建议本轮结束后统一弹出；预演阶段用户还在打字，实时给。
         if (run.kind !== 'commit') {
-          this.emit('suggest', { runId: run.id, suggestion: sug, draft: true });
+          if (this.#filterSuggestions([sug]).length) this.emit('suggest', { runId: run.id, suggestion: sug, draft: true });
         }
         // 想法 10：高价值优化建议 + 用户开启自动采纳时，同步改写 prompt
         if (this.config.autoAdoptHigh && sug.kind === 'optimize' && sug.impact === 'high' && sug.insert) {
@@ -333,9 +378,13 @@ export class Runner {
       files: okFiles,
       summary: `${run.retryOf ? '补丁重试 · ' : ''}${run.mode === 'regenerate' ? '生成' : run.mode === 'continue' ? '增量续写' : '增量修改'} ${okFiles.length} 个文件${failed.length ? `（${failed.length} 个失败）` : ''}`,
       snapshotId: snap.id,
+      // 想法 2：saveMode=confirm 时先标记"待确认"，界面上让用户点保留/丢弃
+      confirmed: this.config.saveMode !== 'confirm',
     });
     this.committedPrompt = run.prompt;
     s.status = 'idle';
+    // 用过的选区就消费掉，避免一直粘在后续轮次上
+    this.selection = null;
 
     // token 用量：优先用接口返回的真实 usage，没有就按字符数估算
     const usage = run.usage
@@ -359,6 +408,19 @@ export class Runner {
     this.emit('run:applied', { runId: run.id, results: results.map(stripDiff), versionId: version.id, files: okFiles });
     this.emit('tree', { tree: this.safeTree() });
     this.emit('versions', s.versionList());
+    // 想法 3：把这一轮（思考/建议/文件操作）写进会话，刷新页面后还能看到
+    s.recordRound({
+      id: run.id,
+      kind: run.kind,
+      mode: run.mode,
+      at: nowIso(),
+      ms,
+      files: okFiles,
+      versionId: version.id,
+      thoughts: run.thoughts,
+      suggestions: this.#filterSuggestions(run.suggestions),
+      ops: run.ops.map((o) => ({ path: o.path, action: o.action, mode: o.mode })),
+    });
     // 想法 6（v2）：本轮结束后才把建议推给用户，避免生成过程中分散注意力。
     // 预演被直接采纳的情况例外：预演阶段已经实时给过建议了，不能再推一遍。
     if (!run.promotedFromDraft) this.#flushSuggestions(run);
@@ -373,6 +435,8 @@ export class Runner {
       chars: run.chars,
       usage,
       droppedBranches: version.droppedBranches ?? 0,
+      pendingConfirm: version.confirmed === false,
+      staging: this.workspace.staging,
     });
     this.emit('state', this.snapshot());
 
@@ -388,14 +452,23 @@ export class Runner {
     this.#maybeResume();
   }
 
-  /** 本轮结束后统一推建议（按影响度排序，高的在前）。 */
+  /** 本轮结束后统一推建议（先按用户开关过滤，再按影响度排序）。 */
   #flushSuggestions(run) {
-    if (!run.suggestions.length) return;
+    const list = this.#filterSuggestions(run.suggestions);
+    if (!list.length) return;
     const order = { high: 0, medium: 1, low: 2 };
-    const sorted = [...run.suggestions].sort((a, b) => (order[a.impact] ?? 1) - (order[b.impact] ?? 1));
+    const sorted = [...list].sort((a, b) => (order[a.impact] ?? 1) - (order[b.impact] ?? 1));
     for (const sug of sorted) {
       this.emit('suggest', { runId: run.id, suggestion: sug, batch: true });
     }
+  }
+
+  /** 想法 5：按用户开关过滤建议类型与条数（模型侧也会被提示，这里是双保险）。 */
+  #filterSuggestions(list) {
+    const cfg = this.config.suggest ?? {};
+    const max = Math.max(0, Math.min(9, Number(cfg.max ?? 4)));
+    if (max === 0) return [];
+    return (list ?? []).filter((s) => cfg[s.kind] !== false).slice(0, max);
   }
 
   /** 补丁没命中时自动重试一次（默认开启，可在设置里关闭）。 */
@@ -542,8 +615,8 @@ export class Runner {
     }
   }
 
-  /** 直接写入文件（用户在预览里手改后保存）。 */
-  writeFile(rel, content) {
+  /** 直接写入文件（用户在编辑器里手改后保存）。 */
+  writeFile(rel, content, { manual = true } = {}) {
     const res = this.workspace.write(rel, content);
     const snap = this.workspace.snapshot({ label: `手动保存 ${rel}`, meta: { kind: 'manual', path: rel } });
     const s = this.session;
@@ -555,13 +628,82 @@ export class Runner {
       summary: `手动保存 ${rel}`,
       snapshotId: snap.id,
       kind: 'manual',
+      confirmed: true, // 手动保存本身就是用户的确认动作
     });
+    // 想法 1/A：记住这是人改的，下一轮提示词里要告诉模型别覆盖
+    if (manual) s.noteManualEdit({ path: rel, chars: content.length, summary: '用户在编辑器里手动修改' });
     s.save();
     this.emit('tree', { tree: this.safeTree() });
     this.emit('versions', s.versionList());
-    this.emit('file:saved', { path: rel, bytes: res.bytes });
+    this.emit('file:saved', { path: rel, bytes: res.bytes, manual });
     this.emit('state', this.snapshot());
     return { ok: true, ...res, versionId: version.id };
+  }
+
+  /** 设置/清除"选中代码"（想法 B）。 */
+  setSelection(sel) {
+    if (!sel || !sel.path) {
+      this.selection = null;
+      return { ok: true, selection: null };
+    }
+    this.selection = {
+      path: sel.path,
+      startLine: Number(sel.startLine) || 1,
+      endLine: Number(sel.endLine) || 1,
+      text: String(sel.text ?? '').slice(0, 4000),
+      lang: sel.lang ?? '',
+    };
+    return { ok: true, selection: this.selection };
+  }
+
+  confirmVersion(versionId) {
+    const res = this.session.confirmVersion(versionId);
+    if (!res.ok) return res;
+    this.session.save();
+    this.emit('versions', this.session.versionList());
+    this.emit('state', this.snapshot());
+    return res;
+  }
+
+  discardVersion(versionId) {
+    const res = this.session.discardVersion(versionId);
+    if (!res.ok) return res;
+    this.committedPrompt = this.session.currentVersion?.promptAfter ?? '';
+    this.rag?.build({ force: true });
+    this.session.save();
+    this.emit('tree', { tree: this.safeTree() });
+    this.emit('versions', this.session.versionList());
+    this.emit('prompt', { text: this.session.prompt, reason: 'discard' });
+    this.emit('rollback', { ...res, direction: 'back', prompt: this.session.prompt, activeVersionId: this.session.activeVersionId });
+    this.emit('state', this.snapshot());
+    return res;
+  }
+
+  /** 把暂存层的改动真正应用到目标项目（想法 D）。 */
+  applyPending() {
+    if (!this.workspace.staging) return { ok: false, error: '当前是直接写入模式，没有待应用的改动' };
+    const res = this.workspace.applyPending();
+    this.rag?.build({ force: true });
+    this.emit('tree', { tree: this.safeTree() });
+    this.emit('pending', { items: this.workspace.pending(), staging: this.workspace.staging });
+    this.emit('state', this.snapshot());
+    this.emit('toast', {
+      level: 'ok',
+      message: `已应用到项目：修改 ${res.applied.length} 个文件${res.deleted.length ? `，删除 ${res.deleted.length} 个` : ''}`,
+    });
+    return { ok: true, ...res };
+  }
+
+  /** 丢弃全部暂存改动（真实项目分毫未动）。 */
+  discardPending() {
+    if (!this.workspace.staging) return { ok: false, error: '当前是直接写入模式' };
+    const res = this.workspace.discardPending();
+    this.rag?.build({ force: true });
+    this.emit('tree', { tree: this.safeTree() });
+    this.emit('pending', { items: [], staging: true });
+    this.emit('state', this.snapshot());
+    this.emit('toast', { level: 'warn', message: `已丢弃 ${res.discarded} 处暂存改动，目标项目未受影响` });
+    return { ok: true, ...res };
   }
 
   snapshot() {
@@ -569,16 +711,39 @@ export class Runner {
     return {
       session: s.snapshotState(),
       provider: { name: this.provider.name, label: this.provider.label, ready: this.provider.ready, note: this.provider.note, model: this.config.model },
+      profile: { id: this.config.activeProfileId, name: (this.config.profiles ?? []).find((p) => p.id === this.config.activeProfileId)?.name ?? '' },
       busy: this.busy,
       run: this.run ? { id: this.run.id, kind: this.run.kind, mode: this.run.mode } : null,
       draft: this.draft ? { runId: this.draft.runId, files: this.draft.ops.map((o) => o.path), mode: this.draft.mode, ms: this.draft.ms } : null,
       versions: s.versionList(),
+      pendingConfirm: s.pendingConfirm,
       intent: this.lastIntent,
       decision: this.lastDecision ? { mode: this.lastDecision.mode, ratio: this.lastDecision.ratio, reason: this.lastDecision.reason } : null,
-      workspace: { files: this.workspace.listFiles().length, bytes: this.workspace.totalBytes(), recent: this.recentFiles },
+      workspace: {
+        files: this.workspace.listFiles().length,
+        bytes: this.workspace.totalBytes(),
+        recent: this.recentFiles,
+        root: this.workspace.root,
+        staging: this.workspace.staging,
+        pendingCount: this.workspace.staging ? this.workspace.pendingRels().size : 0,
+      },
+      selection: this.selection,
+      manualEdits: (s.manualEdits ?? []).map((m) => ({ path: m.path, count: m.count, at: m.at })),
       rag: this.rag ? this.rag.stats() : null,
       memory: this.memory ? this.memory.summary() : null,
-      config: { specDelayMs: this.config.specDelayMs, commitIdleMs: this.config.commitIdleMs, settleMs: this.config.settleMs, intentThreshold: this.config.intentThreshold, autoCommit: this.config.autoCommit, autoAdoptHigh: this.config.autoAdoptHigh },
+      config: {
+        specDelayMs: this.config.specDelayMs,
+        commitIdleMs: this.config.commitIdleMs,
+        settleMs: this.config.settleMs,
+        intentThreshold: this.config.intentThreshold,
+        autoCommit: this.config.autoCommit,
+        autoAdoptHigh: this.config.autoAdoptHigh,
+        patchRetry: this.config.patchRetry,
+        saveMode: this.config.saveMode,
+        suggest: this.config.suggest,
+        writeMode: this.config.writeMode,
+        projectDir: this.config.projectDir,
+      },
     };
   }
 }

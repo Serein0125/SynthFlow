@@ -16,37 +16,93 @@ export const PRESETS = {
   custom: { label: '自定义 OpenAI 兼容端点', baseUrl: '', model: '', needsKey: false },
 };
 
+export function newProfile(overrides = {}) {
+  const provider = overrides.provider ?? 'deepseek';
+  const preset = PRESETS[provider] ?? PRESETS.custom;
+  return {
+    id: overrides.id ?? `p_${Math.random().toString(36).slice(2, 9)}`,
+    name: overrides.name ?? preset.label ?? provider,
+    provider,
+    baseUrl: overrides.baseUrl ?? preset.baseUrl ?? '',
+    model: overrides.model ?? preset.model ?? '',
+    apiKey: overrides.apiKey ?? '',
+    temperature: overrides.temperature ?? 0.3,
+    maxTokens: overrides.maxTokens ?? 4096,
+  };
+}
+
+/** 把旧版"单份配置"平滑迁移成配置档列表。 */
+function normalizeProfiles(stored) {
+  const list = Array.isArray(stored.profiles) ? stored.profiles.filter((p) => p && typeof p === 'object') : [];
+  if (list.length) {
+    return list.map((p, i) => ({ ...newProfile({ name: `配置 ${i + 1}` }), ...p, id: p.id || `p_${i}` }));
+  }
+  if (stored.provider || stored.apiKey || stored.model) {
+    return [newProfile({
+      id: 'p_default',
+      name: PRESETS[stored.provider]?.label ?? '默认配置',
+      provider: stored.provider,
+      baseUrl: stored.baseUrl,
+      model: stored.model,
+      apiKey: stored.apiKey,
+      temperature: stored.temperature,
+      maxTokens: stored.maxTokens,
+    })];
+  }
+  return [newProfile({ id: 'p_default', name: 'DeepSeek' })];
+}
+
+const DEFAULT_SUGGEST = { clarify: true, optimize: true, risk: true, test: false, a11y: false, max: 4, timing: 'round-end' };
+
 export function loadConfig(projectRoot) {
   const file = path.join(projectRoot, '.synthflow', 'config.json');
   const stored = readJsonSafe(file, {});
-  // 默认走真实模型（DeepSeek 预设只需再填一个 Key）；没有 Key 时界面会明确提示"未就绪"。
-  const provider = process.env.SYNTHFLOW_PROVIDER || stored.provider || 'deepseek';
+  const profiles = normalizeProfiles(stored);
+  const activeId = profiles.some((p) => p.id === stored.activeProfileId) ? stored.activeProfileId : profiles[0].id;
+  const active = profiles.find((p) => p.id === activeId) ?? profiles[0];
+
+  const provider = process.env.SYNTHFLOW_PROVIDER || active.provider || 'deepseek';
   const preset = PRESETS[provider] ?? PRESETS.custom;
   const apiKey =
     process.env.SYNTHFLOW_API_KEY ||
     (preset.envKey ? process.env[preset.envKey] : '') ||
-    stored.apiKey ||
+    active.apiKey ||
     '';
+
   return {
+    // —— 当前生效的模型（由 activeProfile 派生，兼容旧的顶层字段）——
     provider,
-    baseUrl: process.env.SYNTHFLOW_BASE_URL || stored.baseUrl || preset.baseUrl || '',
-    model: process.env.SYNTHFLOW_MODEL || stored.model || preset.model || '',
+    baseUrl: process.env.SYNTHFLOW_BASE_URL || active.baseUrl || preset.baseUrl || '',
+    model: process.env.SYNTHFLOW_MODEL || active.model || preset.model || '',
     apiKey,
-    temperature: Number(process.env.SYNTHFLOW_TEMPERATURE ?? stored.temperature ?? 0.3),
-    maxTokens: Number(process.env.SYNTHFLOW_MAX_TOKENS ?? stored.maxTokens ?? 4096),
-    // 预生成（想法 1/2）：打字停顿超过 specDelayMs 就先跑一遍"预演"。
-    // v2 起默认 1000ms：太短会导致还在逐字打的时候就反复起跑，既吵又费 token。
+    temperature: Number(active.temperature ?? 0.3),
+    maxTokens: Number(active.maxTokens ?? 4096),
+    profiles,
+    activeProfileId: activeId,
+
+    // —— 生成节奏 ——
     specDelayMs: Number(stored.specDelayMs ?? 1000),
     commitIdleMs: Number(stored.commitIdleMs ?? 900),
-    // 兜底：用户停手不打了但句子没以标点结尾时，停顿这么久也自动开工
     settleMs: Number(stored.settleMs ?? 1600),
     intentThreshold: Number(stored.intentThreshold ?? 0.6),
     autoCommit: stored.autoCommit !== false,
     autoAdoptHigh: stored.autoAdoptHigh === true,
     patchRetry: stored.patchRetry !== false,
+
+    // —— 版本保存（想法 2）——
+    saveMode: stored.saveMode === 'auto' ? 'auto' : 'confirm',
+
+    // —— 建议开关（想法 5）——
+    suggest: { ...DEFAULT_SUGGEST, ...(stored.suggest ?? {}) },
+
+    // —— 项目与写入 ——
+    projectDir: stored.projectDir || '',
+    writeMode: stored.writeMode === 'staging' ? 'staging' : stored.projectDir ? 'staging' : 'direct',
+    customInstructions: stored.customInstructions || '',
+
     port: Number(stored.port ?? 7788),
     open: stored.open === true,
-    file: file,
+    file,
     stored,
   };
 }
@@ -55,6 +111,17 @@ export function saveConfig(projectRoot, patch) {
   const file = path.join(projectRoot, '.synthflow', 'config.json');
   const cur = readJsonSafe(file, {});
   const next = { ...cur, ...patch };
+  // 保存配置档时，顺便把"当前生效模型"同步到旧的顶层字段，避免历史数据不一致
+  if (Array.isArray(next.profiles) && next.profiles.length) {
+    const active = next.profiles.find((p) => p.id === next.activeProfileId) ?? next.profiles[0];
+    next.activeProfileId = active.id;
+    next.provider = active.provider;
+    next.baseUrl = active.baseUrl;
+    next.model = active.model;
+    next.apiKey = active.apiKey;
+    next.temperature = active.temperature;
+    next.maxTokens = active.maxTokens;
+  }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
   return next;

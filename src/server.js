@@ -1,18 +1,22 @@
-// SynthFlow HTTP 服务：静态前端 + SSE 事件流 + REST 控制接口。
+// SynthFlow HTTP 服务：静态前端 + Monaco + SSE 事件流 + REST 控制接口。
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bytesToHuman, ensureDir, newId } from './util.js';
+import { bytesToHuman, ensureDir, newId, sha1 } from './util.js';
 import { Workspace } from './workspace.js';
 import { Session } from './session.js';
 import { RagIndex } from './rag.js';
 import { Memory } from './memory.js';
 import { Runner } from './runner.js';
-import { loadConfig, saveConfig, PRESETS } from './llm.js';
+import { scanStyle, styleStats } from './style.js';
+import { createProvider, loadConfig, saveConfig, newProfile, PRESETS } from './llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const MONACO_DIR = path.join(__dirname, '..', 'node_modules', 'monaco-editor');
+// 只服务 AMD 构建（min/vs），浏览器要的就是它；dev/esm 用不到，可用 clean.mjs --vendor 裁掉
+const MONACO_MIN = path.join(MONACO_DIR, 'min');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -24,6 +28,8 @@ const MIME = {
   '.png': 'image/png',
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
   '.map': 'application/json; charset=utf-8',
 };
 
@@ -43,43 +49,59 @@ export function parseArgs(argv = process.argv.slice(2)) {
   return args;
 }
 
+const slugOf = (dir) => `${path.basename(dir).replace(/[^\w-]/g, '') || 'project'}-${sha1(dir).slice(0, 8)}`;
+
+/**
+ * v3 把快照/会话/索引从 .synthflow/ 移到了 .synthflow/projects/<项目>/ 下（多项目互不污染）。
+ * 老用户的版本历史不能就这么丢，所以这里做一次性搬迁 —— 只针对默认 workspace，
+ * 避免把历史错误地挂到某个真实项目上。
+ */
+function migrateLegacyStore(globalStore, projectStore, isDefaultWorkspace) {
+  if (!isDefaultWorkspace) return [];
+  const pairs = [
+    ['snapshots', 'snapshots'],
+    ['sessions', 'sessions'],
+    ['history', 'history'],
+  ];
+  const moved = [];
+  for (const [from, to] of pairs) {
+    const src = path.join(globalStore, from);
+    const dest = path.join(projectStore, to);
+    if (fs.existsSync(src) && !fs.existsSync(dest)) {
+      try {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.renameSync(src, dest);
+        moved.push(from);
+      } catch { /* 跨盘等情况就放弃迁移，不影响使用 */ }
+    }
+  }
+  const idxSrc = path.join(globalStore, 'index.json');
+  const idxDest = path.join(projectStore, 'index.json');
+  if (fs.existsSync(idxSrc) && !fs.existsSync(idxDest)) {
+    try {
+      fs.renameSync(idxSrc, idxDest);
+      moved.push('index.json');
+    } catch { /* ignore */ }
+  }
+  return moved;
+}
+
 export function createServer({ projectRoot, port, host = '127.0.0.1', log = console.log, providerOverride, allowMock = false } = {}) {
   const root = path.resolve(projectRoot ?? path.join(__dirname, '..'));
-  const cfg = loadConfig(root);
+  const globalStore = path.join(root, '.synthflow');
+  ensureDir(globalStore);
+  ensureDir(path.join(globalStore, 'skills'));
+
+  let cfg = loadConfig(root);
   if (providerOverride) cfg.provider = providerOverride;
-  const workspaceDir = path.join(root, 'workspace');
-  ensureDir(workspaceDir);
-
-  const workspace = new Workspace(workspaceDir, { storeDir: path.join(root, '.synthflow') });
-  const memory = new Memory(workspace.storeDir);
-  const rag = new RagIndex(workspace);
-  rag.build();
-
-  // 会话：默认复用最近一次，方便用户刷新页面不丢上下文
-  const sessionsDir = path.join(workspace.storeDir, 'sessions');
-  let session = null;
-  const sessionFiles = fs.existsSync(sessionsDir) ? fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.json')) : [];
-  if (sessionFiles.length) {
-    const newest = sessionFiles
-      .map((f) => ({ f, m: fs.statSync(path.join(sessionsDir, f)).mtimeMs }))
-      .sort((a, b) => b.m - a.m)[0];
-    session = Session.load(path.join(sessionsDir, newest.f), { workspace, config: cfg });
-  }
-  if (!session) session = new Session({ id: newId('sess'), workspace, config: cfg });
+  const monacoAvailable = fs.existsSync(path.join(MONACO_DIR, 'min', 'vs', 'loader.js'));
 
   /* ----------------------------- SSE 广播 ----------------------------- */
   const clients = new Set();
   const throttle = new Map();
   let throttleTimer = null;
 
-  function flushThrottled() {
-    throttleTimer = null;
-    for (const [key, entry] of throttle) {
-      throttle.delete(key);
-      broadcast(entry.name, entry.payload, true);
-    }
-  }
-  function broadcast(name, payload, raw = false) {
+  function broadcast(name, payload) {
     const text = `event: ${name}\ndata: ${JSON.stringify(payload ?? null)}\n\n`;
     for (const res of clients) {
       try {
@@ -90,26 +112,92 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     }
   }
 
+  function flushThrottled() {
+    throttleTimer = null;
+    for (const [key, entry] of throttle) {
+      throttle.delete(key);
+      broadcast(entry.name, entry.payload);
+    }
+  }
+
   const THROTTLED = new Set(['think:delta', 'file:delta', 'run:text']);
-  const LAST_WINS = new Set(['intent']); // 高频状态类事件：只保留最后一次，避免界面抖动
+  const LAST_WINS = new Set(['intent']);
   function emit(name, payload) {
     if (THROTTLED.has(name)) {
       const key = `${name}:${payload?.path ?? ''}`;
       const cur = throttle.get(key);
       if (cur) cur.payload.delta += payload.delta ?? '';
-      else throttle.set(key, { name, payload: { ...payload }, mode: 'append' });
+      else throttle.set(key, { name, payload: { ...payload } });
       if (!throttleTimer) throttleTimer = setTimeout(flushThrottled, 45);
       return;
     }
     if (LAST_WINS.has(name)) {
-      throttle.set(name, { name, payload, mode: 'last' });
+      throttle.set(name, { name, payload });
       if (!throttleTimer) throttleTimer = setTimeout(flushThrottled, 90);
       return;
     }
     broadcast(name, payload);
   }
 
-  const runner = new Runner({ session, workspace, rag, memory, config: cfg, emit });
+  /* --------------------------- 服务容器（可重载） --------------------------- */
+  // 每个目标项目有独立的 snapshots / sessions / staging，避免切换项目时互相污染。
+  let svc = null;
+
+  function buildServices() {
+    const projectDir = cfg.projectDir ? path.resolve(cfg.projectDir) : path.join(root, 'workspace');
+    const slug = slugOf(projectDir);
+    const projectStore = path.join(globalStore, 'projects', slug);
+    const writeMode = cfg.writeMode === 'staging' ? 'staging' : 'direct';
+    const overlayDir = writeMode === 'staging' ? path.join(projectStore, 'staging') : projectDir;
+    ensureDir(projectStore);
+    const migrated = migrateLegacyStore(globalStore, projectStore, projectDir === path.join(root, 'workspace'));
+    if (migrated.length) log(`  [迁移] 已把旧的 ${migrated.join('、')} 搬到项目数据目录，历史版本不会丢`);
+
+    const workspace = new Workspace(projectDir, { storeDir: projectStore, overlayDir });
+    const memory = new Memory(globalStore);
+    const rag = new RagIndex(workspace, { skillsDir: path.join(globalStore, 'skills') });
+    rag.build();
+
+    const sessionsDir = path.join(projectStore, 'sessions');
+    let session = null;
+    if (fs.existsSync(sessionsDir)) {
+      const files = fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.json'));
+      if (files.length) {
+        const newest = files.map((f) => ({ f, m: fs.statSync(path.join(sessionsDir, f)).mtimeMs })).sort((a, b) => b.m - a.m)[0];
+        session = Session.load(path.join(sessionsDir, newest.f), { workspace, config: cfg });
+      }
+    }
+    if (!session) session = new Session({ id: newId('sess'), workspace, config: cfg, storeDir: sessionsDir });
+
+    const runner = new Runner({ session, workspace, rag, memory, config: cfg, emit });
+
+    // 记录项目登记表（供界面切换）
+    const registryFile = path.join(globalStore, 'projects.json');
+    let registry = { current: projectDir, list: [] };
+    try {
+      registry = JSON.parse(fs.readFileSync(registryFile, 'utf8').replace(/^\uFEFF/, ''));
+    } catch { /* 首次运行 */ }
+    registry.current = projectDir;
+    registry.list = [{ dir: projectDir, slug, name: path.basename(projectDir), mode: writeMode, lastUsed: new Date().toISOString() },
+      ...(registry.list ?? []).filter((p) => p.dir !== projectDir)].slice(0, 12);
+    fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    return { projectDir, projectStore, writeMode, overlayDir, workspace, memory, rag, session, runner, registry };
+  }
+
+  svc = buildServices();
+
+  function reloadServices() {
+    cfg = loadConfig(root);
+    if (providerOverride) cfg.provider = providerOverride;
+    svc = buildServices();
+    broadcast('state', svc.runner.snapshot());
+    broadcast('tree', { tree: svc.workspace.listTree() });
+    broadcast('versions', svc.session.versionList());
+    broadcast('timeline', { timeline: svc.session.timeline });
+    broadcast('pending', { items: svc.workspace.pending(), staging: svc.workspace.staging });
+    return svc;
+  }
 
   /* ------------------------------ 路由 ------------------------------ */
   const server = http.createServer(async (req, res) => {
@@ -123,10 +211,12 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         connection: 'keep-alive',
         'x-accel-buffering': 'no',
       });
-      res.write(`retry: 1500\n\n`);
+      res.write('retry: 1500\n\n');
       clients.add(res);
-      res.write(`event: hello\ndata: ${JSON.stringify({ at: Date.now(), provider: runner.provider.name, ready: runner.provider.ready })}\n\n`);
-      broadcast('state', runner.snapshot());
+      res.write(`event: hello\ndata: ${JSON.stringify({ at: Date.now(), provider: svc.runner.provider.name, ready: svc.runner.provider.ready, monaco: monacoAvailable })}\n\n`);
+      broadcast('state', svc.runner.snapshot());
+      broadcast('timeline', { timeline: svc.session.timeline });
+      broadcast('pending', { items: svc.workspace.pending(), staging: svc.workspace.staging });
       const ping = setInterval(() => {
         try {
           res.write(': ping\n\n');
@@ -136,6 +226,11 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         clearInterval(ping);
         clients.delete(res);
       });
+      return;
+    }
+
+    if (route.startsWith('/vendor/monaco/')) {
+      serveMonaco(route, res);
       return;
     }
 
@@ -154,28 +249,44 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
 
   async function handleApi(route, req, res, url) {
     const body = req.method === 'POST' ? await readBody(req) : {};
+    const { runner, session, workspace, rag, memory } = svc;
+
     switch (route) {
       case '/api/health':
-        return { ok: true, at: Date.now(), uptime: process.uptime(), pid: process.pid, projectRoot: root, workspace: workspaceDir };
+        return {
+          ok: true,
+          at: Date.now(),
+          uptime: process.uptime(),
+          pid: process.pid,
+          projectRoot: root,
+          projectDir: svc.projectDir,
+          workspace: svc.projectDir, // 兼容旧字段名
+          staging: workspace.staging,
+          monaco: monacoAvailable,
+        };
 
       case '/api/state':
         return {
           ...runner.snapshot(),
-          // runner.snapshot().config 只有生成参数；这里补上完整的公开配置（含 apiKeySet / patchRetry），
-          // 否则设置面板拿不到 baseUrl、也判断不出 Key 是否已保存。
           config: { ...runner.snapshot().config, ...publicConfig(cfg) },
-          presets: Object.fromEntries(
-            Object.entries(PRESETS)
-              .filter(([k, v]) => !v.hidden || allowMock || k === cfg.provider)
-              .map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, model: v.model, needsKey: v.needsKey }]),
-          ),
-          paths: { projectRoot: root, workspace: workspaceDir, store: workspace.storeDir, public: PUBLIC_DIR },
+          presets: visiblePresets(),
+          paths: {
+            projectRoot: root,
+            projectDir: svc.projectDir,
+            workspace: svc.projectDir,
+            store: globalStore,
+            projectStore: svc.projectStore,
+            public: PUBLIC_DIR,
+          },
+          monaco: monacoAvailable,
+          projects: svc.registry,
+          profiles: maskedProfiles(),
+          activeProfileId: cfg.activeProfileId,
         };
 
-      case '/api/input': {
+      case '/api/input':
         runner.onInput({ text: body.text ?? '', idleMs: body.idleMs ?? 0 });
         return { ok: true };
-      }
 
       case '/api/commit':
         return runner.commit({ reason: body.reason ?? 'manual', force: Boolean(body.force) });
@@ -189,14 +300,46 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       case '/api/forward':
         return runner.moveVersion('forward');
 
+      case '/api/version/confirm':
+        return runner.confirmVersion(body.versionId);
+
+      case '/api/version/discard':
+        return runner.discardVersion(body.versionId);
+
       case '/api/adopt':
         return runner.adopt(body.suggestion);
 
       case '/api/dismiss':
         return runner.dismiss(body.suggestion);
 
+      case '/api/selection':
+        return runner.setSelection(body.selection ?? null);
+
       case '/api/tree':
-        return { tree: workspace.listTree(), files: workspace.listFiles(), bytes: workspace.totalBytes(), human: bytesToHuman(workspace.totalBytes()) };
+        return {
+          tree: workspace.listTree(),
+          files: workspace.listFiles(),
+          bytes: workspace.totalBytes(),
+          human: bytesToHuman(workspace.totalBytes()),
+          staging: workspace.staging,
+          projectDir: svc.projectDir,
+        };
+
+      case '/api/timeline':
+        return {
+          timeline: session.timeline ?? [],
+          manualEdits: (session.manualEdits ?? []).map((m) => ({ path: m.path, count: m.count, at: m.at })),
+          restoredFrom: 'session',
+        };
+
+      case '/api/pending':
+        return { items: workspace.pending(), staging: workspace.staging, projectDir: svc.projectDir, writeMode: svc.writeMode };
+
+      case '/api/apply':
+        return runner.applyPending();
+
+      case '/api/discard':
+        return runner.discardPending();
 
       case '/api/file': {
         const rel = url.searchParams.get('path') ?? body.path;
@@ -206,11 +349,35 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
           e.status = 404;
           throw e;
         }
-        return file;
+        return { ...file, staged: workspace.staging ? workspace.stagedAbsolute(file.rel) : false };
       }
 
-      case '/api/save':
+      case '/api/save': {
         return runner.writeFile(body.path, body.content ?? '');
+      }
+
+      case '/api/compare': {
+        const rel = url.searchParams.get('path') ?? body.path;
+        const from = url.searchParams.get('from') ?? body.from;
+        const v = session.versions.find((x) => x.id === from);
+        if (!v) {
+          const e = new Error(`版本不存在: ${from}`);
+          e.status = 404;
+          throw e;
+        }
+        const oldText = workspace.readFromSnapshot(v.snapshotId, rel);
+        const now = workspace.read(rel);
+        const { diffLines, compactDiff } = await import('./util.js');
+        const diff = diffLines(oldText ?? '', now?.content ?? '');
+        return {
+          path: rel,
+          from: v.id,
+          fromExists: oldText !== null,
+          nowExists: Boolean(now),
+          compact: compactDiff(diff),
+          stat: { added: diff.filter((d) => d.type === 'ins').length, removed: diff.filter((d) => d.type === 'del').length },
+        };
+      }
 
       case '/api/versions':
         return { ...session.versionList(), segments: session.segments.slice(-80) };
@@ -221,27 +388,61 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       case '/api/memory':
         return memory.summary();
 
+      case '/api/style': {
+        if (req.method === 'POST') {
+          const data = scanStyle(workspace, { force: true });
+          broadcast('toast', { level: 'ok', message: `已重新扫描项目风格（${data.scanned} 个文件）` });
+          return { ok: true, style: data };
+        }
+        return { style: styleStats(workspace) ?? scanStyle(workspace) };
+      }
+
       case '/api/rag': {
         const q = url.searchParams.get('q') ?? body.q ?? '';
-        return { query: q, hits: rag.search(q, { k: 6 }), stats: rag.stats(), skills: rag.skills().map((s) => ({ name: s.name, description: s.description, triggers: s.triggers })) };
+        return {
+          query: q,
+          hits: rag.search(q, { k: 6 }),
+          stats: rag.stats(),
+          skills: rag.skills().map((s) => ({ name: s.name, description: s.description, triggers: s.triggers, file: s.file })),
+        };
       }
+
+      case '/api/rag/rebuild':
+        rag.build({ force: true });
+        return { ok: true, stats: rag.stats() };
+
+      case '/api/skills': {
+        if (req.method === 'POST') return saveSkill(body);
+        return { skills: skillList() };
+      }
+
+      case '/api/skills/delete':
+        return deleteSkill(body.name);
+
+      case '/api/profiles': {
+        if (req.method === 'POST') return upsertProfile(body);
+        return { profiles: maskedProfiles(), activeProfileId: cfg.activeProfileId };
+      }
+
+      case '/api/profiles/activate':
+        return activateProfile(body.id);
+
+      case '/api/profiles/delete':
+        return deleteProfile(body.id);
+
+      case '/api/project':
+        return setProject(body);
 
       case '/api/config': {
         if (req.method === 'POST') {
-          const saved = saveConfig(root, body);
-          Object.assign(cfg, loadConfig(root), saved.port ? { port: Number(saved.port) } : {});
-          runner.provider = (await import('./llm.js')).createProvider(cfg);
-          runner.config = cfg;
-          broadcast('state', runner.snapshot());
-          broadcast('toast', { level: 'ok', message: `模型配置已更新：${runner.provider.label}${runner.provider.ready ? '' : `（${runner.provider.note}）`}` });
-          return { ok: true, config: publicConfig(cfg), provider: { name: runner.provider.name, ready: runner.provider.ready, note: runner.provider.note } };
+          saveConfig(root, body);
+          reloadServices();
+          const p = svc.runner.provider;
+          broadcast('toast', { level: 'ok', message: `设置已更新：${p.label}${p.ready ? '' : `（${p.note}）`}` });
+          return { ok: true, config: publicConfig(cfg), provider: { name: p.name, label: p.label, ready: p.ready, note: p.note } };
         }
         return { config: publicConfig(cfg), file: cfg.file };
       }
-
-      case '/api/reindex':
-        rag.build({ force: true });
-        return { ok: true, stats: rag.stats() };
 
       default: {
         const e = new Error(`未知接口: ${route}`);
@@ -249,6 +450,156 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         throw e;
       }
     }
+  }
+
+  /* --------------------------- 技能 / 配置档 / 项目 --------------------------- */
+
+  function skillsDir() {
+    return path.join(globalStore, 'skills');
+  }
+
+  function skillList() {
+    return svc.rag.skills().map((s) => ({
+      name: s.name,
+      description: s.description,
+      triggers: s.triggers,
+      body: s.body,
+      file: s.file,
+    }));
+  }
+
+  function saveSkill(body) {
+    const name = String(body.name ?? '').trim();
+    if (!name) throw Object.assign(new Error('技能名不能为空'), { status: 400 });
+    const slug = name.replace(/[^\w\u4e00-\u9fff-]/g, '_').slice(0, 60);
+    const triggers = Array.isArray(body.triggers) ? body.triggers : String(body.triggers ?? '').split(/[,，;；]/).map((s) => s.trim()).filter(Boolean);
+    const content = [
+      '---',
+      `name: ${name}`,
+      `description: ${String(body.description ?? '').replace(/\n/g, ' ')}`,
+      `triggers: ${triggers.join(', ')}`,
+      '---',
+      '',
+      String(body.body ?? ''),
+      '',
+    ].join('\n');
+    const file = path.join(skillsDir(), `${slug}.md`);
+    ensureDir(skillsDir());
+    fs.writeFileSync(file, content, 'utf8');
+    svc.rag.build({ force: true });
+    return { ok: true, file: `${slug}.md`, skills: skillList() };
+  }
+
+  function deleteSkill(name) {
+    const target = svc.rag.skills().find((s) => s.name === name || s.file === name);
+    if (!target) throw Object.assign(new Error(`技能不存在: ${name}`), { status: 404 });
+    fs.rmSync(path.join(skillsDir(), target.file), { force: true });
+    svc.rag.build({ force: true });
+    return { ok: true, skills: skillList() };
+  }
+
+  function maskedProfiles() {
+    return (cfg.profiles ?? []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      provider: p.provider,
+      baseUrl: p.baseUrl,
+      model: p.model,
+      temperature: p.temperature,
+      maxTokens: p.maxTokens,
+      apiKeySet: Boolean(p.apiKey) || Boolean(PRESETS[p.provider]?.needsKey === false),
+      apiKeyHint: p.apiKey ? `${p.apiKey.slice(0, 3)}…${p.apiKey.slice(-4)}` : '',
+    }));
+  }
+
+  function upsertProfile(body) {
+    const list = [...(cfg.profiles ?? [])];
+    const id = body.id || body.profile?.id;
+    const idx = id ? list.findIndex((p) => p.id === id) : -1;
+    const incoming = body.profile ?? body;
+    if (idx >= 0) {
+      const cur = list[idx];
+      const next = { ...cur, ...incoming };
+      // 没填 Key 就保留原来的，避免误清空
+      if (!incoming.apiKey) next.apiKey = cur.apiKey;
+      if (incoming.provider && incoming.provider !== cur.provider) {
+        const preset = PRESETS[incoming.provider] ?? PRESETS.custom;
+        if (!incoming.baseUrl) next.baseUrl = preset.baseUrl ?? '';
+        if (!incoming.model) next.model = preset.model ?? '';
+      }
+      list[idx] = next;
+    } else {
+      list.push(newProfile(incoming));
+    }
+    saveConfig(root, { profiles: list, activeProfileId: body.activate ? (list[idx >= 0 ? idx : list.length - 1].id) : cfg.activeProfileId });
+    reloadServices();
+    return { ok: true, profiles: maskedProfiles(), activeProfileId: cfg.activeProfileId };
+  }
+
+  function activateProfile(id) {
+    if (!(cfg.profiles ?? []).some((p) => p.id === id)) throw Object.assign(new Error(`配置不存在: ${id}`), { status: 404 });
+    saveConfig(root, { activeProfileId: id });
+    reloadServices();
+    const p = svc.runner.provider;
+    broadcast('toast', { level: 'ok', message: `已切换到 ${p.label} · ${cfg.model}${p.ready ? '' : `（${p.note}）`}` });
+    return { ok: true, activeProfileId: id, provider: { name: p.name, label: p.label, ready: p.ready, note: p.note, model: cfg.model } };
+  }
+
+  function deleteProfile(id) {
+    const list = (cfg.profiles ?? []).filter((p) => p.id !== id);
+    if (!list.length) throw Object.assign(new Error('至少要保留一个配置'), { status: 400 });
+    const activeProfileId = cfg.activeProfileId === id ? list[0].id : cfg.activeProfileId;
+    saveConfig(root, { profiles: list, activeProfileId });
+    reloadServices();
+    return { ok: true, profiles: maskedProfiles(), activeProfileId };
+  }
+
+  function setProject(body) {
+    const dir = String(body.dir ?? '').trim();
+    const mode = body.mode === 'staging' ? 'staging' : 'direct';
+    if (dir) {
+      const abs = path.resolve(dir);
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+        throw Object.assign(new Error(`目录不存在: ${abs}`), { status: 400 });
+      }
+      saveConfig(root, { projectDir: abs, writeMode: mode });
+    } else {
+      saveConfig(root, { projectDir: '', writeMode: 'direct' });
+    }
+    reloadServices();
+    broadcast('toast', {
+      level: 'ok',
+      message: dir ? `已切换到项目目录：${svc.projectDir}（${svc.writeMode === 'staging' ? '暂存模式，改动需确认后应用' : '直接写入'}）` : '已切回默认 workspace 目录',
+    });
+    return { ok: true, projectDir: svc.projectDir, writeMode: svc.writeMode, staging: svc.workspace.staging };
+  }
+
+  function visiblePresets() {
+    return Object.fromEntries(
+      Object.entries(PRESETS)
+        .filter(([k, v]) => !v.hidden || allowMock || k === cfg.provider)
+        .map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, model: v.model, needsKey: v.needsKey }]),
+    );
+  }
+
+  /* ------------------------------ 静态资源 ------------------------------ */
+
+  function serveMonaco(route, res) {
+    const rel = route.replace(/^\/vendor\/monaco\/?/, '');
+    let file = path.resolve(MONACO_MIN, rel);
+    if (!file.startsWith(MONACO_MIN)) {
+      res.writeHead(403).end('forbidden');
+      return;
+    }
+    if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+      res.writeHead(404).end('not found');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
+      'cache-control': 'public, max-age=86400',
+    });
+    fs.createReadStream(file).pipe(res);
   }
 
   function serveStatic(route, res) {
@@ -259,7 +610,6 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       return;
     }
     if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      // SPA 兜底
       const fallback = path.join(PUBLIC_DIR, 'index.html');
       if (fs.existsSync(fallback)) file = fallback;
       else {
@@ -273,14 +623,32 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
 
   return {
     server,
-    runner,
-    session,
-    workspace,
-    rag,
-    memory,
-    config: cfg,
+    get runner() {
+      return svc.runner;
+    },
+    get session() {
+      return svc.session;
+    },
+    get workspace() {
+      return svc.workspace;
+    },
+    get rag() {
+      return svc.rag;
+    },
+    get memory() {
+      return svc.memory;
+    },
+    get config() {
+      return cfg;
+    },
     projectRoot: root,
-    workspaceDir,
+    get projectDir() {
+      return svc.projectDir;
+    },
+    get workspaceDir() {
+      return svc.projectDir;
+    },
+    reloadServices,
     listen() {
       return new Promise((resolve, reject) => {
         const onError = (err) => {
@@ -328,6 +696,11 @@ function publicConfig(cfg) {
     autoCommit: cfg.autoCommit,
     autoAdoptHigh: Boolean(cfg.autoAdoptHigh),
     patchRetry: cfg.patchRetry !== false,
+    saveMode: cfg.saveMode ?? 'confirm',
+    suggest: cfg.suggest,
+    customInstructions: cfg.customInstructions ?? '',
+    projectDir: cfg.projectDir ?? '',
+    writeMode: cfg.writeMode ?? 'direct',
   };
 }
 
@@ -342,7 +715,7 @@ function readBody(req) {
     let data = '';
     req.on('data', (c) => {
       data += c;
-      if (data.length > 8 * 1024 * 1024) reject(new Error('请求体过大'));
+      if (data.length > 16 * 1024 * 1024) reject(new Error('请求体过大'));
     });
     req.on('end', () => {
       if (!data) return resolve({});
@@ -377,8 +750,10 @@ if (isMain) {
   console.log('  └────────────────────────────────────────────────────────┘');
   console.log(`  界面地址   ${url}`);
   console.log(`  项目根目录 ${app.projectRoot}`);
-  console.log(`  代码输出   ${app.workspaceDir}   (${app.workspace.listFiles().length} 个文件 / ${bytesToHuman(app.workspace.totalBytes())})`);
+  console.log(`  目标项目   ${app.projectDir}${app.workspace.staging ? '   [暂存模式：改动需确认后应用]' : '   [直接写入]'}`);
+  console.log(`  目标项目文件数 ${app.workspace.listFiles().length} / ${bytesToHuman(app.workspace.totalBytes())}`);
   console.log(`  本地数据   ${path.join(app.projectRoot, '.synthflow')}`);
+  console.log(`  编辑器     ${fs.existsSync(MONACO_DIR) ? 'Monaco（VS Code 内核）' : '未安装 monaco-editor，将降级为只读高亮'}`);
   console.log(`  模型       ${app.runner.provider.label} · ${cfg.model || '(未设置)'} · ${app.runner.provider.ready ? '就绪' : '未就绪'}`);
   if (!app.runner.provider.ready) console.log(`             ${app.runner.provider.note}`);
   console.log('  停止服务   Ctrl + C');

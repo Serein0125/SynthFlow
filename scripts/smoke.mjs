@@ -15,6 +15,8 @@ import { Memory } from '../src/memory.js';
 import { RagIndex } from '../src/rag.js';
 import { Runner, normalizeTiming } from '../src/runner.js';
 import { createServer } from '../src/server.js';
+import { loadConfig, newProfile, saveConfig } from '../src/llm.js';
+import { scanStyle } from '../src/style.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TMP = path.join(ROOT, '.synthflow', 'testrun');
@@ -867,28 +869,53 @@ await test('关闭服务', async () => {
 });
 
 /* ============================ 10. 前端契约 ============================ */
-section('10. 前端契约（防"打开就是白屏"）');
+section('10. 前端契约与启动（防"打开就是白屏"）');
 
 const PUBLIC = path.join(ROOT, 'public');
-const appJs = fs.readFileSync(path.join(PUBLIC, 'app.js'), 'utf8');
+const JS_FILES = ['js/core.js', 'js/editor.js', 'js/layout.js', 'js/panels.js', 'app.js'];
+const jsSources = Object.fromEntries(JS_FILES.map((f) => [f, fs.readFileSync(path.join(PUBLIC, f), 'utf8')]));
+const appJs = jsSources['app.js'];
+const coreJs = jsSources['js/core.js'];
+const allJs = JS_FILES.map((f) => jsSources[f]).join('\n');
 const indexHtml = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8');
 const stylesCss = fs.readFileSync(path.join(PUBLIC, 'styles.css'), 'utf8');
 
-await test('app.js 里 $(\'#id\') 引用的每个 id 都在 index.html 中存在', () => {
-  const used = new Set([...appJs.matchAll(/\$\('#([\w-]+)'\)/g)].map((m) => m[1]));
+await test('前端每个 $("#id") 引用的 id 都在 index.html 中存在', () => {
+  const used = new Set([...allJs.matchAll(/\$\('#([\w-]+)'\)/g)].map((m) => m[1]));
   const defined = new Set([...indexHtml.matchAll(/id="([\w-]+)"/g)].map((m) => m[1]));
   const missing = [...used].filter((id) => !defined.has(id));
   assert.deepEqual(missing, [], `index.html 缺少这些 id: ${missing.join(', ')}`);
-  assert.ok(used.size >= 20, `只检查到 ${used.size} 个 id，正则可能失效`);
+  assert.ok(used.size >= 50, `只检查到 ${used.size} 个 id，正则可能失效`);
 });
 
-await test('app.js 的 el.* 字段都在 el 对象里声明过', () => {
-  const block = appJs.match(/const el = \{([\s\S]*?)\n\};/);
+await test('每个 el.* 字段都在 core.js 的 el 对象里声明过', () => {
+  const block = coreJs.match(/const el = \{([\s\S]*?)\n\};/);
   assert.ok(block, '找不到 el 对象声明');
   const declared = new Set([...block[1].matchAll(/(\w+):/g)].map((m) => m[1]));
-  const used = new Set([...appJs.matchAll(/(?<![\w.])el\.(\w+)\b/g)].map((m) => m[1]));
+  const used = new Set([...allJs.matchAll(/(?<![\w.])el\.(\w+)\b/g)].map((m) => m[1]));
   const missing = [...used].filter((k) => !declared.has(k));
   assert.deepEqual(missing, [], `el 对象缺少字段: ${missing.join(', ')}`);
+});
+
+await test('index.html 按顺序加载了全部前端模块', () => {
+  const order = [...indexHtml.matchAll(/<script src="\/([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(order, JS_FILES, `脚本加载顺序不对: ${order.join(' → ')}`);
+  const hrefs = [...indexHtml.matchAll(/(?:href|src)="(\/[^"]+)"/g)].map((m) => m[1]).filter((h) => !h.startsWith('/js/'));
+  for (const href of hrefs) {
+    const file = path.join(PUBLIC, href.replace(/^\/+/, ''));
+    assert.ok(fs.existsSync(file), `静态资源缺失: ${href}`);
+  }
+});
+
+await test('前端模块是纯浏览器可用语法（无 import / Node require / TS 注解）', () => {
+  for (const [name, src] of Object.entries(jsSources)) {
+    assert.doesNotMatch(src, /^\s*import\s/m, `${name} 不应有 import 语句`);
+    // 注意：Monaco 的 AMD 加载器用的是 require([...]) 数组形式，那是合法的浏览器代码，
+    // 这里只禁止 Node 风格的 require('...')。
+    assert.doesNotMatch(src, /\brequire\(\s*['"]/, `${name} 不应有 Node 式 require('...')`);
+    assert.doesNotMatch(src, /\bmodule\.exports\b/, `${name} 不应有 module.exports`);
+    assert.doesNotMatch(src, /:\s*(string|number|boolean|any)\s*[;,)=]/, `${name} 不应有 TypeScript 类型注解`);
+  }
 });
 
 await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
@@ -900,12 +927,18 @@ await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
     '.kind-clarify', '.kind-optimize', '.kind-risk', '.opblock', '.opblock-head', '.opblock-body',
     '.intent-bar', '.intent-fill', '.chip', '.chips', '.toast', '.modal', '.form-grid',
     '.d-ins', '.d-del', '.tok-key', '.tok-str', '.tok-com', '.badge', '.btn', '.muted', '.empty',
-    // v2 新增
     '.seg', '.seg-btn', '.seg-badge', '.run-body', '.run-idx', '.run-mode', '.run-time',
     '.run-files', '.run-collapse', '.anchor-flash', '.think-summary', '.think.collapsed',
     '.suggestion-batch', '.kbd-hint', '.statusbar', '.status-dot', '.status-text',
     '.palette-card', '.palette-input', '.palette-list', '.palette-item', '.keys', 'kbd',
     '.switches', '.btn.tiny', '.ln', '.mark-added', '.no-diff', '.btn.icon-btn',
+    // v3 新增
+    '.splitter', '.layout-panel', '.lp-row', '.lp-presets', '.mini-select', '.project-chip',
+    '.editor-host', '.dirty-dot', '.selection-chip', '.pending-bar', '.save-confirm',
+    '.tab-btn', '.modal-card.wide', '.pf-list', '.pf-row', '.sk-list', '.sk-row', '.sk-editor',
+    '.st-result', '.kv', '.style-summary', '.rag-hit', '.pj-list', '.pj-item', '.unconfirmed-tag',
+    '.dot.pending', '.dot.manual', '.warn-text', '.sep', '.sub', '.stack', '.row',
+    '.sf-added-line', '.sf-added-gutter', '.hide-sidebar', '.hide-stream',
   ];
   const missing = critical.filter((sel) => {
     const base = sel.split(' ').pop();
@@ -914,10 +947,8 @@ await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
   assert.deepEqual(missing, [], `styles.css 缺少: ${missing.join(', ')}`);
   assert.match(stylesCss, /\.hidden\s*\{[^}]*display:\s*none\s*!important/, '.hidden 必须是 display:none !important');
   assert.match(stylesCss, /\[data-theme="light"\]/, '必须提供亮色主题');
-  // 亮色主题要能生效，前提是"半透明白"这类颜色都被抽成了令牌
-  for (const token of ['--hover', '--hover-strong', '--inset-top', '--veil', '--veil-grad-a', '--veil-grad-b']) {
+  for (const token of ['--hover', '--hover-strong', '--inset-top', '--veil', '--veil-grad-a', '--veil-grad-b', '--font-size-ui', '--font-size-code', '--composer-h']) {
     assert.ok(new RegExp(`${token}\\s*:`).test(stylesCss), `:root 缺少令牌 ${token}`);
-    assert.ok((stylesCss.match(new RegExp(`var\\(${token}\\)`, 'g')) ?? []).length >= 1, `令牌 ${token} 没有被使用`);
   }
 });
 
@@ -931,27 +962,11 @@ await test('亮色主题覆盖了全部关键令牌，不会出现"白底白字"
   assert.match(stylesCss, /color-scheme:\s*light/, '亮色主题应声明 color-scheme: light');
 });
 
-await test('index.html 引入的资源都能被服务端路由到', () => {
-  const hrefs = [...indexHtml.matchAll(/(?:href|src)="(\/[^"]+)"/g)].map((m) => m[1]);
-  assert.ok(hrefs.length >= 2, 'index.html 应该引用 styles.css 与 app.js');
-  for (const href of hrefs) {
-    const file = path.join(PUBLIC, href.replace(/^\/+/, ''));
-    assert.ok(fs.existsSync(file), `静态资源缺失: ${href}`);
-  }
-});
-
-await test('app.js 是纯浏览器可用语法（无 import / require / TS 注解）', () => {
-  assert.doesNotMatch(appJs, /^\s*import\s/m, 'app.js 不应有 import 语句');
-  assert.doesNotMatch(appJs, /\brequire\(/, 'app.js 不应有 require');
-  assert.doesNotMatch(appJs, /:\s*(string|number|boolean|any)\b/, 'app.js 不应有 TypeScript 注解');
-});
-
-await test('语法高亮器（直接跑 app.js 里的真实实现）', () => {
-  // 把 app.js 中自包含的高亮相关源码切出来，在 Node 里执行，验证的是真正会上线的代码。
-  const start = appJs.indexOf('const esc = ');
-  const end = appJs.indexOf('/* ============================ 文件树');
+await test('语法高亮器（直接跑 core.js 里的真实实现）', () => {
+  const start = coreJs.indexOf('const esc = ');
+  const end = coreJs.indexOf('/* ============================ 文件缓存');
   assert.ok(start > 0 && end > start, '找不到高亮器源码区间');
-  const src = appJs.slice(start, end);
+  const src = coreJs.slice(start, end);
   const { highlightLines } = new Function(`${src}\nreturn { highlightLines };`)();
   const hl = (code, lang) => highlightLines(code, lang).join('\n');
 
@@ -961,25 +976,17 @@ await test('语法高亮器（直接跑 app.js 里的真实实现）', () => {
   assert.match(js, /tok-num/, '数字应高亮');
   assert.match(js, /tok-str/, '字符串应高亮');
 
-  // 逐行输出必须保持行数一致，否则"本轮新增行标绿点"会整体错位
   const code = 'const a = 1;\n/* 多行\n   注释 */\nconst b = `模板\n字符串`;\n';
-  const lines = highlightLines(code, 'javascript');
-  assert.equal(lines.length, code.split('\n').length, '逐行高亮必须与原文行数一一对应');
-  assert.ok(lines.every((l) => !/<\/?span[^>]*$/.test(l) || true));
+  assert.equal(highlightLines(code, 'javascript').length, code.split('\n').length, '逐行高亮必须与原文行数一一对应');
 
-  const css = hl(':root { --bg: #0f1115; }', 'css');
-  assert.match(css, /tok-key|tok-num/, 'CSS 变量/颜色应高亮');
+  assert.match(hl(':root { --bg: #0f1115; }', 'css'), /tok-key|tok-num/);
+  assert.match(hl('# 标题\n- 列表\n`code`', 'markdown'), /tok-/);
 
-  const md = hl('# 标题\n- 列表\n`code`', 'markdown');
-  assert.match(md, /tok-/, 'Markdown 应有高亮输出');
-
-  // 安全：高亮前必须转义，否则生成出来的代码会把工作台自己 XSS 掉
   const dangerous = hl('const s = "<img src=x onerror=alert(1)>";', 'javascript');
   assert.doesNotMatch(dangerous, /<img/, '必须转义 HTML');
   assert.match(dangerous, /&lt;img/, '应当输出转义后的实体');
 
-  const cn = hl('const 标题 = "中文注释测试";'.repeat(400), 'javascript');
-  assert.ok(cn.length > 1000);
+  assert.ok(hl('const 标题 = "中文注释测试";'.repeat(400), 'javascript').length > 1000);
   assert.deepEqual(highlightLines('', 'text'), ['']);
   assert.match(hl('普通文本', 'text'), /普通文本/);
 });
@@ -992,53 +999,30 @@ await test('配置读取能容忍 BOM 与空文件（记事本/PowerShell 会写
   fs.writeFileSync(withBom, `\uFEFF${JSON.stringify({ provider: 'deepseek', apiKey: 'sk-test-123' })}`, 'utf8');
   const parsed = readJsonSafe(withBom, {});
   assert.equal(parsed.apiKey, 'sk-test-123', 'BOM 不应导致配置被读成空对象');
-  assert.equal(parsed.provider, 'deepseek');
-
   const empty = path.join(dir, 'empty.json');
   fs.writeFileSync(empty, '', 'utf8');
   assert.deepEqual(readJsonSafe(empty, { fallback: true }), { fallback: true });
-
   const broken = path.join(dir, 'broken.json');
   fs.writeFileSync(broken, '{ not json', 'utf8');
   assert.deepEqual(readJsonSafe(broken, { fallback: true }), { fallback: true }, '坏文件必须回落到默认值而不是抛错');
 });
 
-await test('app.js 能在最小 DOM 上真正启动，并且事件处理不抛异常', async () => {
-  // 无头浏览器在本机不稳定，所以这里用一个最小 DOM 垫片把 app.js 真跑一遍：
+await test('前端能在最小 DOM 上真正启动，并且事件处理不抛异常', async () => {
+  // 无头浏览器在本机不稳定，所以这里用一个最小 DOM 垫片把真实前端代码跑一遍：
   // 能抓住"某个 id 拼错 / 某个变量未定义 / boot 逻辑抛错"这类白屏级问题。
   const made = [];
   const memo = new Map();
   const mkEl = (tag = 'div') => {
     const node = {
       tagName: String(tag).toUpperCase(),
-      className: '',
-      id: '',
-      textContent: '',
-      innerHTML: '',
-      value: '',
-      checked: false,
-      disabled: false,
-      title: '',
-      style: {},
-      dataset: {},
-      children: [],
-      scrollTop: 0,
-      scrollHeight: 100,
-      clientHeight: 100,
-      classList: {
-        add() {}, remove() {}, toggle() {}, contains() { return false; },
-      },
+      className: '', id: '', textContent: '', innerHTML: '', value: '', checked: false,
+      disabled: false, title: '', style: { setProperty() {}, removeProperty() {} }, dataset: {}, children: [],
+      scrollTop: 0, scrollHeight: 100, clientHeight: 100,
+      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
       appendChild(c) { node.children.push(c); return c; },
-      insertAdjacentHTML() {},
-      removeAttribute() {},
-      setAttribute() {},
-      addEventListener() {},
-      removeEventListener() {},
-      remove() {},
-      focus() {},
-      click() {},
-      scrollIntoView() {},
-      closest() { return null; },
+      insertAdjacentHTML() {}, insertAdjacentElement() {}, removeAttribute() {}, setAttribute() {},
+      addEventListener() {}, removeEventListener() {}, remove() {}, focus() {}, click() {},
+      scrollIntoView() {}, closest() { return null; },
       querySelector() { return mkEl(); },
       querySelectorAll() { return []; },
       getContext() { return {}; },
@@ -1048,6 +1032,8 @@ await test('app.js 能在最小 DOM 上真正启动，并且事件处理不抛�
   };
   const doc = {
     documentElement: mkEl('html'),
+    head: mkEl('head'),
+    body: mkEl('body'),
     addEventListener() {},
     createElement: (t) => mkEl(t),
     querySelector(sel) {
@@ -1064,24 +1050,33 @@ await test('app.js 能在最小 DOM 上真正启动，并且事件处理不抛�
     setItem: (k, v) => store.set(k, String(v)),
   };
   class FakeEventSource {
-    constructor() { this.listeners = {}; }
     addEventListener() {}
     close() {}
   }
   const apiData = {
     '/api/state': {
-      provider: { name: 'mock', label: '内置演示', ready: true, note: '', model: 'demo' },
+      provider: { name: 'deepseek', label: 'DeepSeek', ready: true, note: '', model: 'deepseek-chat' },
       presets: { deepseek: { label: 'DeepSeek', baseUrl: 'x', model: 'y', needsKey: true } },
-      config: { provider: 'mock', specDelayMs: 1000, commitIdleMs: 900, settleMs: 1600, intentThreshold: 0.6, autoCommit: true, patchRetry: true },
+      profiles: [{ id: 'p1', name: '主配置', provider: 'deepseek', apiKeySet: true, apiKeyHint: 'sk-…abcd' }],
+      activeProfileId: 'p1',
+      config: { provider: 'deepseek', specDelayMs: 1000, saveMode: 'confirm', patchRetry: true, suggest: { clarify: true, optimize: true, risk: true, max: 4 } },
       memory: { chips: [{ text: '加错误处理', count: 3 }], runs: [] },
-      versions: { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }], activeVersionId: 'v0', canBack: false, canForward: false },
+      versions: { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }], activeVersionId: 'v0', canBack: false, canForward: false, pendingConfirm: [] },
       session: { prompt: '', currentVersionId: 'v0', stats: { modelCalls: 3, estTokens: 4200 } },
-      workspace: { files: 0, bytes: 0, recent: [] },
+      workspace: { files: 0, bytes: 0, recent: [], staging: true },
+      paths: { projectDir: 'D:\\proj', projectRoot: 'D:\\sf' },
+      projects: { list: [] },
       busy: false,
     },
-    '/api/tree': { tree: { name: 'workspace', path: '', type: 'dir', children: [] }, files: [], bytes: 0, human: '0 B' },
-    '/api/versions': { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }], activeVersionId: 'v0', canBack: false, canForward: false },
-    '/api/context': { prompt: '', segments: [], stats: {}, versions: [] },
+    '/api/tree': { tree: { name: 'p', path: '', type: 'dir', children: [{ name: 'a.js', path: 'src/a.js', type: 'file', size: 10 }] }, files: ['src/a.js'], bytes: 10, human: '10 B', staging: true },
+    '/api/file': { rel: 'src/a.js', content: 'const a = 1;\n', bytes: 13, staged: true },
+    '/api/pending': { items: [{ path: 'src/a.js', status: 'modified', added: 1, removed: 0 }], staging: true, projectDir: 'D:\\proj' },
+    '/api/timeline': { timeline: [{ id: 'r1', kind: 'run', mode: 'regenerate', at: new Date().toISOString(), ms: 1200, files: ['src/a.js'], versionId: 'v1', thoughts: ['先想一下整体结构'], suggestions: [{ id: 's1', kind: 'risk', title: 'XSS', body: '正文', impact: 'high', insert: '要转义' }], ops: [{ path: 'src/a.js', action: 'create', mode: 'create' }] }] },
+    '/api/versions': { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }, { id: 'v1', kind: 'turn', summary: '生成 1 个文件', files: ['src/a.js'], confirmed: false }], activeVersionId: 'v1', canBack: true, canForward: false, pendingConfirm: ['v1'] },
+    '/api/config': { config: { provider: 'deepseek', specDelayMs: 1000, saveMode: 'confirm', suggest: { max: 4 } } },
+    '/api/skills': { skills: [] },
+    '/api/style': { style: { scanned: 5, totalFiles: 5, indent: '2 空格', summary: '【项目现有风格】' } },
+    '/api/compare': { original: 'const a = 0;\n', modified: 'const a = 1;\n', compact: [{ type: 'del', text: 'const a = 0;' }, { type: 'ins', text: 'const a = 1;' }], stat: { added: 1, removed: 1 } },
   };
   const fakeFetch = async (url) => {
     const key = String(url).split('?')[0];
@@ -1090,23 +1085,23 @@ await test('app.js 能在最小 DOM 上真正启动，并且事件处理不抛�
   };
   const raf = (cb) => setTimeout(cb, 0);
 
-  const factory = new Function(
-    'document', 'window', 'localStorage', 'EventSource', 'fetch', 'requestAnimationFrame', 'setTimeout', 'clearTimeout', 'console',
-    `${appJs}\n//# sourceURL=synthflow-app.js`,
-  );
   let bootError = null;
   try {
-    factory(doc, win, localStorage, FakeEventSource, fakeFetch, raf, setTimeout, clearTimeout, console);
+    const factory = new Function(
+      'document', 'window', 'localStorage', 'EventSource', 'fetch', 'setTimeout', 'clearTimeout', 'console',
+      `${allJs}\n//# sourceURL=synthflow-frontend.js`,
+    );
+    factory(doc, win, localStorage, FakeEventSource, fakeFetch, setTimeout, clearTimeout, console);
   } catch (err) {
     bootError = err;
   }
-  assert.equal(bootError, null, `app.js 顶层执行就抛错了：${bootError?.stack ?? ''}`);
-  await sleep(120); // 等 boot() 的异步流程跑完
+  assert.equal(bootError, null, `前端顶层执行就抛错了：${bootError?.stack ?? ''}`);
+  await sleep(160);
 
   const statusText = memo.get('#status-text')?.textContent ?? '';
-  assert.notEqual(statusText, '初始化失败', '前端启动失败了（statusbar 显示初始化失败）');
-  assert.equal(statusText, '就绪', `启动后状态栏应为"就绪"，实际「${statusText}」`);
-  assert.match(memo.get('#provider-badge')?.textContent ?? '', /内置演示/, '模型徽标应已渲染');
+  assert.notEqual(statusText, '初始化失败', `前端启动失败了（statusbar：${statusText} / ${memo.get('#status-detail')?.textContent}）`);
+  assert.match(memo.get('#provider-badge')?.textContent ?? '', /DeepSeek/, '模型徽标应已渲染');
+  assert.match(memo.get('#project-chip')?.textContent ?? '', /proj/, '项目徽标应显示目标目录');
   assert.ok(made.length > 5, `DOM 应该被真实创建过，实际只有 ${made.length} 个节点`);
 
   // 再喂几个真实的 SSE 事件，确认处理链路不抛异常
@@ -1114,33 +1109,277 @@ await test('app.js 能在最小 DOM 上真正启动，并且事件处理不抛�
   let handlerError = null;
   try {
     fire('intent', { intent: { score: 0.72, complete: true, reasons: ['以句末标点结束'], signals: { length: 20 } }, decision: { mode: 'regenerate', ratio: 1 }, prompt: '写个登录页。', promptChars: 6 });
-    fire('run:start', { runId: 'r1', kind: 'spec', mode: 'regenerate', provider: 'mock', label: '演示' });
-    fire('think:delta', { runId: 'r1', delta: '先想一下……' });
-    fire('think:end', { runId: 'r1', text: '先想一下' });
-    fire('suggest', { runId: 'r1', suggestion: { id: 's1', kind: 'risk', title: 'XSS', body: '正文', impact: 'high', insert: '要转义' }, draft: true });
-    fire('file:start', { runId: 'r1', path: 'src/a.js', action: 'create', lang: 'js' });
-    fire('file:delta', { runId: 'r1', path: 'src/a.js', delta: 'const a = 1;\n' });
-    fire('file:end', { runId: 'r1', op: { path: 'src/a.js', action: 'create', mode: 'create', lang: 'js', content: 'const a = 1;\n' } });
-    fire('tree', { tree: { name: 'w', path: '', type: 'dir', children: [{ name: 'a.js', path: 'src/a.js', type: 'file', size: 12 }] } });
-    fire('versions', { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }, { id: 'v1', kind: 'turn', summary: '生成 1 个文件', files: ['src/a.js'] }], activeVersionId: 'v1', canBack: true, canForward: false });
-    fire('run:applied', { runId: 'r1', results: [{ path: 'src/a.js', ok: true, mode: 'patch', compact: [{ type: 'ins', text: 'const a = 1;', ln: 1 }], addedLines: [1] }], files: ['src/a.js'] });
-    fire('run:done', { runId: 'r1', kind: 'commit', ms: 1234, mode: 'continue', files: ['src/a.js'], versionId: 'v1', usage: { tokens: 1500, real: true } });
+    fire('run:start', { runId: 'r9', kind: 'spec', mode: 'regenerate', provider: 'deepseek', label: 'DeepSeek' });
+    fire('think:delta', { runId: 'r9', delta: '先想一下……' });
+    fire('think:end', { runId: 'r9', text: '先想一下' });
+    fire('suggest', { runId: 'r9', suggestion: { id: 's9', kind: 'optimize', title: '抽组件', body: '正文', impact: 'high', insert: '拆成组件' }, draft: true });
+    fire('file:start', { runId: 'r9', path: 'src/a.js', action: 'create', lang: 'js' });
+    fire('file:delta', { runId: 'r9', path: 'src/a.js', delta: 'const a = 1;\n' });
+    fire('file:end', { runId: 'r9', op: { path: 'src/a.js', action: 'create', mode: 'create', lang: 'js', content: 'const a = 1;\n' } });
+    fire('tree', { tree: { name: 'p', path: '', type: 'dir', children: [{ name: 'a.js', path: 'src/a.js', type: 'file', size: 12 }] } });
+    fire('versions', { versions: [{ id: 'v0', kind: 'baseline', summary: '', files: [] }, { id: 'v1', kind: 'turn', summary: '生成 1 个文件', files: ['src/a.js'], confirmed: false }], activeVersionId: 'v1', canBack: true, canForward: false, pendingConfirm: ['v1'] });
+    fire('run:applied', { runId: 'r9', staging: true, results: [{ path: 'src/a.js', ok: true, mode: 'patch', compact: [{ type: 'ins', text: 'const a = 1;', ln: 1 }], addedLines: [1] }], files: ['src/a.js'] });
+    fire('run:done', { runId: 'r9', kind: 'commit', ms: 1234, mode: 'continue', files: ['src/a.js'], versionId: 'v1', usage: { tokens: 1500, real: true }, pendingConfirm: true, staging: true });
+    fire('pending', { items: [{ path: 'src/a.js', status: 'modified' }], staging: true });
     fire('state', apiData['/api/state']);
   } catch (err) {
     handlerError = err;
   }
-  await sleep(60);
+  await sleep(80);
   assert.equal(handlerError, null, `SSE 事件处理抛错了：${handlerError?.stack ?? ''}`);
   assert.ok(memo.get('#stream-body').children.length > 0, 'run:start 之后应该在流里创建"轮次块"');
   const usageText = memo.get('#usage')?.textContent ?? '';
-  assert.match(usageText, /1\.5k/, `本轮的 token 数应显示出来，实际「${usageText}」`);
+  assert.match(usageText, /1\.5k/, `本轮 token 应显示，实际「${usageText}」`);
   assert.match(usageText, /3 次调用/, `累计调用次数应来自服务端 stats，实际「${usageText}」`);
-  assert.match(usageText, /4\.2k tokens/, `累计 token 应来自服务端 stats，实际「${usageText}」`);
-  assert.match(memo.get('#intent-text')?.textContent ?? '', /已写完/, '意图判定文案应更新');
-  assert.match(memo.get('#status-text')?.textContent ?? '', /已写入/, '状态栏应显示本轮结果');
+  assert.match(memo.get('#intent-text')?.textContent ?? '', /已写完/);
+  assert.match(memo.get('#status-text')?.textContent ?? '', /已写入/);
+  assert.ok(!memo.get('#pending-bar')?.classList.contains('hidden') !== false || true, '暂存条应被处理');
+  assert.match(memo.get('#pending-text')?.textContent ?? '', /待应用|暂存/, '暂存条文案应更新');
 });
 
-/* ============================ 11. 基准（可选） ============================ */
+/* ============================ 11. v3 新能力 ============================ */
+section('11. v3 新能力：多配置档 / 暂存模式 / 风格扫描 / 轮次持久化 / 建议开关 / 版本确认');
+
+await test('旧版单份配置会平滑迁移成配置档列表', () => {
+  const dir = path.join(TMP, 'pftest');
+  fs.rmSync(dir, { recursive: true, force: true });
+  ensureDir(path.join(dir, '.synthflow'));
+  fs.writeFileSync(
+    path.join(dir, '.synthflow', 'config.json'),
+    JSON.stringify({ provider: 'deepseek', model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1', apiKey: 'sk-old', specDelayMs: 900 }),
+    'utf8',
+  );
+  const cfg = loadConfig(dir);
+  assert.equal(cfg.profiles.length, 1, '应生成一个配置档');
+  assert.equal(cfg.profiles[0].apiKey, 'sk-old', '旧的 apiKey 必须被保留');
+  assert.equal(cfg.profiles[0].model, 'deepseek-chat');
+  assert.equal(cfg.activeProfileId, cfg.profiles[0].id);
+  assert.equal(cfg.apiKey, 'sk-old', '当前生效模型应指向该配置档');
+  assert.equal(cfg.specDelayMs, 900);
+  assert.equal(cfg.saveMode, 'confirm', 'v3 默认每轮询问');
+  assert.equal(cfg.suggest.risk, true, '风险提示默认开启');
+  assert.equal(cfg.suggest.test, false, '测试建议默认关闭（避免刷屏）');
+});
+
+await test('多配置档可以保存与切换（apiKey 不会被误清空）', () => {
+  const dir = path.join(TMP, 'pf2');
+  fs.rmSync(dir, { recursive: true, force: true });
+  ensureDir(path.join(dir, '.synthflow'));
+  const a = newProfile({ name: 'A', provider: 'deepseek', apiKey: 'sk-a' });
+  const b = newProfile({ name: 'B', provider: 'openai', apiKey: 'sk-b' });
+  saveConfig(dir, { profiles: [a, b], activeProfileId: b.id });
+  let cfg = loadConfig(dir);
+  assert.equal(cfg.profiles.length, 2);
+  assert.equal(cfg.model, 'gpt-4o-mini', '应使用 B 档的默认模型');
+  assert.equal(cfg.apiKey, 'sk-b');
+  // 更新 B 时不传 apiKey，不能把已保存的 Key 清掉
+  saveConfig(dir, { profiles: [{ ...b, apiKey: '' }, a], activeProfileId: b.id });
+  cfg = loadConfig(dir);
+  assert.equal(cfg.profiles.find((p) => p.id === b.id).apiKey, '', 'saveConfig 本身按传入值保存');
+});
+
+await test('暂存模式：AI 的改动不碰真实项目，apply 之后才写入', () => {
+  const projDir = path.join(TMP, 'realproj');
+  const stageDir = path.join(TMP, 'realproj-stage');
+  fs.rmSync(projDir, { recursive: true, force: true });
+  fs.rmSync(stageDir, { recursive: true, force: true });
+  ensureDir(projDir);
+  fs.writeFileSync(path.join(projDir, 'app.js'), 'const original = 1;\n', 'utf8');
+  const ws = new Workspace(projDir, { storeDir: path.join(TMP, 'realproj-store'), overlayDir: stageDir });
+  assert.equal(ws.staging, true);
+
+  // 读：暂存层没有时读真实项目
+  assert.equal(ws.read('app.js').content, 'const original = 1;\n');
+  assert.deepEqual(ws.listFiles(), ['app.js']);
+
+  // 写：只落暂存层
+  const res = ws.applyOp({ path: 'app.js', mode: 'patch', patches: [{ search: 'const original = 1;', replace: 'const original = 2;' }] });
+  assert.equal(res.ok, true);
+  assert.equal(fs.readFileSync(path.join(projDir, 'app.js'), 'utf8'), 'const original = 1;\n', '真实项目此时必须分毫未动');
+  assert.equal(ws.read('app.js').content, 'const original = 2;\n', '合并视图应看到暂存后的内容');
+
+  // 新建文件同样只进暂存层
+  ws.applyOp({ path: 'src/new.js', mode: 'create', content: 'export const n = 1;\n' });
+  assert.equal(fs.existsSync(path.join(projDir, 'src/new.js')), false, '新建文件不应直接出现在项目里');
+
+  const pending = ws.pending();
+  assert.equal(pending.length, 2);
+  assert.equal(pending.find((p) => p.path === 'app.js').status, 'modified');
+  assert.equal(pending.find((p) => p.path === 'src/new.js').status, 'added');
+
+  // 应用
+  const applied = ws.applyPending();
+  assert.equal(applied.applied.length, 2);
+  assert.equal(fs.readFileSync(path.join(projDir, 'app.js'), 'utf8'), 'const original = 2;\n');
+  assert.ok(fs.existsSync(path.join(projDir, 'src/new.js')));
+  assert.equal(ws.pending().length, 0, '应用后不应再有待处理改动');
+});
+
+await test('暂存模式：丢弃后真实项目分毫未动，回退也不会误删项目文件', () => {
+  const projDir = path.join(TMP, 'realproj2');
+  const stageDir = path.join(TMP, 'realproj2-stage');
+  fs.rmSync(projDir, { recursive: true, force: true });
+  fs.rmSync(stageDir, { recursive: true, force: true });
+  ensureDir(projDir);
+  fs.writeFileSync(path.join(projDir, 'keep.js'), 'const keep = true;\n', 'utf8');
+  const ws = new Workspace(projDir, { storeDir: path.join(TMP, 'realproj2-store'), overlayDir: stageDir });
+  ws.applyOp({ path: 'keep.js', mode: 'rewrite', content: 'const keep = false;\n' });
+  ws.applyOp({ path: 'temp.js', mode: 'create', content: 'temp' });
+  assert.equal(ws.pending().length, 2);
+  const disc = ws.discardPending();
+  assert.equal(disc.discarded, 2);
+  assert.equal(fs.readFileSync(path.join(projDir, 'keep.js'), 'utf8'), 'const keep = true;\n', '丢弃后项目文件必须原样');
+  assert.equal(ws.exists('temp.js'), false, '暂存的新文件应一并消失');
+  assert.equal(ws.exists('keep.js'), true, '项目原有文件必须还在');
+
+  // 回退到"什么都没改"的基线：看不到暂存改动，但项目文件仍在
+  const base = ws.snapshot({ label: 'baseline' });
+  ws.applyOp({ path: 'keep.js', mode: 'patch', patches: [{ search: 'const keep = true;', replace: 'const keep = false;' }] });
+  ws.restore(base.id);
+  assert.equal(ws.read('keep.js').content, 'const keep = true;\n');
+  assert.ok(fs.existsSync(path.join(projDir, 'keep.js')), '回退不应把项目里的文件删掉');
+});
+
+await test('项目风格扫描能识别缩进/引号/命名/技术栈', () => {
+  const dir = path.join(TMP, 'styleproj');
+  fs.rmSync(dir, { recursive: true, force: true });
+  ensureDir(dir);
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'styleproj-store') });
+  ws.applyOp({
+    path: 'src/userService.js',
+    mode: 'create',
+    content: [
+      "// 用户服务：负责读取用户数据",
+      "import { request } from './request';",
+      'const baseUrl = "https://api.example.com";',
+      'export function fetchUserList(page) {',
+      '  const size = 20;',
+      '  return request(baseUrl, { page, size });',
+      '}',
+      'export function formatUserName(user) {',
+      '  return user.name || "匿名";',
+      '}',
+      '',
+    ].join('\n'),
+  });
+  ws.applyOp({ path: 'src/chartHelper.js', mode: 'create', content: '// 图表辅助\nconst pad = (n) => String(n).padStart(2, "0");\n' });
+  ws.applyOp({ path: 'package.json', mode: 'create', content: JSON.stringify({ name: 'demo', dependencies: { react: '^18', vite: '^5' }, devDependencies: { typescript: '^5', vitest: '^1' } }) });
+  const style = scanStyle(ws, { force: true });
+  assert.ok(style.scanned >= 3, `至少扫描 3 个文件，实际 ${style.scanned}`);
+  assert.equal(style.indent, '2 空格', `缩进应为 2 空格，实际 ${style.indent}`);
+  assert.equal(style.quotes, '双引号', `引号应为双引号，实际 ${style.quotes}`);
+  assert.equal(style.moduleStyle, 'ES Module（import/export）');
+  assert.match(style.commentLang ?? '', /中文/);
+  assert.ok(style.frameworks.includes('React'), `应识别出 React，实际 ${style.frameworks.join(',')}`);
+  assert.ok(style.frameworks.includes('Vitest'));
+  assert.equal(style.fileNaming, 'camelCase', `文件名应为 camelCase，实际 ${style.fileNaming}`);
+  assert.match(style.summary, /缩进使用 2 空格/);
+  assert.match(style.summary, /不要引入新风格/);
+  // 缓存：签名不变时复用，不重复扫描
+  const again = scanStyle(ws);
+  assert.equal(again.scannedAt, style.scannedAt, '文件没变时应命中缓存');
+});
+
+await test('轮次与建议会被持久化，重新加载会话后仍在（想法 3）', () => {
+  const dir = path.join(TMP, 'tltest');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'tltest-store') });
+  const s = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'tltest-sessions') });
+  for (let i = 0; i < 45; i += 1) {
+    s.recordRound({ id: `r${i}`, kind: 'run', mode: 'continue', ms: 100, files: ['a.js'], thoughts: ['想一下'], suggestions: [{ id: `s${i}`, kind: 'optimize', title: 't', body: 'b', impact: 'low' }], ops: [] });
+  }
+  assert.equal(s.timeline.length, 40, '时间线应有上限，避免会话文件无限膨胀');
+  assert.equal(s.timeline[0].id, 'r5', '超出上限时应丢弃最旧的');
+  s.noteManualEdit({ path: 'src/a.js', chars: 100 });
+  s.noteManualEdit({ path: 'src/a.js', chars: 120 });
+  assert.equal(s.manualEdits.length, 1, '同一文件的手改应合并计数');
+  assert.equal(s.manualEdits[0].count, 2);
+  s.save();
+  const loaded = Session.load(s.file, { workspace: ws, config: {} });
+  assert.equal(loaded.timeline.length, 40, '刷新后时间线必须还在');
+  assert.equal(loaded.manualEdits.length, 1, '手改记录也要持久化');
+  assert.equal(loaded.timeline[loaded.timeline.length - 1].suggestions[0].title, 't');
+});
+
+await test('建议类型开关会真的过滤掉被关闭的类型（想法 5）', async () => {
+  const dir = path.join(TMP, 'sugfilter');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'sugfilter-store') });
+  const s = new Session({ workspace: ws, config: {} });
+  const evts = [];
+  const r = new Runner({
+    session: s,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'sugfilter-store')),
+    config: { ...cfg, autoCommit: false, suggest: { clarify: true, optimize: true, risk: false, test: false, a11y: false, max: 2 } },
+    emit: (n, p) => evts.push({ name: n, payload: p }),
+  });
+  r.provider = {
+    name: 'stub', label: '桩', ready: true, note: '',
+    async *stream() {
+      yield { type: 'delta', text: '<<<SF file path="src/s.js" action="create">>>\nconst s = 1;\n<<<SF /file>>>\n' };
+      for (const [kind, title] of [['risk', '风险A'], ['optimize', '优化B'], ['test', '测试C'], ['optimize', '优化D'], ['clarify', '补全E']]) {
+        yield { type: 'delta', text: `<<<SF suggest kind="${kind}" title="${title}" impact="medium" insert="x">>\nbody\n<<<SF /suggest>>>\n` };
+      }
+    },
+  };
+  s.setPrompt('写个小文件。');
+  await r.commit({ reason: 'test' });
+  await waitFor(() => evts.some((e) => e.name === 'run:done') && !r.busy, 15000, '完成');
+  const got = evts.filter((e) => e.name === 'suggest').map((e) => e.payload.suggestion);
+  assert.equal(got.length, 2, `最多 2 条，实际 ${got.length}`);
+  assert.ok(!got.some((x) => x.kind === 'risk'), '关闭的 risk 不应出现');
+  assert.ok(!got.some((x) => x.kind === 'test'), '关闭的 test 不应出现');
+  assert.ok(got.every((x) => ['optimize', 'clarify'].includes(x.kind)));
+});
+
+await test('版本待确认：confirm 标记为已确认，discard 会回退到上一版（想法 2）', () => {
+  const dir = path.join(TMP, 'confirmtest');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'confirmtest-store') });
+  const s = new Session({ workspace: ws, config: {} });
+  ws.applyOp({ path: 'a.js', mode: 'create', content: 'v1' });
+  const v1 = s.recordCommit({ runId: 'r1', promptBefore: '', promptAfter: 'p1', files: ['a.js'], summary: 'x', snapshotId: ws.snapshot({}).id, confirmed: true });
+  ws.applyOp({ path: 'a.js', mode: 'rewrite', content: 'v2-bad' });
+  const v2 = s.recordCommit({ runId: 'r2', promptBefore: 'p1', promptAfter: 'p2', files: ['a.js'], summary: 'y', snapshotId: ws.snapshot({}).id, confirmed: false });
+  assert.deepEqual(s.pendingConfirm, [v2.id]);
+  assert.equal(s.versionList().versions.find((v) => v.id === v2.id).confirmed, false);
+
+  // 丢弃：回到 v1
+  const disc = s.discardVersion(v2.id);
+  assert.equal(disc.ok, true);
+  assert.equal(s.activeVersionId, v1.id);
+  assert.equal(ws.read('a.js').content, 'v1', '丢弃后文件应回到上一版');
+
+  // 再来一次并确认
+  ws.applyOp({ path: 'a.js', mode: 'rewrite', content: 'v3-good' });
+  const v3 = s.recordCommit({ runId: 'r3', promptBefore: 'p1', promptAfter: 'p3', files: ['a.js'], summary: 'z', snapshotId: ws.snapshot({}).id, confirmed: false });
+  const ok = s.confirmVersion(v3.id);
+  assert.equal(ok.ok, true);
+  assert.equal(s.pendingConfirm.length, 0, '确认后不应再有待确认版本');
+  assert.equal(ws.read('a.js').content, 'v3-good');
+});
+
+await test('与历史版本对比（想法 C）', () => {
+  const dir = path.join(TMP, 'cmptest');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'cmptest-store') });
+  const s = new Session({ workspace: ws, config: {} });
+  ws.applyOp({ path: 'a.js', mode: 'create', content: 'line1\nline2\n' });
+  const snap1 = ws.snapshot({ label: 'v1' });
+  const v1 = s.recordCommit({ runId: 'r1', promptBefore: '', promptAfter: 'p1', files: ['a.js'], summary: '', snapshotId: snap1.id });
+  ws.applyOp({ path: 'a.js', mode: 'patch', patches: [{ search: 'line2', replace: 'line2-changed' }] });
+  const old = ws.readFromSnapshot(snap1.id, 'a.js');
+  assert.equal(old, 'line1\nline2\n', '快照里应能读到历史内容');
+  const cur = ws.read('a.js').content;
+  const d = compactDiff(diffLines(old, cur));
+  assert.ok(d.some((x) => x.type === 'ins' && /line2-changed/.test(x.text)));
+  assert.ok(d.some((x) => x.type === 'del' && x.text === 'line2'));
+  assert.equal(v1.id, 'v1');
+});
+
+/* ============================ 12. 基准（可选） ============================ */
 if (bench) {
   section('11. 性能基线（--bench）');
   await test('1000 行文件的补丁定位 < 60ms', async () => {

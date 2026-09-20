@@ -185,6 +185,12 @@ export class Session {
     this.lastDecision = null;
     this.status = 'idle'; // idle | speculating | generating | applying | error
 
+    // v3：把"思考与建议"持久化，刷新页面不丢（想法 3）
+    this.timeline = [];
+    // v3：用户手动改过的文件，下一轮要告知模型别覆盖（想法 1/A）
+    this.manualEdits = [];
+    this.maxTimeline = 40;
+
     const baseline = workspace.snapshot({ label: '基线', meta: { kind: 'baseline' } });
     this.versions.push({
       id: 'v0',
@@ -294,7 +300,7 @@ export class Session {
   }
 
   /** 记录一次生成运行的结果，并产生新版本。 */
-  recordCommit({ runId, promptBefore, promptAfter, files, summary, kind = 'turn', snapshotId }) {
+  recordCommit({ runId, promptBefore, promptAfter, files, summary, kind = 'turn', snapshotId, confirmed = true }) {
     // 若游标停在历史版本上继续生成，右侧那条分支会被丢弃（与 git 在历史提交上继续提交一致）。
     let dropped = 0;
     if (this.activeIndex < this.versions.length - 1) {
@@ -315,6 +321,9 @@ export class Session {
       summary,
       runId,
       kind,
+      // 想法 2：saveMode 为 confirm 时，版本先标记"待确认"，界面上给保留/丢弃按钮
+      confirmed,
+      confirmedAt: confirmed ? nowIso() : null,
     };
     this.versions.push(rec);
     this.activeIndex = this.versions.length - 1;
@@ -388,6 +397,75 @@ export class Session {
     return this.moveVersion('back');
   }
 
+  /** 记录一轮生成（思考/建议/文件操作），用于刷新后回灌思考栏。 */
+  recordRound(rec) {
+    const item = {
+      id: rec.id,
+      kind: rec.kind ?? 'run',
+      mode: rec.mode ?? 'regenerate',
+      at: rec.at ?? nowIso(),
+      ms: rec.ms ?? 0,
+      files: rec.files ?? [],
+      versionId: rec.versionId ?? null,
+      thoughts: (rec.thoughts ?? []).slice(0, 6).map((t) => String(t).slice(0, 3000)),
+      suggestions: (rec.suggestions ?? []).slice(0, 8),
+      ops: (rec.ops ?? []).slice(0, 40),
+      error: rec.error ?? null,
+    };
+    this.timeline.push(item);
+    if (this.timeline.length > this.maxTimeline) this.timeline = this.timeline.slice(-this.maxTimeline);
+    this.touch();
+    return item;
+  }
+
+  /** 用户手动改了文件（想法 1/A）：记录下来，下一轮提示词里要告诉模型"这是人改的"。 */
+  noteManualEdit({ path: rel, summary = '', chars = 0 }) {
+    const exist = this.manualEdits.find((m) => m.path === rel);
+    if (exist) {
+      exist.at = nowIso();
+      exist.count += 1;
+      exist.summary = summary || exist.summary;
+      exist.chars = chars || exist.chars;
+    } else {
+      this.manualEdits.push({ path: rel, at: nowIso(), count: 1, summary, chars });
+    }
+    if (this.manualEdits.length > 20) this.manualEdits = this.manualEdits.slice(-20);
+    this.touch();
+    return this.manualEdits;
+  }
+
+  clearManualEdits(paths) {
+    if (!paths?.length) {
+      this.manualEdits = [];
+    } else {
+      this.manualEdits = this.manualEdits.filter((m) => !paths.includes(m.path));
+    }
+    this.touch();
+  }
+
+  /** 确认一个"待确认"版本（想法 2）。 */
+  confirmVersion(versionId) {
+    const v = versionId ? this.versions.find((x) => x.id === versionId) : this.currentVersion;
+    if (!v) return { ok: false, error: '版本不存在' };
+    v.confirmed = true;
+    v.confirmedAt = nowIso();
+    this.touch();
+    return { ok: true, versionId: v.id, versions: this.versionList() };
+  }
+
+  /** 丢弃一个"待确认"版本：等价于回退到它之前的那一版。 */
+  discardVersion(versionId) {
+    const idx = versionId ? this.versions.findIndex((v) => v.id === versionId) : this.activeIndex;
+    if (idx < 0) return { ok: false, error: '版本不存在' };
+    if (idx === 0) return { ok: false, error: '基线版本不能丢弃' };
+    if (idx !== this.activeIndex) return { ok: false, error: '只能丢弃当前所在的版本（先回退到它）' };
+    return this.moveVersion('back');
+  }
+
+  get pendingConfirm() {
+    return this.versions.filter((v) => v.kind !== 'baseline' && v.confirmed === false).map((v) => v.id);
+  }
+
   save() {
     this.updatedAt = nowIso();
     writeJsonAtomic(this.file, {
@@ -399,6 +477,10 @@ export class Session {
       versions: this.versions,
       notes: this.notes,
       stats: this.stats,
+      timeline: this.timeline,
+      manualEdits: this.manualEdits,
+      versionSeq: this.versionSeq,
+      activeIndex: this.activeIndex,
       promptHash: sha1(this.prompt),
     });
     this.appendHistory();
@@ -434,6 +516,9 @@ export class Session {
       s.versionSeq = s.versions.reduce((max, v) => Math.max(max, Number(String(v.id).replace(/^v/, '')) || 0), 0);
     }
     s.stats = { runs: 0, commits: 0, rollbacks: 0, forwards: 0, charsGenerated: 0, adopted: 0, dismissed: 0, modelCalls: 0, estTokens: 0, ...(data.stats ?? {}) };
+    if (!Array.isArray(s.timeline)) s.timeline = [];
+    if (!Array.isArray(s.manualEdits)) s.manualEdits = [];
+    s.maxTimeline = 40;
     return s;
   }
 
@@ -465,11 +550,13 @@ export class Session {
         promptAfter: v.promptAfter,
         isCurrent: i === this.activeIndex,
         ahead: i > this.activeIndex,
+        confirmed: v.confirmed !== false,
       })),
       activeVersionId: this.activeVersionId,
       activeIndex: this.activeIndex,
       canBack: this.canBack,
       canForward: this.canForward,
+      pendingConfirm: this.pendingConfirm,
     };
   }
 }

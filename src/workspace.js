@@ -1,4 +1,10 @@
-// SynthFlow 工作区：受沙箱约束的文件读写 + 补丁应用 + 版本快照（回退能力的地基）。
+// SynthFlow 工作区：受沙箱约束的文件读写 + 补丁应用 + 版本快照。
+//
+// v3 起支持"目标项目"模式（想法 4/D）：
+//   · 直接模式（overlayDir === root）：写盘立即生效，和以前一样
+//   · 暂存模式（overlayDir = .synthflow/staging）：读 = 暂存层优先、否则读真实项目；
+//     写 = 只写暂存层；用户确认后才由 applyPending() 落到真实项目。
+//   这样 AI 永远不会在你没点确认之前改坏已有项目，同时又能看到项目的真实内容与风格。
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -20,14 +26,21 @@ const TEXT_EXT = new Set([
   'py', 'rb', 'go', 'rs', 'java', 'kt', 'php', 'sh', 'ps1', 'sql', 'xml', 'svg', 'gitignore',
 ]);
 
+const IGNORE_DIRS = [
+  '.git', 'node_modules', '.synthflow', '.cache', 'dist', 'build', 'out', 'coverage',
+  '.next', '.nuxt', '.turbo', '.svelte-kit', 'vendor', '.venv', 'venv', '__pycache__',
+  '.idea', '.vscode', 'target', 'bin', 'obj',
+];
+
+const MAX_READ_BYTES = 512 * 1024; // 超过这个大小的文件不读进内存（避免误读大产物）
+const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+
 export function isTextFile(rel) {
   const base = path.basename(rel);
   if (base.startsWith('.') && !base.includes('.')) return true;
   const ext = base.split('.').pop()?.toLowerCase() ?? '';
   return TEXT_EXT.has(ext) || !base.includes('.');
 }
-
-const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024; // 单文件快照上限，防止把大二进制塞进版本库
 
 /** 在 haystack 中定位 needle：先精确，再按"忽略首尾空白 + 行归一"模糊匹配。 */
 export function locateBlock(haystack, needle) {
@@ -43,7 +56,6 @@ export function locateBlock(haystack, needle) {
   if (!targetNorm) return null;
   const lines = splitLines(text);
 
-  // 滑动窗口逐行归一比对；允许 1 行偏移容错。
   for (let size = targetLines.length; size >= Math.max(1, targetLines.length - 1); size -= 1) {
     for (let i = 0; i + size <= lines.length; i += 1) {
       const windowNorm = norm(lines.slice(i, i + size).join('\n'));
@@ -55,7 +67,6 @@ export function locateBlock(haystack, needle) {
     }
   }
 
-  // 最后兜底：找与目标首行最相似的锚点。
   const first = targetLines.find((l) => l.trim().length > 3);
   if (first) {
     const anchor = lines.findIndex((l) => l.trim() === first.trim());
@@ -71,16 +82,22 @@ export function locateBlock(haystack, needle) {
 
 export class Workspace {
   /**
-   * @param {string} root 工作区根目录（生成的代码全部落在这里，任何路径逃逸都会被拒绝）
-   * @param {{storeDir?:string, maxSnapshots?:number}} [opts]
+   * @param {string} root 目标目录（真实项目或生成目录）
+   * @param {{storeDir?:string, overlayDir?:string, maxSnapshots?:number}} [opts]
    */
   constructor(root, opts = {}) {
     this.root = path.resolve(root);
     this.storeDir = path.resolve(opts.storeDir ?? path.join(this.root, '..', '.synthflow'));
+    this.overlayDir = path.resolve(opts.overlayDir ?? this.root);
+    this.staging = this.overlayDir !== this.root;
     this.maxSnapshots = opts.maxSnapshots ?? 60;
+    this.stateFile = path.join(this.storeDir, 'staging.json');
     ensureDir(this.root);
+    if (this.staging) ensureDir(this.overlayDir);
     ensureDir(this.snapshotsDir);
     ensureDir(this.historyDir);
+    const st = readJsonSafe(this.stateFile, { deleted: [] });
+    this.deleted = new Set(st.deleted ?? []);
   }
 
   get snapshotsDir() {
@@ -91,40 +108,111 @@ export class Workspace {
     return path.join(this.storeDir, 'history');
   }
 
+  /** 写路径（暂存模式下是暂存层）。 */
   abs(rel) {
+    return resolveInside(this.overlayDir, rel);
+  }
+
+  absRead(rel) {
     return resolveInside(this.root, rel);
   }
 
-  exists(rel) {
+  absAt(base, rel) {
+    return resolveInside(base, rel);
+  }
+
+  saveState() {
+    writeJsonAtomic(this.stateFile, { deleted: [...this.deleted] });
+  }
+
+  /** 暂存层里是否有这个文件（而不是项目里）。 */
+  stagedAbsolute(rel) {
     try {
-      return fs.existsSync(this.abs(rel).abs);
+      return fs.existsSync(resolveInside(this.overlayDir, rel).abs);
     } catch {
       return false;
     }
   }
 
-  read(rel) {
-    const { abs, rel: r } = this.abs(rel);
-    if (!fs.existsSync(abs)) return null;
-    return { rel: r, content: fs.readFileSync(abs, 'utf8'), bytes: fs.statSync(abs).size };
+  exists(rel) {
+    try {
+      if (this.deleted.has(rel)) return false;
+      const { abs } = this.absRead(rel);
+      if (fs.existsSync(abs)) return true;
+      return this.staging && fs.existsSync(this.abs(rel).abs);
+    } catch {
+      return false;
+    }
   }
 
+  /** 读取：暂存层优先，否则读真实项目。 */
+  read(rel) {
+    let r;
+    try {
+      r = this.absRead(rel);
+    } catch {
+      return null;
+    }
+    const candidates = this.staging ? [this.abs(rel).abs, r.abs] : [r.abs];
+    for (const abs of candidates) {
+      try {
+        if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+          if (fs.statSync(abs).size > MAX_READ_BYTES) return { rel: r.rel, content: '', bytes: 0, tooLarge: true };
+          return { rel: r.rel, content: fs.readFileSync(abs, 'utf8'), bytes: fs.statSync(abs).size };
+        }
+      } catch { /* 换下一个候选 */ }
+    }
+    return null;
+  }
+
+  /** 写入永远落到暂存层（暂存模式下不会碰真实项目）。 */
   write(rel, content) {
     const { abs, rel: r } = this.abs(rel);
     ensureDir(path.dirname(abs));
     fs.writeFileSync(abs, content, 'utf8');
+    if (this.deleted.delete(r)) this.saveState();
     return { rel: r, bytes: Buffer.byteLength(content, 'utf8') };
   }
 
   remove(rel) {
-    const { abs, rel: r } = this.abs(rel);
-    if (fs.existsSync(abs)) fs.rmSync(abs, { force: true, recursive: true });
+    const { rel: r } = this.abs(rel);
+    if (this.staging) {
+      const inOverlay = this.stagedAbsolute(r);
+      if (inOverlay) fs.rmSync(this.abs(r).abs, { force: true, recursive: true });
+      // 项目里存在的文件：只记录"待删除"，等用户确认后才真删
+      const inProject = fs.existsSync(this.absRead(r).abs);
+      if (inProject) {
+        this.deleted.add(r);
+        this.saveState();
+      }
+    } else if (fs.existsSync(this.abs(r).abs)) {
+      fs.rmSync(this.abs(r).abs, { force: true, recursive: true });
+    }
     return r;
   }
 
-  /** 供 UI 使用的文件树。 */
+  /** 合并视图下的全部文件。 */
+  listFiles() {
+    const set = new Set(listFilesRecursive(this.root, { ignore: IGNORE_DIRS }).filter(isTextFile));
+    if (this.staging) {
+      for (const f of listFilesRecursive(this.overlayDir, { ignore: IGNORE_DIRS })) {
+        if (isTextFile(f)) set.add(f);
+      }
+    }
+    for (const d of this.deleted) set.delete(d);
+    return [...set].filter((rel) => {
+      try {
+        const over = this.staging ? this.abs(rel).abs : null;
+        const abs = over && fs.existsSync(over) ? over : this.absRead(rel).abs;
+        return fs.statSync(abs).size <= MAX_READ_BYTES;
+      } catch {
+        return false;
+      }
+    }).sort();
+  }
+
   listTree() {
-    const files = listFilesRecursive(this.root).filter(isTextFile);
+    const files = this.listFiles();
     const root = { name: path.basename(this.root), path: '', type: 'dir', children: [] };
     const dirIndex = new Map([['', root]]);
     const ensureDirNode = (dirPath) => {
@@ -139,9 +227,11 @@ export class Workspace {
       const dir = f.split('/').slice(0, -1).join('/');
       let size = 0;
       try {
-        size = fs.statSync(path.join(this.root, f)).size;
+        size = this.read(f)?.bytes ?? 0;
       } catch { /* ignore */ }
-      ensureDirNode(dir).children.push({ name: f.split('/').pop(), path: f, type: 'file', size, lang: f.split('.').pop() });
+      const node = { name: f.split('/').pop(), path: f, type: 'file', size, lang: f.split('.').pop() };
+      if (this.pendingRels().has(f)) node.pending = true;
+      ensureDirNode(dir).children.push(node);
     }
     const sortNode = (n) => {
       if (!Array.isArray(n.children)) return;
@@ -152,24 +242,100 @@ export class Workspace {
     return root;
   }
 
-  listFiles() {
-    return listFilesRecursive(this.root).filter(isTextFile);
-  }
-
   totalBytes() {
     let total = 0;
     for (const f of this.listFiles()) {
       try {
-        total += fs.statSync(path.join(this.root, f)).size;
+        total += this.read(f)?.bytes ?? 0;
       } catch { /* ignore */ }
     }
     return total;
   }
 
-  /**
-   * 应用一次模型产出的文件操作。
-   * @returns {{path:string, ok:boolean, mode:string, error?:string, diff?:Array, before?:string, after?:string, changedLines?:number}}
-   */
+  /* ------------------------- 暂存层（改动待应用） ------------------------- */
+
+  pendingRels() {
+    if (!this.staging) return new Set();
+    const out = new Set(this.deleted);
+    for (const f of listFilesRecursive(this.overlayDir, { ignore: IGNORE_DIRS })) {
+      if (isTextFile(f)) out.add(f);
+    }
+    return out;
+  }
+
+  /** 待应用到真实项目的改动清单（带差异与统计）。 */
+  pending() {
+    if (!this.staging) return [];
+    const out = [];
+    for (const rel of this.pendingRels()) {
+      let overlay = null;
+      let base = null;
+      try {
+        const o = this.abs(rel).abs;
+        if (fs.existsSync(o)) overlay = fs.readFileSync(o, 'utf8');
+      } catch { /* ignore */ }
+      try {
+        const b = this.absRead(rel).abs;
+        if (fs.existsSync(b)) base = fs.readFileSync(b, 'utf8');
+      } catch { /* ignore */ }
+      if (overlay === base) continue;
+      const diff = diffLines(base ?? '', overlay ?? '');
+      out.push({
+        path: rel,
+        status: base === null ? 'added' : overlay === null ? 'deleted' : 'modified',
+        added: diff.filter((d) => d.type === 'ins').length,
+        removed: diff.filter((d) => d.type === 'del').length,
+        diff,
+      });
+    }
+    return out.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /** 把暂存层的改动真正写进目标项目。 */
+  applyPending() {
+    if (!this.staging) return { applied: [], deleted: [] };
+    const items = this.pending();
+    const applied = [];
+    const deleted = [];
+    for (const item of items) {
+      const target = this.absRead(item.path);
+      if (item.status === 'deleted') {
+        if (fs.existsSync(target.abs)) fs.rmSync(target.abs, { force: true });
+        deleted.push(item.path);
+      } else {
+        const src = this.abs(item.path).abs;
+        ensureDir(path.dirname(target.abs));
+        fs.copyFileSync(src, target.abs);
+        applied.push(item.path);
+      }
+    }
+    this.clearStaging();
+    return { applied, deleted };
+  }
+
+  /** 丢弃所有暂存改动（真实项目分毫未动）。 */
+  discardPending() {
+    if (!this.staging) return { discarded: 0 };
+    const count = this.pendingRels().size;
+    this.clearStaging();
+    return { discarded: count };
+  }
+
+  clearStaging() {
+    if (this.staging) {
+      for (const f of listFilesRecursive(this.overlayDir)) {
+        try {
+          fs.rmSync(path.join(this.overlayDir, f), { force: true });
+        } catch { /* ignore */ }
+      }
+      this.cleanupEmptyDirs(this.overlayDir);
+    }
+    this.deleted = new Set();
+    this.saveState();
+  }
+
+  /* ------------------------------ 补丁应用 ------------------------------ */
+
   applyOp(op) {
     const rel = String(op.path || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
     if (!rel) return { path: '', ok: false, mode: op.mode, error: '缺少 path' };
@@ -179,16 +345,16 @@ export class Workspace {
     } catch (err) {
       return { path: rel, ok: false, mode: op.mode, error: err.message };
     }
-    const before = fs.existsSync(target.abs) ? fs.readFileSync(target.abs, 'utf8') : null;
+    const existing = this.read(rel);
+    const before = existing?.content ?? null;
 
     if (op.mode === 'delete') {
-      if (before === null) return { path: target.rel, ok: false, mode: 'delete', error: '文件不存在' };
+      if (!this.exists(rel)) return { path: target.rel, ok: false, mode: 'delete', error: '文件不存在' };
       this.remove(target.rel);
-      return { path: target.rel, ok: true, mode: 'delete', before, after: '', diff: diffLines(before, ''), changedLines: splitLines(before).length };
+      return { path: target.rel, ok: true, mode: 'delete', before, after: '', diff: diffLines(before ?? '', ''), changedLines: splitLines(before ?? '').length };
     }
 
-    if (before === null) {
-      // 新建
+    if (before === null || existing?.tooLarge) {
       const content = op.content ?? '';
       this.write(target.rel, content);
       return { path: target.rel, ok: true, mode: 'create', before: null, after: content, diff: diffLines('', content), changedLines: splitLines(content).length };
@@ -225,7 +391,6 @@ export class Workspace {
       };
     }
 
-    // rewrite（含 create 但文件已存在的情况）
     const content = op.content ?? '';
     this.write(target.rel, content);
     return { path: target.rel, ok: true, mode: 'rewrite', before, after: content, diff: diffLines(before, content), changedLines: diffLines(before, content).filter((d) => d.type !== 'same').length };
@@ -238,7 +403,6 @@ export class Workspace {
     return index.snapshots ?? [];
   }
 
-  /** 打一个全量文本快照，返回快照元数据。 */
   snapshot({ label = '', turnId = '', segmentIds = [], runId = '', meta = {} } = {}) {
     const list = this.listSnapshots();
     const seq = list.length ? Math.max(...list.map((s) => s.seq)) + 1 : 1;
@@ -249,19 +413,13 @@ export class Workspace {
     const manifest = {};
     let bytes = 0;
     for (const rel of this.listFiles()) {
-      const abs = path.join(this.root, rel);
-      let stat;
-      try {
-        stat = fs.statSync(abs);
-      } catch {
-        continue;
-      }
-      if (stat.size > MAX_SNAPSHOT_BYTES) continue;
+      const f = this.read(rel);
+      if (!f || f.tooLarge) continue;
       const dest = path.join(filesDir, rel);
       ensureDir(path.dirname(dest));
-      fs.copyFileSync(abs, dest);
-      manifest[rel] = sha1(fs.readFileSync(abs, 'utf8'));
-      bytes += stat.size;
+      fs.writeFileSync(dest, f.content, 'utf8');
+      manifest[rel] = sha1(f.content);
+      bytes += f.bytes;
     }
     const rec = { id, seq, label, turnId, segmentIds, runId, createdAt: nowIso(), fileCount: Object.keys(manifest).length, bytes, meta };
     writeJsonAtomic(path.join(dir, 'manifest.json'), { ...rec, files: manifest });
@@ -281,29 +439,46 @@ export class Workspace {
     return losers.length;
   }
 
-  /** 回退到某个快照：先清空工作区，再按快照内容重建（工作区由 SynthFlow 独占管理）。 */
+  /** 读某个快照里的某个文件（用于"与历史版本对比"）。 */
+  readFromSnapshot(snapshotId, rel) {
+    try {
+      const { rel: r } = resolveInside(this.root, rel);
+      const file = path.join(this.snapshotsDir, snapshotId, 'files', r);
+      if (!fs.existsSync(file)) return null;
+      return fs.readFileSync(file, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  /** 回退：清空当前写入层，再按快照内容重建（暂存模式下真实项目不会被触碰）。 */
   restore(snapshotId) {
     const dir = path.join(this.snapshotsDir, snapshotId);
     const man = readJsonSafe(path.join(dir, 'manifest.json'), null);
     if (!man) throw new Error(`快照不存在: ${snapshotId}`);
-    for (const rel of this.listFiles()) {
-      try {
-        this.remove(rel);
-      } catch { /* ignore */ }
+    if (this.staging) {
+      // 暂存模式：清掉暂存层，合并视图自然回落到项目真实内容
+      this.clearStaging();
+    } else {
+      // 直接模式：工作区由 SynthFlow 独占管理，整目录重建才等价于"回到那一版"
+      for (const rel of this.listFiles()) {
+        try {
+          fs.rmSync(this.abs(rel).abs, { force: true });
+        } catch { /* ignore */ }
+      }
+      this.cleanupEmptyDirs(this.root);
     }
     const written = [];
     for (const rel of Object.keys(man.files ?? {})) {
       const src = path.join(dir, 'files', rel);
       if (!fs.existsSync(src)) continue;
-      const content = fs.readFileSync(src, 'utf8');
-      this.write(rel, content);
+      this.write(rel, fs.readFileSync(src, 'utf8'));
       written.push(rel);
     }
-    this.cleanupEmptyDirs();
     return { snapshotId, restored: written.length, files: written, meta: man };
   }
 
-  cleanupEmptyDirs() {
+  cleanupEmptyDirs(base = this.root) {
     const walk = (dir) => {
       let entries = [];
       try {
@@ -313,10 +488,10 @@ export class Workspace {
       }
       for (const e of entries) if (e.isDirectory()) walk(path.join(dir, e.name));
       try {
-        if (dir !== this.root && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+        if (dir !== base && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
       } catch { /* ignore */ }
     };
-    walk(this.root);
+    walk(base);
   }
 
   /** 生成一段紧凑的"项目地图"，用于塞进模型上下文。 */
@@ -324,18 +499,13 @@ export class Workspace {
     const files = this.listFiles();
     const lines = [];
     for (const rel of files.slice(0, maxFiles)) {
-      let content = '';
-      try {
-        content = fs.readFileSync(path.join(this.root, rel), 'utf8');
-      } catch {
-        continue;
-      }
+      const f = this.read(rel);
+      if (!f) continue;
       const symbols = [];
       const re = /(?:export\s+)?(?:async\s+)?(?:function|class|const|let|def|interface|type|struct)\s+([A-Za-z_$][\w$]*)/g;
       let m;
-      while ((m = re.exec(content)) && symbols.length < 8) symbols.push(m[1]);
-      const head = splitLines(content).length;
-      lines.push(`${rel} (${head} 行)${symbols.length ? ` — ${symbols.join(', ')}` : ''}`);
+      while ((m = re.exec(f.content)) && symbols.length < 8) symbols.push(m[1]);
+      lines.push(`${rel} (${splitLines(f.content).length} 行)${symbols.length ? ` — ${symbols.join(', ')}` : ''}`);
     }
     if (files.length > maxFiles) lines.push(`… 另有 ${files.length - maxFiles} 个文件未列出`);
     return lines.join('\n').slice(0, maxChars);

@@ -35,7 +35,21 @@ export function buildMessages(ctx) {
     config = {},
     previousPrompt = '',
     requireSuggestions = false,
+    styleSummary = null,
+    projectNote = null,
+    manualEditNote = null,
+    selectionNote = null,
   } = ctx;
+
+  // 想法 5：只让模型产出用户要的建议类型，省 token 也省注意力
+  const sug = config.suggest ?? {};
+  const KINDS = { clarify: '需求补全(clarify)', optimize: '优化方向(optimize)', risk: '风险提示(risk)', test: '测试建议(test)', a11y: '可访问性(a11y)' };
+  const enabledKinds = Object.keys(KINDS).filter((k) => sug[k] !== false);
+  const disabledKinds = Object.keys(KINDS).filter((k) => sug[k] === false).map((k) => KINDS[k]);
+  const maxSuggest = Math.max(0, Math.min(9, Number(sug.max ?? 4)));
+  const suggestKindLine = enabledKinds.length
+    ? `（允许的类型：${enabledKinds.map((k) => KINDS[k]).join('、')}）`
+    : '（用户关闭了所有建议类型，此时可以不输出 suggest）';
 
   const sys = [];
   sys.push(
@@ -49,15 +63,22 @@ export function buildMessages(ctx) {
       `2. 主动补全需求：信息缺失时，用 suggest(kind="clarify") 给出可直接采纳的补充，而不是反问等待。\n` +
       `3. 主动指出风险与更优方案：用 suggest(kind="risk"/"optimize")，每条都要短、可执行、可一键采纳。\n` +
       `4. 每个文件写完立刻关闭 file 通道，然后再开下一个，用户可以边看边改。\n` +
-      `5. 建议总数控制在 2~4 条，宁精勿滥。`,
+      `5. 建议总数控制在 ${maxSuggest} 条以内，宁精勿滥。`,
   );
+  if (disabledKinds.length) {
+    sys.push(`【用户的偏好设置】本轮**不要**输出这些类型的建议：${disabledKinds.join('、')}。已被关闭的建议不要出现。`);
+  }
   if (requireSuggestions) {
     sys.push(
-      `【硬性要求】无论这一轮是全新生成还是**增量/补丁**修改，你都必须至少给出 **2 条** suggest 建议，` +
-        `并且要基于**这一轮刚刚改动的代码**给出下一步可以做什么（例如：还没处理的边界、可以抽出的复用点、` +
-        `缺少的错误处理或测试）。用户会把这些建议一键采纳进提示词，然后让你继续增量实现。`,
+      `【硬性要求】无论这一轮是全新生成还是**增量/补丁**修改，你都必须至少给出 **2 条** suggest 建议` +
+        `${suggestKindLine}，并且要基于**这一轮刚刚改动的代码**给出下一步可以做什么（例如：还没处理的边界、` +
+        `可以抽出的复用点、缺少的错误处理或测试）。用户会把这些建议一键采纳进提示词，然后让你继续增量实现。`,
     );
   }
+  if (styleSummary) sys.push(styleSummary);
+  if (projectNote) sys.push(projectNote);
+  if (manualEditNote) sys.push(manualEditNote);
+  if (selectionNote) sys.push(selectionNote);
   if (repoMap) sys.push(`当前工作区已有的文件（项目地图）：\n\`\`\`\n${repoMap}\n\`\`\``);
   if (memoryBriefing) sys.push(`关于这位用户的长期习惯（来自本地记忆，请顺着他的习惯写）：\n${memoryBriefing}`);
   if (skills.length) {
@@ -71,10 +92,11 @@ export function buildMessages(ctx) {
         ragHits.map((h) => `--- ${h.source}:${h.startLine} ---\n${truncate(h.text, 1500)}`).join('\n'),
     );
   }
-  if (config.systemPromptExtra) sys.push(String(config.systemPromptExtra));
+  if (config.customInstructions) sys.push(`【用户的长期偏好（必须遵守）】\n${config.customInstructions}`);
 
   const user = [];
   user.push(`【用户完整提示词（会话上下文栈已自动拼接）】\n${prompt}`);
+  if (selectionNote) user.push(selectionNote);
   if (adopted.length) user.push(`【用户已采纳的建议】\n${adopted.map((a) => `- ${a.text}`).join('\n')}`);
   if (previousPrompt && previousPrompt !== prompt) user.push(`【上一轮生成时使用的提示词】\n${truncate(previousPrompt, 2000)}`);
   user.push(`【本轮模式】${MODE_GUIDE[mode] ?? MODE_GUIDE.regenerate}`);

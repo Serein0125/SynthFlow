@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SynthFlow 自检</title>
+  <style>
+    body { margin: 0; padding: 18px 20px; background: #0f1216; color: #e8ecf3;
+      font: 13px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p.sub { color: #8b95a7; margin: 0 0 14px; font-size: 12px; }
+    ul { list-style: none; padding: 0; margin: 0 0 16px; display: grid; gap: 4px; }
+    li { padding: 5px 10px; border-radius: 6px; background: #171b23; border: 1px solid #262b36; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+    li.ok { color: #3fbf8f; border-color: #23543f; }
+    li.bad { color: #e5606c; border-color: #5c2b31; }
+    #host { height: 240px; border: 1px solid #2b3442; border-radius: 8px; overflow: hidden; }
+    .hint { color: #5d6676; font-size: 11.5px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>SynthFlow 自检</h1>
+  <p class="sub">用来快速确认服务、静态资源、Monaco 编辑器是否正常。出问题时先看这一页。</p>
+  <ul id="results"></ul>
+  <div id="host"></div>
+  <p class="hint">如果下面这块区域里出现了带行号、带语法高亮的代码，说明编辑器工作正常。</p>
+
+  <script>
+    const results = document.getElementById('results');
+    const out = (name, ok, detail) => {
+      const li = document.createElement('li');
+      li.className = ok ? 'ok' : 'bad';
+      li.textContent = `${ok ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`;
+      results.appendChild(li);
+    };
+
+    (async () => {
+      // 1) 服务与关键接口
+      let health = null;
+      try {
+        health = await (await fetch('/api/health')).json();
+        out('服务在线', health.ok === true, `pid=${health.pid} 目标项目=${health.projectDir}`);
+        out('Staging 模式', typeof health.staging === 'boolean', health.staging ? '暂存（改动需确认）' : '直接写入');
+      } catch (err) {
+        out('服务在线', false, err.message);
+      }
+      for (const [name, url] of [['前端脚本', '/js/core.js'], ['样式表', '/styles.css'], ['Monaco 主程序', '/vendor/monaco/vs/editor/editor.main.js']]) {
+        try {
+          const r = await fetch(url);
+          out(`${name} 可访问`, r.ok, `${r.status} ${r.headers.get('content-length') ?? ''} 字节`);
+        } catch (err) {
+          out(`${name} 可访问`, false, err.message);
+        }
+      }
+      try {
+        const st = await (await fetch('/api/state')).json();
+        out('模型已配置', Boolean(st.provider?.ready), `${st.provider?.label ?? '?'} · ${st.provider?.model ?? '?'}`);
+        out('配置档数量', Array.isArray(st.profiles), `${st.profiles?.length ?? 0} 份`);
+      } catch (err) {
+        out('模型已配置', false, err.message);
+      }
+
+      // 2) Monaco
+      try {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = '/vendor/monaco/vs/loader.js';
+          s.onload = resolve;
+          s.onerror = () => reject(new Error('loader.js 加载失败'));
+          document.head.appendChild(s);
+        });
+        out('loader.js 加载', true);
+        window.require.config({ paths: { vs: '/vendor/monaco/vs' } });
+        window.MonacoEnvironment = {
+          getWorkerUrl(moduleId) {
+            const bootstrap =
+              "self.MonacoEnvironment = { baseUrl: '/vendor/monaco/' };" +
+              "importScripts('/vendor/monaco/vs/loader.js');" +
+              "require.config({ paths: { vs: '/vendor/monaco/vs' } });" +
+              `require([${JSON.stringify(moduleId)}], function () {});`;
+            return `data:text/javascript;charset=utf-8,${encodeURIComponent(bootstrap)}`;
+          },
+        };
+        await new Promise((resolve, reject) => window.require(['vs/editor/editor.main'], resolve, reject));
+        out('editor.main 加载', Boolean(window.monaco?.editor), window.monaco?.editor ? 'monaco 已就绪' : 'monaco 缺失');
+
+        const ed = window.monaco.editor.create(document.getElementById('host'), {
+          value: '// SynthFlow 自检\nconst greeting = "编辑器工作正常";\nfunction hello(name) {\n  return `${greeting}，${name}`;\n}\n',
+          language: 'javascript',
+          theme: 'vs-dark',
+          minimap: { enabled: false },
+          fontSize: 13,
+          automaticLayout: true,
+          scrollBeyondLastLine: false,
+        });
+        out('创建编辑器实例', Boolean(ed));
+        out('语言识别', ed.getModel().getLanguageId() === 'javascript', ed.getModel().getLanguageId());
+        out('语法着色', window.monaco.editor.tokenize('const a = 1;', 'javascript').length > 0);
+
+        const diff = window.monaco.editor.createDiffEditor(document.createElement('div'), { readOnly: true });
+        diff.setModel({
+          original: window.monaco.editor.createModel('const a = 1;\n', 'javascript'),
+          modified: window.monaco.editor.createModel('const a = 2;\n', 'javascript'),
+        });
+        out('差异编辑器可用', Boolean(diff.getModel()?.modified));
+        diff.dispose();
+        out('全部通过', true, '可以关闭本页，回到工作台');
+        document.title = 'SELFTEST_OK';
+      } catch (err) {
+        out('Monaco 初始化', false, err.message);
+        document.title = 'SELFTEST_FAIL';
+      }
+    })();
+  </script>
+</body>
+</html>

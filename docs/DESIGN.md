@@ -278,7 +278,110 @@ recordCommit()         若游标不在末尾 → 丢弃右侧分支（记入 dro
 
 ---
 
-## 11. 前端要点（v2）
+## 11. v3 架构补充
+
+### 11.1 暂存层（overlay）：让 AI 敢碰真实项目
+
+`Workspace` 的 `root`（目标项目）与 `overlayDir`（写入落点）是分开的两个概念：
+
+```
+直接模式   overlayDir === root         → 写盘立即生效（默认 workspace/ 用这个）
+暂存模式   overlayDir = projects/<p>/staging  → 读合并视图，写只进暂存层
+```
+
+- `read(rel)`：暂存层优先，否则读目标项目
+- `write(rel, content)`：**永远写暂存层**
+- `remove(rel)`：暂存层有就删它；只有项目里有就记进 `deleted` 集合（延迟删除）
+- `listFiles()/listTree()/repoMap()/RAG`：全部基于合并视图
+- `pending()`：暂存层 vs 项目的逐文件差异（added / modified / deleted + +/- 行数）
+- `applyPending()`：确认后逐文件拷贝进项目（先打快照），然后清空暂存层
+- `discardPending()`：清空暂存层，目标项目分毫未动
+
+这套语义让"AI 看得到真实项目"和"AI 不会改坏真实项目"同时成立。快照也基于合并视图，
+所以**回退**在两种模式下都正确：直接模式清空工作区再重建；暂存模式清空暂存层，
+合并视图自然回落到项目真实内容（不会误删项目里的文件 —— 这一点在冒烟测试里有专门用例）。
+
+### 11.2 项目风格扫描（`style.js`）
+
+扫描合并视图里的代码文件（上限 160 个），统计出：
+
+| 维度 | 方法 |
+| --- | --- |
+| 缩进 | 统计有缩进的行，Tab 票数 vs 空格票数；空格取"最可能的步长"（2/4/8 中按 `票数/步长` 打分） |
+| 引号 / 分号 | 统计 `'` 与 `"`；统计语句行里以 `;` 结尾的比例（样本 < 20 行时不表态） |
+| 注释语言 | 抽出所有注释，比较 CJK 字符数与英文词数 |
+| 命名 | 函数/类/常量声明名 → camel / Pascal / snake / CONSTANT 投票（少于 3 票不表态） |
+| 文件名 | 文件名 → kebab / Pascal / camel / snake 投票（少于 2 票不表态） |
+| 模块写法 | `import/export` 行数 vs `require/module.exports` 出现次数 |
+| 技术栈 | 读 `package.json` 的 dependencies + devDependencies 白名单匹配 |
+
+结果缓存在 `projects/<p>/style.json`，签名（文件列表 + 大小 + 内容长度）不变就复用。
+只有扫描到 ≥3 个文件、且至少有一条明确结论时才注入提示词 —— 信号不足时宁可不说话，
+否则会给模型错误的约束。
+
+### 11.3 轮次时间线（想法 3）
+
+`session.timeline` 保存最近 40 轮：`{id, kind, mode, at, ms, files, versionId, thoughts[], suggestions[], ops[]}`。
+思考每段截断 3000 字符、最多 6 段，建议最多 8 条 —— 目的是"刷新页面还能看到"，不是做完整审计日志。
+前端 `rehydrateTimeline()` 把它们按原样式重建为折叠的轮次块（恢复的建议标记为已处理，避免误点）。
+
+### 11.4 建议过滤的双保险（想法 5）
+
+1. **提示词层**：把关闭的类型明确列给模型（"本轮不要输出这些类型的建议"），并给出每轮条数上限 ——
+   这是省 token 的关键，避免生成完再丢弃。
+2. **服务端层**：`#filterSuggestions()` 在推送前再过滤一次并截断条数。模型不听话时兜底。
+
+### 11.5 版本"待确认"（想法 2）
+
+**文件当轮就落盘**（这是"不中断"的前提），确认动作只决定"要不要把这个版本留下"：
+
+```
+recordCommit({ confirmed: saveMode !== 'confirm' })
+   confirmed=false → 时间线标「待确认」，轮次块出现 [保留] [丢弃]
+confirmVersion(id) → 标记已确认
+discardVersion(id) → 等价于 moveVersion('back')，并把该版本从历史里退掉
+```
+
+`pendingConfirm` 会随版本列表一起下发，界面据此显示"待确认"徽标。
+
+### 11.6 多配置档（想法 8）
+
+```
+config.json
+  ├── profiles: [{id, name, provider, baseUrl, model, apiKey, temperature, maxTokens}]
+  └── activeProfileId
+```
+
+`loadConfig()` 把 `activeProfile` 派生到顶层的 `provider/baseUrl/model/apiKey`，所以下游（Provider、Runner）
+完全不用感知配置档的存在。`normalizeProfiles()` 负责把 v2 的单份配置迁移成 `profiles[0]`。
+接口只回传掩码（`apiKeySet` + `sk-…abcd`），明文 Key 永不出网。
+
+### 11.7 前端模块化与"能在 Node 里跑起来"的取舍
+
+前端拆成 5 个**经典脚本**（不是 ES Module）：`core → editor → layout → panels → app`。
+这样做的直接好处是冒烟测试可以把它们按顺序拼成一个函数体，在最小 DOM 垫片上**真跑一遍** —— 
+不用无头浏览器也能抓住"某个 id 拼错 / 变量未定义 / boot 抛错"这类白屏级问题。
+代价是模块间共享全局作用域（靠严格的命名约定维持：`el/S/LS/Editor/Layout/Panels`）。
+
+`Editor` 是一个对象字面量而不是 class：**对象字面量不能用 `#private` 方法**，
+这一点被 DOM 垫片测试当场抓到过（写的时候很像合法语法）。
+
+### 11.8 预演门槛：分数之外还要看"写了多少"
+
+最初只按意图分 `>= 0.32` 决定是否预演。实测发现一个反直觉的坑：
+
+> `新建 src/datefmt.js 导出 formatDate 函数，把时间戳…` 打到「…把」时，结尾是连接词「把」，
+> 被扣 0.38 分 → 分数 0.15 → **不预演**。而这恰恰是"用户明显在写一个完整需求"的时刻。
+
+连接词扣分的本意是"句子没写完，别急着改代码"，但它不该**同时**关掉预演 —— 预演本来就不落盘。
+所以门槛改成：
+
+```js
+const enoughContext = intent.signals.length >= 12 && intent.signals.hasVerb;
+const specWorthy = intent.score >= 0.32 || enoughContext;
+```
+
+即"分数够，**或者**已经写了足够长且带明确动作词"。修复后 livecheck 场景 A 才稳定测出预演路径。
 
 - **轮次块**：每轮生成是一个 `.stream-run`，头部显示 `第 N 轮 · 模式 · 时间 · 文件数 · 耗时`，
   按 `data-kind`/`data-mode` 着色；↑↓ 在轮次间跳转并 `anchor-flash` 高亮；整块可折叠。
@@ -294,7 +397,7 @@ recordCommit()         若游标不在末尾 → 丢弃右侧分支（记入 dro
 
 ---
 
-## 11. 已知取舍
+## 12. 已知取舍
 
 - 回退是**线性版本链 + 游标**：能自由往返，但在历史版本上继续生成会丢弃右侧分支（界面会告知丢弃了几个）。
   版本树会让 UI 与心智负担都变重，当前不值。
@@ -302,6 +405,11 @@ recordCommit()         若游标不在末尾 → 丢弃右侧分支（记入 dro
 - 快照是全量拷贝而非增量。文本文件 + 60 个版本上限，实测几百 KB 量级，不值得为此引入复杂度。
 - 前端没有语法高亮之外的"智能"（无 LSP、无类型检查）。它是需求到代码的通道，不是 IDE 替代品。
 - 逐行高亮意味着跨行结构（块注释、模板字符串）在行边界处会重新开标签，视觉上分段但内容无误。
-  这是"能标注新增行"必须付出的代价。
-- 内置演示模型保留在代码里（`--provider mock`），因为它是我做离线回归测试的唯一手段；
+  这是"能标注新增行"必须付出的代价。Monaco 可用时不存在这个问题（走官方装饰器）。
+- **暂存模式是覆盖式应用**，不做三方合并：同名文件直接用暂存内容覆盖。所以默认不开自动应用。
+- **目标项目的读取是全局的**：切到真实项目后，风格扫描与 RAG 会读它的代码。追求极致隔离的话，
+  可以把 `styleScan` 的 `maxFiles` 调小，或把目标目录指回 `workspace/`。
+- **Monaco 是唯一的外部依赖**（裁剪后 25 MB）。它加载失败会自动降级为只读高亮，
+  但降级路径的"编辑"能力就没了 —— `/selftest.html` 会明确报出是哪一步失败。
+- 内置演示模型保留在代码里（`--provider mock`），因为它是离线回归测试的唯一手段；
   界面上已彻底隐藏，不影响正常使用。

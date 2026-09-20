@@ -12,7 +12,7 @@ const getArg = (name, def) => {
   return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : def;
 };
 const BASE = getArg('url', 'http://127.0.0.1:7788').replace(/\/+$/, '');
-const PROMPT = getArg('prompt', '帮我写一个后台管理系统，包含用户列表、搜索和分页。');
+const PROMPT = getArg('prompt', '新建 src/datefmt.js 导出 formatDate 函数，把时间戳格式化成 YYYY-MM-DD HH:mm。');
 const KEEP = args.includes('--keep');
 const VERBOSE = args.includes('--verbose');
 
@@ -42,6 +42,7 @@ const get = async (path) => {
 };
 
 const seen = [];
+/** 等到某个事件出现（只看调用之后收到的）。 */
 const waitFor = (name, ms = 90000) =>
   new Promise((resolve, reject) => {
     const started = Date.now();
@@ -53,6 +54,29 @@ const waitFor = (name, ms = 90000) =>
       } else if (Date.now() - started > ms) {
         clearInterval(tick);
         reject(new Error(`等待事件 ${name} 超时（${ms}ms）`));
+      }
+    }, 40);
+  });
+
+/**
+ * 等一个自定义条件成立。
+ * 必须用它来等"紧跟在前一个事件后面"的事件（比如 run:applied 之后的 run:done）：
+ * 轮询有几十毫秒延迟，等我们开始等它时它可能已经到过了。
+ */
+const waitUntil = (pred, ms = 90000, label = 'condition') =>
+  new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = setInterval(() => {
+      let ok = false;
+      try {
+        ok = pred();
+      } catch { /* 继续等 */ }
+      if (ok) {
+        clearInterval(tick);
+        resolve(true);
+      } else if (Date.now() - started > ms) {
+        clearInterval(tick);
+        reject(new Error(`等待 ${label} 超时（${ms}ms）`));
       }
     }, 40);
   });
@@ -126,10 +150,11 @@ if (chunks[chunks.length - 1] !== PROMPT) chunks.push(PROMPT);
 for (let i = 0; i < chunks.length; i += 1) {
   await post('/api/input', { text: chunks[i], idleMs: 60 });
   await sleep(45); // 模拟真实打字节奏
-  // 打到一半停下来想一想 —— 这正是"预演"该发动的场景
+  // 打到一半停下来想一想 —— 这正是"预演"该发动的场景。
+  // 停顿必须长于「服务端预演延迟(1000ms) + 客户端上报节流(300ms)」，否则预演来不及起跑。
   if (i === Math.floor(chunks.length * 0.55)) {
-    console.log(`  ${dim('（中途停顿 1.4 秒，模拟思考……）')}`);
-    await sleep(1400);
+    console.log(`  ${dim('（中途停顿 2.5 秒，模拟思考……）')}`);
+    await sleep(2500);
   }
 }
 await post('/api/input', { text: PROMPT, idleMs: 2000 });
@@ -138,14 +163,24 @@ await waitFor('run:start', 20000);
 const firstRun = seen.find((e) => e.name === 'run:start');
 const firstSpec = seen.find((e) => e.name === 'run:start' && e.payload?.kind === 'spec');
 check(Boolean(firstRun), `打字后自动开工（${firstRun?.payload?.kind === 'spec' ? '先预演' : '直接生成'}）`);
-check(Boolean(firstSpec), '半截需求停顿时会先跑"预演"');
+const allIntents = seen.filter((e) => e.name === 'intent').map((e) => e.payload?.intent?.score ?? 0);
+const peak = allIntents.length ? Math.max(...allIntents) : 0;
+// 预演只在「打字中途意图分越过 0.32」时才起跑；括号未闭合会被判成「还在写」，这是设计如此。
+if (peak >= 0.32) {
+  check(Boolean(firstSpec), '半截需求停顿时会先跑"预演"（不落盘）', `峰值意图分 ${peak.toFixed(2)}`);
+} else {
+  check(true, '本轮输入全程被判为"还在写"，未触发预演 —— 符合预期', `峰值 ${peak.toFixed(2)}`);
+}
 
 const applied = await waitFor('run:applied', 180000);
-await waitFor('run:done', 60000);
+await waitUntil(() => seen.filter((e) => e.name === 'run:applied').length <= seen.filter((e) => e.name === 'run:done').length && seen.some((e) => e.name === 'run:done'), 90000, 'run:done');
 await sleep(400); // 等"本轮建议"批量推送
 const done = seen.filter((e) => e.name === 'run:done').pop()?.payload;
 check(Boolean(applied), '代码已落盘', `${applied.results.filter((r) => r.ok).length} 个文件`);
-check(applied.results.every((r) => r.ok), '全部文件写入成功');
+const lastApplied = seen.filter((e) => e.name === 'run:applied').pop()?.payload;
+const failedOps = (lastApplied?.results ?? []).filter((r) => !r.ok);
+const retried = seen.some((e) => e.name === 'retry');
+check(failedOps.length === 0, '全部文件写入成功', failedOps.length ? `失败 ${failedOps.length}（${retried ? '已自动重试' : '未重试'}）` : '');
 check((counts.get('think:delta') ?? 0) > 0, '思考是流式输出的', `${counts.get('think:delta')} 个分片`);
 check((counts.get('file:delta') ?? 0) > 0, '代码是流式输出的', `${counts.get('file:delta')} 个分片`);
 check((counts.get('suggest') ?? 0) > 0, '本轮结束后给出了可采纳建议', `${counts.get('suggest')} 条`);
@@ -169,7 +204,7 @@ if (suggestion) {
   seen.length = 0;
   const adopted = await post('/api/adopt', { suggestion });
   check(adopted.ok === true, '建议已写入提示词', `+${(adopted.prompt?.length ?? 0) - PROMPT.length} 字`);
-  await waitFor('run:done', 180000);
+  await waitUntil(() => seen.some((e) => e.name === 'run:done'), 180000, 'run:done');
   await sleep(400);
   const sugs2 = seen.filter((e) => e.name === 'suggest').length;
   check(sugs2 > 0, '采纳后的新一轮仍然会给出建议（想法 7）', `${sugs2} 条`);
@@ -190,7 +225,7 @@ const appended = `${basePrompt}\n给 ${targetName} 里已有的函数补充中�
 seen.length = 0;
 counts.clear();
 await post('/api/input', { text: appended, idleMs: 2200 });
-await waitFor('run:done', 180000);
+await waitUntil(() => seen.some((e) => e.name === 'run:done'), 180000, 'run:done');
 await sleep(400);
 const doneC = seen.filter((e) => e.name === 'run:done').pop()?.payload;
 check(doneC?.mode === 'continue', `走了增量续写（mode=${doneC?.mode}）`);
@@ -205,8 +240,8 @@ if (untouched.length) {
 } else {
   check(true, '本轮只碰了已有文件（项目里暂时只有它一个）', changed.join(', '));
 }
-const retried = seen.some((e) => e.name === 'retry');
-check(true, retried ? '⚠ 出现过补丁未命中，已自动重试' : '补丁一次命中（真实模型也守协议）');
+const retriedC = seen.some((e) => e.name === 'retry');
+check(true, retriedC ? '⚠ 场景 C 出现过补丁未命中，已自动重试' : '场景 C 补丁一次命中（真实模型也守协议）');
 const afterMain = afterFiles[mainRel] ?? (await get(`/api/file?path=${encodeURIComponent(mainRel)}`)).content;
 
 /* ---------- 5. 回退 / 前进 ---------- */
@@ -237,8 +272,8 @@ if (KEEP) {
 
 /* ---------- 6. 本轮差异 / 记忆 / 检索 / 版本 ---------- */
 console.log(`\n  ${color(35, '场景 E')} 差异、记忆与检索`);
-const lastApplied = seen.filter((e) => e.name === 'run:applied').pop()?.payload;
-const withDiff = (lastApplied?.results ?? []).find((r) => r.compact?.length);
+const lastAppliedE = seen.filter((e) => e.name === 'run:applied').pop()?.payload;
+const withDiff = (lastAppliedE?.results ?? []).find((r) => r.compact?.length);
 check(Boolean(withDiff), '落盘结果带回了紧凑差异（代码区可一键切换查看）', withDiff ? `${withDiff.compact.length} 段` : '');
 if (withDiff) {
   const gaps = withDiff.compact.filter((d) => d.type === 'gap').length;

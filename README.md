@@ -10,6 +10,7 @@
 ```bat
 :: 双击项目根目录的 start.cmd，或者：
 cd /d D:\ProgramData\SynthFlow
+npm install          :: 只为装 Monaco 编辑器（约 25 MB，见下方"磁盘"）
 npm start
 ```
 
@@ -19,11 +20,14 @@ Key 只写进本机 `.synthflow/config.json`，不会外发。
 想看它自己证明自己没问题：
 
 ```bat
-npm run smoke        :: 60 项离线冒烟测试（不联网、不花钱）
-node scripts/livecheck.mjs   :: 对正在运行的服务做一次真实用户流程演练（会真实调用你配置的模型）
+npm run smoke                  :: 69 项离线冒烟测试（不联网、不花钱）
+node scripts/livecheck.mjs     :: 对正在运行的服务做真实用户流程演练（会真实调用你配置的模型）
 ```
 
+浏览器里还有个自检页：**http://127.0.0.1:7788/selftest.html**（逐项检查服务、资源、模型、Monaco）。
+
 > 需要零成本离线演练时：`node src/server.js --provider mock`（内置演示模型，界面上已隐藏，仅供开发与测试）。
+> 排障时可以加 `SF_DEBUG=1` 启动，服务端会打印意图判定与预演决策过程。
 
 ---
 
@@ -72,6 +76,39 @@ node scripts/livecheck.mjs   :: 对正在运行的服务做一次真实用户流
 | 16 | 别弄坏电脑，交代清楚下载了什么、放哪了 | **没有下载任何东西、没有装任何依赖**，全部产物都在 `D:\ProgramData\SynthFlow` 内，见「磁盘与进程」 | ✅ |
 | 17 | 自己冒烟测试、上网看别人方案、注意 token 余额 | 60 项离线冒烟 + 在线验收脚本；`docs/RESEARCH.md`；状态栏实时显示 token 用量 | ✅ |
 | 18 | 权限问题找别的办法，太麻烦就先停下 | 全程无阻塞：服务只监听 `127.0.0.1`，无需管理员权限 | ✅ |
+
+---
+
+## v3 更新（可编辑 / 可自定义 / 可指向真实项目）
+
+| # | 你的建议 | 实际做了什么 |
+| --- | --- | --- |
+| 1 | 代码面板可控，可以直接改代码 | 换成 **Monaco（VS Code 内核）**：真编辑器、语法高亮、行号、折叠、`Ctrl+S` 保存（保存即生成一个可回退版本）、未保存时标签页显示 `•`。Monaco 加载失败会自动降级成原来的只读高亮，不会白屏 |
+| +A | 手动改动进入上下文（我提的） | 你手改过的文件会被记入 `session.manualEdits`，下一轮提示词里明确告诉模型"这些是人改的，用补丁改、别覆盖"。生成开始前若编辑器里有未保存内容，会**自动先保存**，绝不丢你的手改 |
+| +B | 选中代码 → 定向提需求（我提的） | 在编辑器里选中几行，输入框上方出现 `已选中 src/x.ts:12-18` 标签；该轮需求会优先只作用于这段，并在提示词里附上选中原文 |
+| 2 | 版本手动保存，每轮提示是否保存 | 默认 `每轮完成后问我`：轮次块里出现 `[保留 v7] [丢弃这轮改动]`，时间线上标「待确认」。**文件仍立即落盘**（这是"不中断"的前提），所以不会因为忘记点而丢东西；点丢弃就自动回退到上一版。想安静用就在设置里改成 `自动保存` |
+| 3 | 刷新后保留思考与建议 | 每轮（含预演）的思考、建议、文件操作都会写进会话（最近 40 轮），刷新页面后原样回灌，轮次导航依旧可用 |
+| 4 | 自动读取项目风格 | 新增 `styleScan`：扫描现有代码得出缩进/引号/分号/命名/文件命名/模块写法/注释语言/技术栈，作为**硬约束**注入提示词。在真实项目上实测：正确识别出「2 空格 / 双引号 / 不写分号 / camelCase / PascalCase 文件名 / Vue + Tailwind + Element Plus + Vite + TypeScript」 |
+| 5 | 可设置是否提优化/风险等建议 | 按类型开关（需求补全 / 优化方向 / 风险提示 / 测试建议 / 可访问性）+ 每轮最多几条。关掉的类型**不会让模型生成**（省 token），不是生成完再丢掉。默认风险提示开、测试建议关 |
+| 6 | 引入 RAG / Skills 适配个人喜好 | 设置里新增「技能与检索」：技能可新建/编辑/删除（写进 `.synthflow/skills/*.md`，按触发词自动注入），检索可手动测试与重建索引。另加**长期偏好**自由文本框（如"组件一律函数式 + 中文注释"），每次生成都会带上 |
+| 7 | 参考 Photoshop 的可自定义工作界面 | 面板之间可**拖拽调宽**（双击复原）、字号可调（界面/代码分开）、左右面板可整体隐藏，另有 4 套布局预设（默认 / 专注代码 / 专注对话 / 极简），全部存 localStorage |
+| 8 | 多个 API Key 自由切换 | 配置从单份改成**配置档列表**：可保存多份（名称/服务商/模型/Base URL/Key），顶栏下拉一键切换，设置里可增删改。Key 只回传掩码（`sk-…abcd`），旧的单份配置会自动迁移成第一份 |
+| +C | 与任意历史版本对比（我提的） | 差异视图旁边多了一个版本下拉：默认对比"本轮之前"，也可选任意历史版本，用 Monaco 的并排 diff 展示 |
+| +D | 改动先预览再应用到真实项目（我提的） | **暂存模式**：把目标项目指向你的真实项目后，AI 的改动只落在 `.synthflow/projects/<项目>/staging/`，编辑器顶部出现"待应用"条，列出改动文件与 +/- 行数，确认后才写进项目，也可以一键全部丢弃。**实测：指向你真实的 EasyCampus 前端跑了一轮生成，项目里 188 个文件大小与修改时间全部字节级未变** |
+
+### 关于目标项目（这是 v3 最实用的部分）
+
+设置 → 项目与风格 → 填一个目录 + 选「暂存模式」。之后：
+
+- **读**：合并视图，暂存层优先，否则读你的项目真实内容 —— 所以模型能看到你真实的代码、真实的风格、真实的组件名（实测它自己引用了项目里的 `ActivityCard`/`PostCard`/`CommentSection`）
+- **写**：只写暂存层，你的项目一动不动
+- **应用**：确认后才写入（会先打快照，随时可回退）
+- 每个目标项目有**独立的快照/会话/暂存目录**（`.synthflow/projects/<名字>-<hash>/`），切换项目不会互相污染
+
+### 自检页
+
+浏览器打开 **http://127.0.0.1:7788/selftest.html** —— 逐项检查服务、静态资源、模型配置、Monaco 编辑器与差异编辑器。
+出问题先看这一页。
 
 ---
 
@@ -149,18 +186,31 @@ npm start
 
 ```json
 {
-  "provider": "deepseek",
-  "baseUrl": "https://api.deepseek.com/v1",
-  "model": "deepseek-chat",
-  "temperature": 0.3,
-  "maxTokens": 4096,
+  "activeProfileId": "p_default",
+  "profiles": [
+    {
+      "id": "p_default",
+      "name": "DeepSeek",
+      "provider": "deepseek",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "apiKey": "sk-...",
+      "temperature": 0.3,
+      "maxTokens": 4096
+    }
+  ],
   "specDelayMs": 1000,
   "commitIdleMs": 900,
   "settleMs": 1600,
   "intentThreshold": 0.6,
   "autoCommit": true,
   "autoAdoptHigh": false,
-  "patchRetry": true
+  "patchRetry": true,
+  "saveMode": "confirm",
+  "suggest": { "clarify": true, "optimize": true, "risk": true, "test": false, "a11y": false, "max": 4, "timing": "round-end" },
+  "customInstructions": "",
+  "projectDir": "",
+  "writeMode": "direct"
 }
 ```
 
@@ -187,46 +237,57 @@ D:\ProgramData\SynthFlow\
 ├── start.cmd              一键启动（双击即可，会打开浏览器）
 ├── package.json           零依赖，无 node_modules
 ├── src\                   后端（全部 Node 内置模块）
-│   ├── server.js          HTTP + SSE + REST
-│   ├── runner.js          预演/提交/落盘/回退 的调度核心
-│   ├── session.js         上下文栈 · 意图判定 · 漂移决策 · 版本链
-│   ├── workspace.js       沙箱文件读写 · 补丁命中 · 快照
+│   ├── server.js          HTTP + SSE + REST + Monaco 静态服务 + 多项目隔离
+│   ├── runner.js          预演/提交/落盘/回退/自动重试 的调度核心
+│   ├── session.js         上下文栈 · 意图判定 · 漂移决策 · 版本游标 · 轮次时间线
+│   ├── workspace.js       沙箱文件读写 · 补丁命中 · 快照 · 暂存层（overlay）
 │   ├── protocol.js        流协议解析（think/suggest/file/memory）
-│   ├── prompt.js          上下文组装（项目地图/RAG/技能/用户画像）
-│   ├── llm.js             模型接入层 + 内置离线演示大脑（界面已隐藏）
+│   ├── prompt.js          上下文组装（风格/技能/检索/手改/选区/用户画像）
+│   ├── style.js           项目风格扫描（想法 4）
+│   ├── llm.js             模型接入层 + 多配置档 + 内置离线演示大脑（界面已隐藏）
 │   ├── rag.js             BM25 检索 + skills
 │   └── memory.js          习惯记忆与用户画像
 ├── public\                前端（原生，无构建）
-│   ├── index.html  styles.css  app.js
+│   ├── index.html  styles.css  selftest.html
+│   ├── app.js             主逻辑：SSE 接线 / 文件树 / 轮次流 / 输入框 / 启动
+│   └── js\core.js  js\editor.js(Monaco)  js\layout.js(布局)  js\panels.js(各面板)
 ├── scripts\
-│   ├── smoke.mjs          60 项离线冒烟测试
+│   ├── smoke.mjs          69 项离线冒烟测试
 │   ├── livecheck.mjs      在线端到端验收
 │   └── clean.mjs          磁盘清理（默认只看不删）
-├── workspace\             ★ 生成出来的代码全在这里（可以被你随意删）
+├── workspace\             ★ 默认目标的代码输出（可以被你随意删）
 ├── .synthflow\            ★ 本机运行数据（可以被你随意删）
-│   ├── config.json        你的模型配置（clean 脚本永不删它）
-│   ├── snapshots\         版本快照（回退用）
-│   ├── sessions\          会话上下文栈
-│   ├── history\ memory\   提示词历史与习惯画像
-│   ├── skills\            放 *.md 即可被自动挂载为技能
-│   ├── index.json         RAG 索引（可自动重建）
-│   └── testrun\           冒烟测试产物（跑完可删）
+│   ├── config.json        模型配置与配置档（clean 脚本永不删它）
+│   ├── skills\            技能 *.md（clean 脚本永不删）
+│   ├── memory\            习惯记忆（全局）
+│   └── projects\<项目>\   按目标项目隔离的数据
+│       ├── snapshots\     版本快照（回退/对比用）
+│       ├── sessions\      会话上下文栈 + 轮次时间线
+│       ├── staging\       暂存模式下的待应用改动
+│       ├── style.json     项目风格画像
+│       └── index.json     RAG 索引
 └── docs\                  设计文档与调研笔记
 ```
 
-**下载了什么？——什么都没下载。** 没有 `npm install`、没有 `node_modules`、没有全局安装、没有改注册表、
-没有写 `%USERPROFILE%` 或系统临时目录。整个项目就是上面的文本文件，加起来几 MB。
-npm 缓存指向项目内的 `.cache\npm`（原仓库已有配置），本次未被使用。
+**下载了什么？** v1/v2 一个字节都没下；**v3 为了 Monaco 编辑器装了 1 个依赖**：
+
+```
+npm install → node_modules/monaco-editor（连同 3 个小依赖：dompurify / marked / @types）
+  解包后 93.4 MB → 执行 node scripts/clean.mjs --vendor 裁掉运行时用不到的 dev/esm 构建 → 25.1 MB
+  npm 缓存：写进了全局 cache（约 23 MB），本项目的 .cache/npm 未被使用
+```
+
+没有全局安装、没有改注册表、没有写 `%USERPROFILE%`。想彻底删掉：`npm uninstall monaco-editor`（编辑器会自动降级为只读高亮，功能不受影响）。
 
 ### 磁盘占用与清理
 
 ```bat
 node scripts/clean.mjs              :: 只看占用，不删任何东西
 node scripts/clean.mjs --test       :: 删冒烟测试产物
+node scripts/clean.mjs --projects   :: 删各项目的快照/会话/暂存
 node scripts/clean.mjs --workspace  :: 清空生成出来的代码
-node scripts/clean.mjs --history    :: 删提示词历史与记忆
-node scripts/clean.mjs --snapshots  :: 删版本快照（回退能力重置）
-node scripts/clean.mjs --all        :: 以上全部（保留 config.json）
+node scripts/clean.mjs --vendor     :: 裁掉 Monaco 用不到的构建（省约 70 MB）
+node scripts/clean.mjs --all        :: 以上全部（保留 config.json 与 skills）
 ```
 
 用完后想彻底清空内存占用：关掉 `start.cmd` 那个黑窗口即可（或 `Ctrl+C`）。服务只监听 `127.0.0.1`，不对外网开放。
@@ -266,41 +327,54 @@ node scripts/clean.mjs --all        :: 以上全部（保留 config.json）
 ## 验证记录（本次交付实测）
 
 ```
-npm run smoke                 60 通过 / 0 失败 · 13.0s
-node scripts/livecheck.mjs    全部通过（离线内置模型 · 11.9s）
-node scripts/livecheck.mjs    全部通过（真实 DeepSeek · 38.0s）
-  场景 A 边打字边生成  → 中途停顿触发"预演"；本轮结束给出 3 条建议；
-                        预演结果被直接采纳（省一次调用）；返回真实 token 用量 ≈2811
-  场景 B 采纳建议      → 提示词 +69 字，自动跟进生成，并**又给出 3 条新建议**
-  场景 C 追加需求      → mode=continue，补丁一次命中，未涉及文件字节级不变
-  场景 D 回退 + 前进   → v3 ⇄ v4 往返：文件、提示词、游标同步；已在最新版时正确拒绝
-  场景 E 差异与检索    → 紧凑差异 34 段含 2 处折叠、索引 5 片段、版本链 v0 → v1 → v2 → v3 → v4
+npm run smoke                 69 通过 / 0 失败 · 13.0s
+node scripts/livecheck.mjs    43 项全通过（真实 DeepSeek · 48.1s）
+  场景 A 边打字边生成  → 中途停顿触发"预演"；本轮结束给出 6 条建议；
+                        预演结果被直接采纳（省一次调用）；返回真实 token 用量 ≈11939
+  场景 B 采纳建议      → 提示词 +103 字，自动跟进生成，并又给出 3 条新建议
+  场景 C 追加需求      → mode=continue，补丁一次命中，其余 10 个文件字节级不变
+  场景 D 回退 + 前进   → v47 ⇄ v48 往返：文件、提示词、游标同步；已在最新版时正确拒绝
+  场景 E 差异与检索    → 紧凑差异 8 段含 2 处折叠、索引 27 片段、版本链 v0 → … → v48
+
+真实项目实测（指向 D:\Trae_learning\EasyCampus-main\frontend，暂存模式）
+  风格扫描   → 2 空格 / 双引号 / 不写分号 / camelCase / PascalCase 文件名 /
+               Vue + Tailwind CSS + Element Plus + Vite + TypeScript / 中文注释
+  生成结果   → 模型自己引用了项目里真实的 ActivityCard、PostCard、CommentSection，
+               产出的 TypeScript 完全沿用项目风格（无分号、中文注释、2 空格）
+  安全性     → 188 个项目文件在生成前后「大小 + 修改时间」全部一致；丢弃后依旧一致
+
+浏览器实测（headless Edge + /selftest.html）
+  Monaco loader → editor.main → 创建实例 → 语言识别 → 语法着色 → 差异编辑器 全部 ✓
 ```
 
-代价：整轮真实验收约 5 次模型调用、合计约 1.4 万 token。**冒烟测试全程零成本**（不联网）。
+代价：整轮真实验收约 5 次模型调用、合计约 3 万 token。**冒烟测试全程零成本**（不联网）。
 
 ---
 
 ## 已知边界（不吹牛）
 
-- **内置演示模型**只会按关键词产出几类模板（后台管理 / 登录 / 图表 / 表单 / 通用小工具）。
-  界面上已移除，只用于离线回归测试；真实代码质量取决于你接的模型。
-- **补丁未命中**时会明确提示，并**自动重试一次**（把真实文件内容重新喂回去）；仍失败则保留其它文件的改动，
-  不会静默改坏文件。兜底策略是三层：精确 → 忽略首尾空白/行归一 → 首行锚点。
-- **版本链是线性的**：可以来回回退/前进，但在历史版本上继续生成会**丢弃右侧分支**（会提示你丢弃了几个版本），
-  与 git 在历史提交上继续提交的行为一致。暂不支持分支树。
+- **Monaco 是唯一的外部依赖**（约 25 MB）。如果它加载失败（文件被删、CSP 限制），编辑器会自动降级为只读高亮，
+  其余功能不受影响；`/selftest.html` 会明确告诉你哪一步挂了。
+- **暂存模式只保护"写入"，不保护"读取"**：切到真实项目后 SynthFlow 会读你的代码（做风格扫描与检索），
+  这是它贴齐风格的前提。不想让它读就把目标目录指回 `workspace/`。
+- **应用改动是覆盖式的**：确认时会用暂存内容覆盖项目里的同名文件，不会自动合并冲突。所以默认是暂存模式。
+- **内置演示模型**只会按关键词产出几类模板。界面上已移除，只用于离线回归测试。
+- **补丁未命中**会明确提示并**自动重试一次**；仍失败则保留其它文件的改动，不会静默改坏文件。
+  兜底策略是三层：精确 → 忽略首尾空白/行归一 → 首行锚点。
+- **版本链是线性的**：可以来回回退/前进，但在历史版本上继续生成会**丢弃右侧分支**（会提示丢弃了几个版本）。
+- **"待确认版本"只是标记，不是延迟写入**：文件当轮就落盘了，确认动作决定的是"保不保留为一个版本"。
 - **RAG 是词法检索（BM25）**，不是向量检索：零依赖、零下载、够用，但对语义改写不敏感。
-- **思考折叠是本地偏好**（localStorage），换浏览器会回到默认的"折叠"。
-- 前端目前是**工作台形态**（浏览器内），不是 VS Code 插件。插件化需要额外的 IDE 宿主环境配合。
+- **思考折叠、布局、主题、差异视图偏好**存在 localStorage，换浏览器会回到默认。
+- 前端仍是**工作台形态**（浏览器内），不是 VS Code 插件。
 
 ## 下一步可以做什么
 
-1. 接 VS Code 扩展（把 `workspace/` 换成 IDE 的文档模型，`file:start` 事件映射成编辑器跳转）。
+1. 接 VS Code 扩展（把目标目录换成 IDE 的文档模型，`file:start` 事件映射成编辑器跳转）。
 2. 把 BM25 换成向量检索（`rag.js` 已经是可替换的单点）。
-3. 版本树分支（现在丢弃的分支可以留下来，支持"从 v3 再试一版"并对比两条分支的代码）。
-4. 让建议支持"部分采纳"（只取 insert 的某一句）。
-5. skills 目录已经能挂 `.md`，可以往里塞你们团队的代码规范、组件库用法。
-6. 差异视图支持"与任意历史版本对比"（现在是只看本轮差异，快照里其实有全部版本）。
+3. 版本树分支（现在丢弃的分支可以留下来，支持"从 v3 再试一版"并对比两条分支）。
+4. 暂存模式升级成三方合并（现在同名文件是覆盖式应用，可以引入 diff3 自动合并）。
+5. 让建议支持"部分采纳"（只取 insert 的某一句）。
+6. 风格扫描接入 ESLint / Prettier 配置，直接读项目已有的规则而不是靠统计推断。
 
 ---
 

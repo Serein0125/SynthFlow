@@ -12,17 +12,41 @@
       <div class="brand">
         <span class="logo">◆</span>
         <span class="brand-name">SynthFlow</span>
-        <span class="tagline">边打字边生成 · 并行思考 · 一键回退</span>
+        <span id="project-chip" class="chip project-chip" title="目标项目目录">📁 workspace</span>
       </div>
       <div class="status-cluster">
         <span id="provider-badge" class="badge" title="当前模型">模型加载中…</span>
+        <select id="profile-select" class="mini-select hidden" title="切换模型配置"></select>
         <span id="run-badge" class="badge idle">空闲</span>
         <span class="spacer"></span>
-        <button id="btn-undo" class="btn" title="回退一步（Alt+Z）">⏪ 回退</button>
-        <button id="btn-redo" class="btn" title="前进到下一版（Alt+Shift+Z）" disabled>⏩ 前进</button>
-        <button id="btn-regenerate" class="btn" title="忽略已有产出，强制重新生成">↻ 重生成</button>
-        <button id="btn-theme" class="btn ghost icon-btn" title="切换主题（跟随系统 / 亮 / 暗）">🌙</button>
-        <button id="btn-settings" class="btn ghost" title="模型与参数设置">⚙ 设置</button>
+        <button id="btn-undo" class="btn" title="回退一步（Alt+Z）">⏪</button>
+        <button id="btn-redo" class="btn" title="前进到下一版（Alt+Shift+Z）" disabled>⏩</button>
+        <button id="btn-regenerate" class="btn" title="忽略已有产出，强制重新生成">↻</button>
+        <button id="btn-layout" class="btn ghost icon-btn" title="界面布局（参考 Photoshop 工作区）">▤</button>
+        <button id="btn-theme" class="btn ghost icon-btn" title="切换主题">🌙</button>
+        <button id="btn-help" class="btn ghost icon-btn" title="快捷键">?</button>
+        <button id="btn-settings" class="btn ghost" title="设置">⚙ 设置</button>
+      </div>
+
+      <div id="layout-panel" class="layout-panel hidden">
+        <div class="lp-head">界面布局</div>
+        <div class="lp-presets">
+          <button class="btn ghost small" data-preset="default">默认</button>
+          <button class="btn ghost small" data-preset="code">专注代码</button>
+          <button class="btn ghost small" data-preset="chat">专注对话</button>
+          <button class="btn ghost small" data-preset="zen">极简</button>
+        </div>
+        <label class="lp-row">左侧栏 <input id="ly-sidebar" type="range" min="0" max="520" step="10" /><span id="ly-sidebar-val" class="muted tiny">260px</span></label>
+        <label class="lp-row">思考栏 <input id="ly-stream" type="range" min="0" max="640" step="10" /><span id="ly-stream-val" class="muted tiny">340px</span></label>
+        <label class="lp-row">输入区 <input id="ly-composer" type="range" min="96" max="520" step="10" /><span id="ly-composer-val" class="muted tiny">190px</span></label>
+        <label class="lp-row">界面字号 <input id="ly-font-ui" type="range" min="11" max="17" step="0.5" /><span id="ly-font-ui-val" class="muted tiny">13px</span></label>
+        <label class="lp-row">代码字号 <input id="ly-font-code" type="range" min="10" max="20" step="0.5" /><span id="ly-font-code-val" class="muted tiny">12.5px</span></label>
+        <label class="check"><input id="ly-show-sidebar" type="checkbox" /> 显示左侧栏</label>
+        <label class="check"><input id="ly-show-stream" type="checkbox" /> 显示思考栏</label>
+        <div class="lp-foot">
+          <span class="muted tiny">拖动面板之间的竖线也能调宽，双击复原</span>
+          <button id="ly-reset" class="btn ghost small">恢复默认</button>
+        </div>
       </div>
     </header>
 
@@ -41,28 +65,41 @@
           </ol>
         </section>
       </aside>
+      <div id="split-left" class="splitter" title="拖动调整宽度，双击复原"></div>
 
       <main class="editor">
         <div class="tabs" id="tabs"></div>
         <div class="editor-toolbar">
           <span id="current-path" class="path">未选择文件</span>
+          <span id="dirty-dot" class="dirty-dot hidden" title="有未保存的修改">●</span>
           <span class="spacer"></span>
           <span id="file-meta" class="muted"></span>
-          <div class="seg" id="view-toggle" role="group" aria-label="视图切换">
+          <div class="seg" id="view-toggle" role="group">
             <button class="seg-btn active" data-view="code" title="看完整代码（Ctrl+D 切换）">代码</button>
-            <button class="seg-btn" data-view="diff" title="只看本轮改动（Ctrl+D 切换）">本轮差异<span id="diff-count" class="seg-badge hidden"></span></button>
+            <button class="seg-btn" data-view="diff" title="看差异（Ctrl+D 切换）">差异<span id="diff-count" class="seg-badge hidden"></span></button>
           </div>
-          <button id="btn-save" class="btn ghost small">保存</button>
+          <select id="compare-select" class="mini-select" title="选择对比基准"></select>
+          <button id="btn-save" class="btn ghost small" title="保存（Ctrl+S）">保存</button>
+        </div>
+        <div id="pending-bar" class="pending-bar hidden">
+          <span id="pending-text" class="pending-text"></span>
+          <span class="spacer"></span>
+          <button id="btn-apply-pending" class="btn primary small">应用到项目</button>
+          <button id="btn-discard-pending" class="btn ghost small">全部丢弃</button>
         </div>
         <div class="code-wrap">
+          <div id="editor-host" class="editor-host hidden"></div>
+          <div id="diff-host" class="editor-host hidden"></div>
           <pre id="code-pre" class="code"><code id="code" class="hl"></code></pre>
+          <pre id="diff-pre" class="code hidden"><code id="diff-code" class="hl"></code></pre>
           <div id="editor-empty" class="editor-empty">
-            <p>代码会在这里实时长出来。</p>
+            <p>代码会在这里实时长出来，也可以直接改。</p>
             <p class="muted">左边是它自动创建的文件，右边是它在想什么。</p>
           </div>
         </div>
       </main>
 
+      <div id="split-right" class="splitter" title="拖动调整宽度，双击复原"></div>
       <aside class="stream">
         <div class="pane-title-row">
           <h3 class="pane-title">思考 &amp; 建议</h3>
@@ -74,17 +111,23 @@
           <button id="btn-round-next" class="btn ghost tiny" title="下一轮">↓</button>
         </div>
         <div id="stream-body" class="stream-body">
-          <p class="empty">它在打字的间隙就会开始思考，并把可采纳的建议推到这里。</p>
+          <p class="empty">它在打字的间隙就会开始思考，并把可采纳的建议推到这里。<br />刷新页面也不会丢。</p>
         </div>
       </aside>
     </div>
 
+    <div id="split-composer" class="splitter horizontal" title="拖动调整输入区高度"></div>
     <footer class="composer">
       <div class="intent">
         <div class="intent-bar"><div id="intent-fill" class="intent-fill"></div></div>
         <span id="intent-text" class="intent-text">等待输入…</span>
         <span class="spacer"></span>
         <span id="decision-text" class="muted"></span>
+      </div>
+      <div id="selection-chip" class="selection-chip hidden">
+        <span class="tag">选中</span>
+        <span id="selection-text"></span>
+        <button id="selection-clear" class="btn ghost tiny">取消</button>
       </div>
       <div class="composer-row">
         <textarea id="prompt" rows="4" spellcheck="false"
@@ -100,9 +143,8 @@
         <span id="status-text" class="status-text">空闲</span>
         <span id="status-detail" class="muted"></span>
         <span class="spacer"></span>
-        <span id="usage" class="muted" title="字符数按 3 字符≈1 token 估算；接真实模型后优先使用接口返回的真实用量">本轮 ≈0 tokens · 累计 0 次调用</span>
+        <span id="usage" class="muted" title="接真实模型时优先使用接口返回的真实用量">累计 0 次调用</span>
         <span id="counter" class="muted">0 字</span>
-        <button id="btn-help" class="btn ghost tiny" title="快捷键">?</button>
       </div>
     </footer>
   </div>
@@ -122,12 +164,14 @@
       <div class="keys">
         <div><kbd>Alt</kbd>+<kbd>Z</kbd><span>回退一步（文件与提示词一起回到上一版）</span></div>
         <div><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd><span>前进到下一版（回退后可恢复）</span></div>
+        <div><kbd>Ctrl</kbd>+<kbd>S</kbd><span>保存当前文件（会生成一个可回退的版本）</span></div>
         <div><kbd>Alt</kbd>+<kbd>Enter</kbd><span>不等判定，立即生成</span></div>
-        <div><kbd>Esc</kbd><span>停止生成</span></div>
-        <div><kbd>Ctrl</kbd>+<kbd>D</kbd><span>代码 / 本轮差异 视图切换</span></div>
+        <div><kbd>Esc</kbd><span>关闭弹窗 / 停止生成</span></div>
+        <div><kbd>Ctrl</kbd>+<kbd>D</kbd><span>代码 / 差异 视图切换</span></div>
         <div><kbd>Ctrl</kbd>+<kbd>P</kbd><span>快速跳转文件</span></div>
         <div><kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd><span>采纳本轮第 N 条建议</span></div>
       </div>
+      <p class="muted">在编辑器里选中一段代码，再用输入框提需求，AI 会优先只改这一段。</p>
       <div class="modal-actions">
         <button id="help-close" class="btn primary">知道了</button>
       </div>
@@ -135,33 +179,121 @@
   </div>
 
   <div id="settings-modal" class="modal hidden">
-    <div class="modal-card">
-      <h2>模型与生成设置</h2>
-      <p class="muted">填写任意 OpenAI 兼容端点即可。API Key 只写入本机 <code>.synthflow/config.json</code>，不会外发。</p>
-      <div class="form-grid">
-        <label>服务商
-          <select id="cfg-provider"></select>
-        </label>
-        <label>模型名<input id="cfg-model" placeholder="deepseek-chat" /></label>
-        <label>Base URL<input id="cfg-baseUrl" placeholder="https://api.deepseek.com/v1" /></label>
-        <label>API Key<input id="cfg-apiKey" type="password" placeholder="sk-..." /></label>
-        <label>预演延迟 ms<input id="cfg-specDelayMs" type="number" min="0" step="100" /></label>
-        <label>判定完成后的等待 ms<input id="cfg-commitIdleMs" type="number" min="100" step="50" /></label>
-        <label>停手兜底等待 ms<input id="cfg-settleMs" type="number" min="200" step="100" /></label>
-        <label>意图完成阈值 0~1<input id="cfg-intentThreshold" type="number" min="0" max="1" step="0.05" /></label>
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <h2>设置</h2>
+        <div class="tabs-line">
+          <button class="tab-btn active" data-tab="model">模型</button>
+          <button class="tab-btn" data-tab="gen">生成</button>
+          <button class="tab-btn" data-tab="suggest">建议</button>
+          <button class="tab-btn" data-tab="project">项目与风格</button>
+          <button class="tab-btn" data-tab="skills">技能与检索</button>
+        </div>
       </div>
-      <div class="switches">
-        <label class="check"><input id="cfg-autoCommit" type="checkbox" /> 判定写完后自动落盘</label>
-        <label class="check"><input id="cfg-autoAdoptHigh" type="checkbox" /> 自动采纳高价值优化建议（会改写提示词）</label>
-        <label class="check"><input id="cfg-patchRetry" type="checkbox" /> 补丁未命中时自动重试一次（会多消耗一次调用）</label>
+
+      <div class="modal-body">
+        <section data-pane="model">
+          <p class="muted">可以保存多份配置（不同服务商 / 不同模型），点左侧圆点即可切换当前使用哪一份。</p>
+          <div id="pf-list" class="pf-list"></div>
+          <button id="pf-add" class="btn ghost small">＋ 新增配置</button>
+        </section>
+
+        <section data-pane="gen" class="hidden">
+          <div class="form-grid">
+            <label>预演延迟 ms<input id="cfg-specDelayMs" type="number" min="0" step="100" /></label>
+            <label>判定完成后的等待 ms<input id="cfg-commitIdleMs" type="number" min="100" step="50" /></label>
+            <label>停手兜底等待 ms<input id="cfg-settleMs" type="number" min="200" step="100" /></label>
+            <label>意图完成阈值 0~1<input id="cfg-intentThreshold" type="number" min="0" max="1" step="0.05" /></label>
+            <label>版本保存方式
+              <select id="cfg-saveMode">
+                <option value="confirm">每轮完成后问我（保留 / 丢弃）</option>
+                <option value="auto">自动保存，不打扰</option>
+              </select>
+            </label>
+          </div>
+          <div class="switches">
+            <label class="check"><input id="cfg-autoCommit" type="checkbox" /> 判定写完后自动落盘</label>
+            <label class="check"><input id="cfg-autoAdoptHigh" type="checkbox" /> 自动采纳高价值优化建议（会改写提示词）</label>
+            <label class="check"><input id="cfg-patchRetry" type="checkbox" /> 补丁未命中时自动重试一次（会多消耗一次调用）</label>
+          </div>
+        </section>
+
+        <section data-pane="suggest" class="hidden">
+          <p class="muted">关掉的类型不会出现在思考栏里，也不会让模型去生成（省 token）。风险提示建议保持开启。</p>
+          <div class="switches">
+            <label class="check"><input id="sg-clarify" type="checkbox" /> 需求补全（信息缺失时主动补全）</label>
+            <label class="check"><input id="sg-optimize" type="checkbox" /> 优化方向（更好的写法 / 结构）</label>
+            <label class="check"><input id="sg-risk" type="checkbox" /> 风险提示（安全、边界、隐患）</label>
+            <label class="check"><input id="sg-test" type="checkbox" /> 测试建议</label>
+            <label class="check"><input id="sg-a11y" type="checkbox" /> 可访问性</label>
+            <label>每轮最多几条建议<input id="sg-max" type="number" min="0" max="9" step="1" /></label>
+          </div>
+          <label class="stack">长期偏好（每次生成都会带上，可以写你的编码习惯）
+            <textarea id="cfg-custom" rows="4" placeholder="例如：组件一律用函数式 + hooks；样式用 Tailwind；注释用中文；不要用 any。"></textarea>
+          </label>
+        </section>
+
+        <section data-pane="project" class="hidden">
+          <p class="muted">当前目标：<code id="pj-current"></code></p>
+          <div class="form-grid">
+            <label>项目目录<input id="pj-dir" placeholder="留空 = 用 D:\ProgramData\SynthFlow\workspace" /></label>
+            <label>写入方式
+              <select id="pj-mode">
+                <option value="staging">暂存模式：改动先放着，我确认后再写入项目（推荐）</option>
+                <option value="direct">直接写入：生成即改你的项目</option>
+              </select>
+            </label>
+          </div>
+          <button id="pj-apply" class="btn primary small">切换项目</button>
+          <div id="pj-list" class="pj-list"></div>
+          <hr class="sep" />
+          <h3 class="sub">项目风格扫描</h3>
+          <p class="muted">读一遍现有代码，提炼缩进/引号/命名/模块写法，作为硬约束注入模型，让新代码贴齐项目风格。</p>
+          <button id="st-rescan" class="btn ghost small">重新扫描</button>
+          <div id="st-result" class="st-result"></div>
+        </section>
+
+        <section data-pane="skills" class="hidden">
+          <h3 class="sub">技能（按触发词自动注入的规范说明）</h3>
+          <div id="sk-list" class="sk-list"></div>
+          <button id="sk-new" class="btn ghost small">＋ 新建技能</button>
+          <div id="sk-editor" class="sk-editor hidden">
+            <div class="form-grid">
+              <label>技能名<input id="sk-name" placeholder="例如：团队前端规范" /></label>
+              <label>触发词（逗号分隔）<input id="sk-triggers" placeholder="组件, 样式, 表单" /></label>
+            </div>
+            <label class="stack">简述<input id="sk-desc" placeholder="一句话说明它管什么" /></label>
+            <label class="stack">内容（Markdown）<textarea id="sk-body" rows="7" placeholder="写下必须遵守的规则…"></textarea></label>
+            <div class="modal-actions">
+              <button id="sk-save" class="btn primary small">保存技能</button>
+              <button id="sk-cancel" class="btn ghost small">取消</button>
+            </div>
+          </div>
+          <hr class="sep" />
+          <h3 class="sub">项目检索（RAG）</h3>
+          <p class="muted">生成时会自动检索相关代码片段塞进上下文。这里可以手动试一下检索效果。</p>
+          <div class="row">
+            <input id="rag-query" placeholder="输入关键词，例如：分页 搜索" />
+            <button id="rag-test" class="btn ghost small">测试检索</button>
+            <button id="rag-rebuild" class="btn ghost small">重建索引</button>
+          </div>
+          <div id="rag-result" class="rag-result"></div>
+        </section>
       </div>
+
       <div class="modal-actions">
-        <button id="cfg-save" class="btn primary">保存并生效</button>
+        <button id="cfg-save" class="btn primary">保存设置</button>
         <button id="cfg-close" class="btn ghost">关闭</button>
       </div>
     </div>
   </div>
 
-  <script type="module" src="/app.js"></script>
+  <div id="skills-modal" class="modal hidden"></div>
+
+  <script src="/js/core.js"></script>
+  <script src="/js/editor.js"></script>
+  <script src="/js/layout.js"></script>
+  <script src="/js/panels.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

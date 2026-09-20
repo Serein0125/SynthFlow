@@ -14,8 +14,9 @@
     "bench": "node scripts/smoke.mjs --bench",
     "clean": "node scripts/clean.mjs"
   },
-  "dependencies": {},
-  "devDependencies": {},
+  "dependencies": {
+    "monaco-editor": "^0.56.0"
+  },
   "keywords": [
     "ai-coding",
     "speculative-generation",

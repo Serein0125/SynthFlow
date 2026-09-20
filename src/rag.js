@@ -12,7 +12,8 @@ export class RagIndex {
   constructor(workspace, opts = {}) {
     this.workspace = workspace;
     this.storeDir = workspace.storeDir;
-    this.skillsDir = path.join(this.storeDir, 'skills');
+    // 技能是"用户级"的，跟项目无关，所以允许从外部指定（默认仍放在 storeDir 下）
+    this.skillsDir = opts.skillsDir ?? path.join(this.storeDir, 'skills');
     this.indexFile = path.join(this.storeDir, 'index.json');
     this.maxChunkChars = opts.maxChunkChars ?? 1800;
     this.docs = [];
