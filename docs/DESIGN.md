@@ -780,6 +780,57 @@ this.emit = (name, payload) => {
 
 ---
 
+## 19. 推理强度与思维链分流（v3.7）
+
+### 19.1 为什么参数要实测而不是照文档抄
+
+各家文档对"推理强度"的写法差别很大，而且文档常常滞后于实际接口。
+这一层一旦发错参数，表现是 400/422 直接失败，或者更糟 —— 参数被静默忽略、看起来一切正常但没有效果。
+所以实现前先用真实 Key 打了 7 枪，把结论钉在代码注释里：
+
+| 探测 | 结果 |
+| --- | --- |
+| `GET /v1/models` | 只有 `deepseek-flash` 与 `deepseek-v4-pro` |
+| `reasoning_effort: 'ultra'` | **422**，错误信息里带出合法枚举 `none/minimal/low/medium/high/xhigh/max` |
+| `thinking: {type:'enabled'}` + `reasoning_effort` | 200，响应多出 `reasoning_content` 与 `completion_tokens_details.reasoning_tokens` |
+| `thinking: {type:'disabled'}` | 200，无 `reasoning_content` |
+| 只给 `reasoning_effort` 不给 `thinking` | 200 —— 思考默认就是开的，所以只有"关"才需要显式发 `thinking` |
+| `model: 'deepseek-chat'` | **200，但回显 `model: deepseek-flash` 且无思维链** |
+
+最后一条最阴：旧模型名还能用，但被静默转成了 flash 的**非思考**模式。
+用户配置里留着它，界面上一切正常，只是"推理强度"怎么调都不生效。
+**参数被静默接受但没有效果，比直接报错更难发现。** 所以加了启动期迁移 + 落盘。
+
+### 19.2 思维链必须走独立通道
+
+DeepSeek 把 CoT 放在 `reasoning_content`，和 `content` **分开**返回。而思考模式是
+`flash` / `pro` 的**默认行为**（不是可选增强）。原来的实现是：
+
+```js
+const text = delta.content ?? delta.reasoning_content ?? '';
+if (text) yield { type: 'delta', text };
+```
+
+这行代码在 `deepseek-chat`（非思考）下完全正常，所以历史上没暴露。一旦切到 flash/pro，
+**模型的思考过程会和代码输出汇入同一条流**，被协议解析器当成真的文件操作 ——
+模型"想"到 `<<<SF file path="x">>>` 就会被真的写盘。
+
+修法是利用应用**本来就有**的思考通道（`think:start/think:delta/think:end` 是预演阶段显示
+"AI 在打字时就在想什么"用的），把 CoT 接到那里：既修了正确性问题，
+也让"模型自己的推理"和"应用产生的思考"合并成用户视角下的一条思考流。
+
+回归测试用了一个很直接的办法：**往思维链里塞一段完全合法的协议标记**，然后断言它一个字都不能
+出现在正文流里。这类"通道串味"的 bug 用普通断言很难覆盖，但用"投毒"就很干脆。
+
+### 19.3 默认值的选择
+
+官方默认强度是 `high`。这个应用默认给 `low`，理由是它的**调用模式**：
+预演由"打字停顿 ~1 秒"触发，用户在写一句话的过程中可能触发好几次。
+默认高档会把钱烧在还没写完的半句话上，而且预演结果经常被丢弃。
+默认档要匹配的是**调用频率**，不是"理论上最好的质量"。
+
+---
+
 ## 15. 已知取舍
 
 - 回退是**线性版本链 + 游标**：能自由往返，但在历史版本上继续生成会丢弃右侧分支（界面会告知丢弃了几个）。

@@ -9,25 +9,114 @@ export const PRESETS = {
   // 内置演示模型：界面上不再展示（hidden），只在 `node src/server.js --provider mock` 时可用，
   // 以及供 scripts/smoke.mjs 做离线回归测试。这样"界面干净"和"零成本可测"两件事都能成立。
   mock: { label: '内置演示（离线可用）', baseUrl: '', model: 'synthflow-demo', needsKey: false, hidden: true },
-  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', needsKey: true, envKey: 'DEEPSEEK_API_KEY' },
+  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash', needsKey: true, envKey: 'DEEPSEEK_API_KEY' },
   openai: { label: 'OpenAI 兼容', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', needsKey: true, envKey: 'OPENAI_API_KEY' },
   ollama: { label: '本地 Ollama', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5-coder:7b', needsKey: false },
   siliconflow: { label: 'SiliconFlow', baseUrl: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-Coder-7B-Instruct', needsKey: true, envKey: 'SILICONFLOW_API_KEY' },
   custom: { label: '自定义 OpenAI 兼容端点', baseUrl: '', model: '', needsKey: false },
 };
 
+/**
+ * 每个服务商可选的模型与"推理强度"。
+ *
+ * DeepSeek 这份是**实测出来的**（2026-09，直接用 API Key 打的）：
+ *   GET /v1/models        → 只有 deepseek-flash 与 deepseek-v4-pro 两个
+ *   POST 带 reasoning_effort: 'ultra' → 422，错误信息里给出合法枚举：
+ *        none | minimal | low | medium | high | xhigh | max
+ *   带 thinking:{type:'enabled'} + reasoning_effort → 响应里多出 reasoning_content
+ *   带 thinking:{type:'disabled'}                  → 没有 reasoning_content
+ *   旧名字 deepseek-chat 仍然 200，但会被静默转给 deepseek-flash 的**非思考**模式（回显 model=deepseek-flash）
+ *
+ * 所以这里只放实测过的东西；没有实测过的服务商不给模型清单（保持自由输入），
+ * 强度选项也标注清楚是"按 OpenAI 格式发送"。
+ */
+export const MODEL_CATALOG = {
+  deepseek: {
+    models: [
+      { id: 'deepseek-flash', label: 'Flash', note: 'V4.1-Flash · 快且便宜 · 支持看图' },
+      { id: 'deepseek-v4-pro', label: 'Pro', note: 'V4-Pro · 更强更贵 · 不支持看图' },
+    ],
+    efforts: [
+      { id: 'none', label: '关闭思考', note: '不产生思维链，最快最省' },
+      { id: 'low', label: '低', note: '少量思考 —— 日常改代码够用（推荐）' },
+      { id: 'medium', label: '中', note: '中等思考' },
+      { id: 'high', label: '高', note: '官方默认档' },
+      { id: 'max', label: '最高', note: '最慢最贵，难问题才用' },
+    ],
+    thinkingToggle: true, // 支持用 thinking:{type:'disabled'} 显式关闭
+    effortParam: 'reasoning_effort',
+    defaultEffort: 'low',
+  },
+  openai: {
+    models: [],
+    efforts: [
+      { id: 'none', label: '关闭', note: '不发送推理强度参数' },
+      { id: 'low', label: '低', note: 'reasoning_effort: low' },
+      { id: 'medium', label: '中', note: 'reasoning_effort: medium' },
+      { id: 'high', label: '高', note: 'reasoning_effort: high' },
+    ],
+    effortParam: 'reasoning_effort',
+    defaultEffort: 'none',
+    note: '仅推理类模型（o 系列等）认这个参数；普通模型请选「关闭」',
+  },
+  siliconflow: {
+    models: [],
+    efforts: [
+      { id: 'none', label: '关闭', note: '不发送推理强度参数' },
+      { id: 'low', label: '低', note: 'reasoning_effort: low' },
+      { id: 'medium', label: '中', note: 'reasoning_effort: medium' },
+      { id: 'high', label: '高', note: 'reasoning_effort: high' },
+    ],
+    effortParam: 'reasoning_effort',
+    defaultEffort: 'none',
+  },
+  custom: {
+    models: [],
+    efforts: [
+      { id: 'none', label: '关闭', note: '不发送推理强度参数' },
+      { id: 'low', label: '低', note: 'reasoning_effort: low' },
+      { id: 'medium', label: '中', note: 'reasoning_effort: medium' },
+      { id: 'high', label: '高', note: 'reasoning_effort: high' },
+    ],
+    effortParam: 'reasoning_effort',
+    defaultEffort: 'none',
+    note: '不确定你的端点支不支持就不要开，开了被拒会自动降级重试一次',
+  },
+};
+
+/** 某个服务商支持的强度选项（没有就用"关闭"一个选项）。 */
+export function effortsOf(provider) {
+  return MODEL_CATALOG[provider]?.efforts ?? [{ id: 'none', label: '关闭', note: '该服务商未内置强度选项' }];
+}
+
+/** 旧模型名迁移：deepseek-chat / deepseek-reasoner 已不在 /v1/models 里了。 */
+const LEGACY_MODEL_MAP = {
+  'deepseek-chat': 'deepseek-flash',
+  'deepseek-reasoner': 'deepseek-flash',
+  'deepseek-coder': 'deepseek-flash',
+  'deepseek-v4-flash': 'deepseek-flash',
+  'deepseek-v4-flash-vision-exp': 'deepseek-flash',
+};
+
 export function newProfile(overrides = {}) {
   const provider = overrides.provider ?? 'deepseek';
   const preset = PRESETS[provider] ?? PRESETS.custom;
+  const catalog = MODEL_CATALOG[provider];
+  // 旧模型名统一迁移：deepseek-chat 虽然还能返回 200，但实际是 flash 的非思考模式，
+  // 留在配置里会让人以为"我选的是 chat"，而且思考强度选了也不生效。
+  let model = overrides.model ?? preset.model ?? '';
+  if (provider === 'deepseek' && LEGACY_MODEL_MAP[model]) model = LEGACY_MODEL_MAP[model];
   return {
     id: overrides.id ?? `p_${Math.random().toString(36).slice(2, 9)}`,
     name: overrides.name ?? preset.label ?? provider,
     provider,
     baseUrl: overrides.baseUrl ?? preset.baseUrl ?? '',
-    model: overrides.model ?? preset.model ?? '',
+    model,
     apiKey: overrides.apiKey ?? '',
     temperature: overrides.temperature ?? 0.3,
     maxTokens: overrides.maxTokens ?? 4096,
+    // 推理强度：off 语义用 'none' 表示"不思考/不发送参数"
+    reasoningEffort: overrides.reasoningEffort ?? catalog?.defaultEffort ?? 'none',
   };
 }
 
@@ -35,7 +124,20 @@ export function newProfile(overrides = {}) {
 function normalizeProfiles(stored) {
   const list = Array.isArray(stored.profiles) ? stored.profiles.filter((p) => p && typeof p === 'object') : [];
   if (list.length) {
-    return list.map((p, i) => ({ ...newProfile({ name: `配置 ${i + 1}` }), ...p, id: p.id || `p_${i}` }));
+    return list.map((p, i) => {
+      // 注意：这里是 { ...默认值, ...存储值 } 的合并，所以**存储值会覆盖**迁移结果。
+      // 模型名的迁移必须在合并**之后**再做一遍，否则老配置里的 deepseek-chat
+      // 会一直留着 —— 它虽然还能返回 200，但实际被转成 flash 的非思考模式，
+      // 推理强度选了也不生效，界面上却看不出任何异常。
+      const merged = { ...newProfile({ name: `配置 ${i + 1}` }), ...p, id: p.id || `p_${i}` };
+      if (merged.provider === 'deepseek' && LEGACY_MODEL_MAP[merged.model]) {
+        merged.model = LEGACY_MODEL_MAP[merged.model];
+      }
+      if (!merged.reasoningEffort) {
+        merged.reasoningEffort = MODEL_CATALOG[merged.provider]?.defaultEffort ?? 'none';
+      }
+      return merged;
+    });
   }
   if (stored.provider || stored.apiKey || stored.model) {
     return [newProfile({
@@ -77,6 +179,8 @@ export function loadConfig(projectRoot) {
     apiKey,
     temperature: Number(active.temperature ?? 0.3),
     maxTokens: Number(active.maxTokens ?? 4096),
+    // 推理强度：空值按"该服务商的默认档"兜底（DeepSeek 默认 low，其它默认 none=不发送）
+    reasoningEffort: active.reasoningEffort ?? MODEL_CATALOG[provider]?.defaultEffort ?? 'none',
     profiles,
     activeProfileId: activeId,
 
@@ -135,6 +239,7 @@ export function saveConfig(projectRoot, patch) {
     next.apiKey = active.apiKey;
     next.temperature = active.temperature;
     next.maxTokens = active.maxTokens;
+    next.reasoningEffort = active.reasoningEffort ?? 'none';
   }
   if (patch.writeMode !== undefined) {
     // 只认两个合法值：脏值落盘后再被 loadConfig 一兜底，用户选的模式就又变了。
@@ -957,12 +1062,53 @@ async function* openaiStream(req, cfg) {
     max_tokens: cfg.maxTokens,
     stream_options: { include_usage: true }, // 拿到真实 token 用量，方便用户盯住余额
     messages: req.messages,
+    ...thinkingParams(cfg),
   };
   const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: req.signal });
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '');
+    // 推理强度参数被拒时（有些端点不认），自动去掉重试一次 —— 报错原文照样带上，不瞒着用户
+    const usedThinking = Object.keys(thinkingParams(cfg)).length > 0;
+    if (usedThinking && (res.status === 400 || res.status === 422)) {
+      yield { type: 'note', text: `该端点不接受推理强度参数（HTTP ${res.status}），已自动去掉重试：${text.slice(0, 160)}` };
+      const plain = { ...body };
+      delete plain.thinking;
+      delete plain.reasoning_effort;
+      const retry = await fetch(url, { method: 'POST', headers, body: JSON.stringify(plain), signal: req.signal });
+      if (!retry.ok || !retry.body) {
+        const t2 = await retry.text().catch(() => '');
+        throw new Error(`模型接口返回 ${retry.status}: ${t2.slice(0, 300)}`);
+      }
+      yield* readSse(retry);
+      return;
+    }
     throw new Error(`模型接口返回 ${res.status}: ${text.slice(0, 300)}`);
   }
+  yield* readSse(res);
+}
+
+/**
+ * 把"推理强度"翻译成请求字段。
+ *
+ * DeepSeek 的实测结论（2026-09）：
+ *   - reasoning_effort 合法枚举 none|minimal|low|medium|high|xhigh|max，其余值直接 422
+ *   - 思考模式**默认开启**；要关就用 thinking:{type:'disabled'}，或者 effort 给 none
+ *   - 思考时温度/presence_penalty/frequency_penalty 都不生效（不报错，只是被忽略）
+ */
+function thinkingParams(cfg) {
+  const effort = cfg.reasoningEffort ?? 'none';
+  const catalog = MODEL_CATALOG[cfg.provider];
+  if (!effort || effort === 'none') {
+    // 显式关闭：只有确认支持这个开关的服务商才发，否则宁可什么都不发
+    return catalog?.thinkingToggle ? { thinking: { type: 'disabled' } } : {};
+  }
+  const param = catalog?.effortParam ?? (cfg.provider === 'custom' ? 'reasoning_effort' : null);
+  if (!param) return {};
+  return { [param]: effort };
+}
+
+/** 读取 OpenAI 兼容的 SSE 流。 */
+async function* readSse(res) {
   const decoder = new TextDecoder('utf-8');
   let buf = '';
   let sawUsage = false;
@@ -982,8 +1128,12 @@ async function* openaiStream(req, cfg) {
           yield { type: 'usage', usage: json.usage };
         }
         const delta = json.choices?.[0]?.delta ?? {};
-        const text = delta.content ?? delta.reasoning_content ?? '';
-        if (text) yield { type: 'delta', text };
+        // ★ 思维链必须走**单独一条通道**。
+        // 以前这里写的是 `delta.content ?? delta.reasoning_content`，把 CoT 和正文
+        // 混进了同一条流 —— 而思考模式是 flash/pro 的默认行为，
+        // 于是模型的思考过程会被当成"代码输出"喂给协议解析器。
+        if (delta.reasoning_content) yield { type: 'think', text: delta.reasoning_content };
+        if (delta.content) yield { type: 'delta', text: delta.content };
       } catch { /* 跳过心跳/半包 */ }
     }
   }
@@ -1047,11 +1197,17 @@ export function createProvider(cfg) {
   if (!cfg.baseUrl) missing.push('baseUrl');
   if (!cfg.model) missing.push('model');
   if (PRESETS[provider]?.needsKey && !cfg.apiKey) missing.push('apiKey');
+  const effortId = cfg.reasoningEffort ?? MODEL_CATALOG[provider]?.defaultEffort ?? 'none';
+  const effortLabel = effortsOf(provider).find((e) => e.id === effortId)?.label ?? effortId;
   return {
     name: provider,
     label,
     ready: missing.length === 0,
-    note: missing.length ? `缺少配置：${missing.join(', ')}（可在界面右上角「模型设置」补全）` : `${cfg.model} @ ${cfg.baseUrl}`,
+    note: missing.length
+      ? `缺少配置：${missing.join(', ')}（可在界面右上角「模型设置」补全）`
+      : `${cfg.model} @ ${cfg.baseUrl} · 推理强度：${effortLabel}`,
+    model: cfg.model,
+    reasoningEffort: effortId,
     stream: (req) => openaiStream(req, cfg),
   };
 }

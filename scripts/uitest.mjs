@@ -689,6 +689,83 @@ try {
     if (rows < 1) throw new Error('没有渲染出任何配置档');
   });
 
+  await test('★ 模型可选（下拉清单）+ 可手填，并有推理强度选择', async () => {
+    await cdp.evaluate(`document.querySelector('#settings-modal [data-tab="model"]').click(); return true;`);
+    await sleep(300);
+    const info = await cdp.evaluate(`
+      const row = document.querySelector('#pf-list .pf-row');
+      if (!row) return { error: '没有配置档行' };
+      const model = row.querySelector('.pf-model');
+      const dl = model ? document.querySelector('#' + model.getAttribute('list')) : null;
+      const effort = row.querySelector('.pf-effort');
+      return {
+        hasModelInput: Boolean(model),
+        modelValue: model?.value ?? '',
+        datalistId: model?.getAttribute('list') ?? null,
+        options: dl ? [...dl.querySelectorAll('option')].map((o) => o.value) : [],
+        hasEffort: Boolean(effort),
+        effortValue: effort?.value ?? null,
+        effortOptions: effort ? [...effort.options].map((o) => o.value) : [],
+        hint: row.querySelector('.pf-hint')?.textContent?.trim() ?? '',
+      };
+    `);
+    if (info.error) throw new Error(info.error);
+    if (!info.hasModelInput) throw new Error('没有模型输入框');
+    if (!info.datalistId) throw new Error('模型输入框没挂 datalist —— 那样就只能手打，选不了');
+    // 当前生效的服务商是 deepseek，清单里必须给出实测存在的那两个模型
+    if (info.options.length) {
+      if (!info.options.includes('deepseek-flash')) throw new Error(`模型清单里没有 deepseek-flash：${info.options.join(',')}`);
+      if (!info.options.includes('deepseek-v4-pro')) throw new Error(`模型清单里没有 deepseek-v4-pro：${info.options.join(',')}`);
+    } else {
+      throw new Error('模型清单是空的 —— 用户没法在 flash / pro 之间选');
+    }
+    if (!info.hasEffort) throw new Error('没有推理强度选择框');
+    const need = ['none', 'low', 'medium', 'high', 'max'];
+    if (JSON.stringify(info.effortOptions) !== JSON.stringify(need)) {
+      throw new Error(`强度选项不对：${info.effortOptions.join(',')}（应为 ${need.join(',')}）`);
+    }
+    console.log(`      ${dim(`模型清单 ${info.options.join('/')} · 当前 ${info.modelValue} · 强度 ${info.effortOptions.join('/')} · 现值 ${info.effortValue}`)}`);
+  });
+
+  await test('★ 顶栏显示当前模型与推理强度（这两件事决定速度和质量，不该藏起来）', async () => {
+    const badge = await cdp.evaluate(`return { text: document.querySelector('#provider-badge')?.textContent?.trim() ?? '', title: document.querySelector('#provider-badge')?.title ?? '' };`);
+    if (!/deepseek/i.test(badge.text)) throw new Error(`顶栏没显示模型：${badge.text}`);
+    if (!/思考|不思考/.test(badge.text)) throw new Error(`顶栏没显示推理强度：${badge.text}`);
+    if (!badge.title) throw new Error('徽标没有 title 说明');
+    console.log(`      ${dim(`顶栏徽标：${badge.text}`)}`);
+  });
+
+  await test('改推理强度会真的写进配置（切回原值）', async () => {
+    const before = await (await fetch(`${BASE}/api/state`)).json();
+    const origEffort = before.provider.reasoningEffort;
+    const next = origEffort === 'high' ? 'low' : 'high';
+    await cdp.evaluate(`
+      const row = document.querySelector('#pf-list .pf-row');
+      const eff = row.querySelector('.pf-effort');
+      eff.value = ${JSON.stringify(next)};
+      eff.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    `);
+    await sleep(900);
+    const after = await (await fetch(`${BASE}/api/state`)).json();
+    if (after.provider.reasoningEffort !== next) {
+      throw new Error(`选了 ${next}，服务端却是 ${after.provider.reasoningEffort}`);
+    }
+    if (!after.provider.note.includes(next === 'high' ? '高' : '低')) {
+      throw new Error(`provider.note 没跟着更新：${after.provider.note}`);
+    }
+    // 还原
+    await cdp.evaluate(`
+      const row = document.querySelector('#pf-list .pf-row');
+      const eff = row.querySelector('.pf-effort');
+      eff.value = ${JSON.stringify(origEffort)};
+      eff.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    `);
+    await sleep(800);
+    console.log(`      ${dim(`强度 ${origEffort} → ${next} → ${origEffort}，服务端每次都跟上`)}`);
+  });
+
   await test('技能面板可打开编辑器', async () => {
     await cdp.evaluate(`document.querySelector('#settings-modal [data-tab="skills"]').click(); return true;`);
     await sleep(350);

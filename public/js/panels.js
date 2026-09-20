@@ -16,6 +16,7 @@ const Panels = {
         state: st,
         config: { ...st.config, ...cfgRes.config },
         presets: st.presets ?? {},
+        modelCatalog: st.modelCatalog ?? {},
         profiles: st.profiles ?? [],
         activeProfileId: st.activeProfileId,
         projects: st.projects ?? { list: [] },
@@ -242,16 +243,25 @@ const Panels = {
   renderProfiles(profiles, activeProfileId, presets) {
     const box = el.modal.querySelector('#pf-list');
     if (!box) return;
+    const catalog = this.ctx.modelCatalog ?? {};
     box.innerHTML = '';
     for (const p of profiles) {
       const active = p.id === activeProfileId;
+      const cat = catalog[p.provider] ?? { models: [], efforts: [], defaultEffort: 'none' };
       const row = document.createElement('div');
       row.className = `pf-row${active ? ' active' : ''}`;
+      const listId = `pf-models-${p.id}`;
+      // 模型用 input+datalist：既能从清单里挑，也能手填（没实测过的服务商不给清单，
+      // 但绝不能因此让用户没法输入模型名）。
+      const modelOpts = (cat.models ?? []).map((m) => `<option value="${esc(m.id)}">${esc(m.label)} — ${esc(m.note ?? '')}</option>`).join('');
+      const effortOpts = (cat.efforts ?? []).map((e) => `<option value="${esc(e.id)}"${e.id === (p.reasoningEffort ?? 'none') ? ' selected' : ''} title="${esc(e.note ?? '')}">${esc(e.label)}</option>`).join('');
       row.innerHTML =
         `<label class="check"><input type="radio" name="pf" ${active ? 'checked' : ''} /></label>` +
         `<input class="pf-name" value="${esc(p.name)}" />` +
         `<select class="pf-provider">${Object.entries(presets).map(([k, v]) => `<option value="${k}"${k === p.provider ? ' selected' : ''}>${esc(v.label)}</option>`).join('')}</select>` +
-        `<input class="pf-model" value="${esc(p.model)}" placeholder="模型名" />` +
+        `<input class="pf-model" list="${listId}" value="${esc(p.model)}" placeholder="模型名" />` +
+        `<datalist id="${listId}">${modelOpts}</datalist>` +
+        `<select class="pf-effort" title="推理强度：越高越准，也越慢越贵">${effortOpts}</select>` +
         `<input class="pf-base" value="${esc(p.baseUrl)}" placeholder="Base URL" />` +
         `<input class="pf-key" type="password" placeholder="${p.apiKeySet ? `已保存 ${esc(p.apiKeyHint)}（留空不改）` : 'API Key'}" />` +
         `<button class="btn ghost small pf-del" title="删除">✕</button>`;
@@ -260,6 +270,7 @@ const Panels = {
         name: row.querySelector('.pf-name').value.trim() || p.name,
         provider: row.querySelector('.pf-provider').value,
         model: row.querySelector('.pf-model').value.trim(),
+        reasoningEffort: row.querySelector('.pf-effort').value,
         baseUrl: row.querySelector('.pf-base').value.trim(),
         apiKey: row.querySelector('.pf-key').value.trim(),
       });
@@ -276,12 +287,32 @@ const Panels = {
       };
       row.querySelector('input[name=pf]').addEventListener('change', () => save(true));
       row.querySelector('.pf-provider').addEventListener('change', () => {
-        const preset = presets[row.querySelector('.pf-provider').value];
+        const key = row.querySelector('.pf-provider').value;
+        const preset = presets[key];
+        const nextCat = catalog[key] ?? { models: [], efforts: [], defaultEffort: 'none' };
         if (preset) {
           row.querySelector('.pf-model').value = preset.model ?? '';
           row.querySelector('.pf-base').value = preset.baseUrl ?? '';
         }
+        // 换服务商时，模型清单和强度选项都要跟着换
+        const dl = row.querySelector(`#${listId}`);
+        if (dl) dl.innerHTML = (nextCat.models ?? []).map((m) => `<option value="${esc(m.id)}">${esc(m.label)} — ${esc(m.note ?? '')}</option>`).join('');
+        const eff = row.querySelector('.pf-effort');
+        if (eff) {
+          eff.innerHTML = (nextCat.efforts ?? []).map((e) => `<option value="${esc(e.id)}" title="${esc(e.note ?? '')}">${esc(e.label)}</option>`).join('');
+          eff.value = nextCat.defaultEffort ?? 'none';
+        }
       });
+      // 模型输入框旁边提示一下这个模型的特点
+      const hint = document.createElement('span');
+      hint.className = 'pf-hint muted tiny';
+      const updateHint = () => {
+        const hit = (cat.models ?? []).find((m) => m.id === row.querySelector('.pf-model').value.trim());
+        hint.textContent = hit ? hit.note : (cat.note ?? '');
+      };
+      row.appendChild(hint);
+      row.querySelector('.pf-model').addEventListener('input', updateHint);
+      updateHint();
       row.querySelectorAll('input,select').forEach((node) => node.addEventListener('change', () => save(false)));
       row.querySelector('.pf-del').addEventListener('click', async () => {
         try {

@@ -218,10 +218,17 @@ function setStatus(kind, text, detail = '') {
 function renderUsage() {
   const fmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n ?? 0));
   const parts = [];
-  if (S.usage.last) parts.push(`本轮 ≈${fmt(S.usage.last)}`);
+  if (S.usage.last) {
+    parts.push(`本轮 ≈${fmt(S.usage.last)}${S.usage.lastReasoning ? `（思考 ${fmt(S.usage.lastReasoning)}）` : ''}`);
+  }
   parts.push(`累计 ${S.usage.calls} 次调用`);
   if (S.usage.tokens) parts.push(`${fmt(S.usage.tokens)} tokens`);
-  if (el.usage) el.usage.textContent = parts.join(' · ');
+  if (S.usage.reasoning) parts.push(`其中思考 ${fmt(S.usage.reasoning)}`);
+  if (el.usage) {
+    el.usage.textContent = parts.join(' · ');
+    el.usage.title = '接真实模型时优先使用接口返回的真实用量。思考模式下思维链单独计费，'
+      + '「推理强度」越高这部分越大 —— 想省钱就把强度调低或关掉。';
+  }
 }
 
 /* ======================== 代码高亮（Monaco 不可用时的降级） ======================== */

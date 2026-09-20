@@ -253,6 +253,72 @@ Node 内置 WebSocket 之后完全没必要引第三方。整个测试台是一�
 | **2** | 切到直接写入后，页面像坏了一样：输入框被挤到屏幕外、顶栏能被滚走 | **真 bug，被 #1 藏住了**：`.editor` 是网格，行是**按"第几个孩子"对号入座**的。`#pending-bar` 一旦 `display:none`（直接写入模式下永远如此），后面的孩子整体上移一行 → 代码区掉进 `auto` 行塌成 **0 高**、分隔条吃掉 `1fr`、输入区落进 `5px` 的分隔条行，**溢出 185px（= 190 − 5）**，整个页面因此能上下滚 | 每个孩子用显式 `grid-row` 定位，谁被隐藏都只留一个 0 高空行，其它行纹丝不动。冒烟/UI 测试各加一条"页面整体不可滚动"守住 |
 | **3** | 每轮生成完状态栏都红着「出错了」，可文件其实写对了 | **真 bug，而且每轮必现**：`#applyRun` 里 `version` 在**手动保存模式**（你现在用的就是这个）下恒为 `null`，同一段代码上面几处都写的是 `version?.id`，唯独 `if (version.droppedBranches)` 漏了问号 → 每轮生成成功后都抛一次 `TypeError`。因为异常发生在 `run:done` 之后，只等 `run:done` 的用例根本发现不了 | 补上空值保护，并加一条**断言"不许出现 run:error"**的冒烟用例（已验证：把修复退回去它立刻变红，报的就是你截图里那句 `Cannot read properties of null (reading 'droppedBranches')`） |
 
+## v3.7 更新（自己选模型 + 推理强度）
+
+你说的"能选 flash 还是 pro，并且有对应的推理能力强度"——做了，而且**参数是实测出来的，不是照文档猜的**。
+
+### 先拿到事实
+
+直接用你的 API Key 打了两枪：
+
+```
+GET  /v1/models          → 只有两个：deepseek-flash、deepseek-v4-pro
+POST reasoning_effort=ultra → HTTP 422，错误信息里给出合法枚举：
+                              none | minimal | low | medium | high | xhigh | max
+POST thinking:{type:'enabled'} + reasoning_effort → 响应里多出 reasoning_content
+POST thinking:{type:'disabled'}                    → 没有 reasoning_content
+```
+
+顺带查出一件你可能不知道的事：**`deepseek-chat` 已经不在模型列表里了**。请求还能返回 200，
+但会被静默转给 `deepseek-flash` 的**非思考模式**（回显 `model: deepseek-flash`）。
+也就是说你之前的配置一直跑在 flash 上，而且"推理强度"就算选了也不会生效 —— 界面上完全看不出来。
+现在配置会自动迁移成 `deepseek-flash`（旧名字 → 真实模型名，并补齐强度字段）。
+
+### 做了什么
+
+**① 模型能选，也能手填。** 设置 → 模型 → 每个配置档的模型框变成"下拉清单 + 自由输入"二合一：
+DeepSeek 给出 `Flash`（V4.1-Flash · 快且便宜 · 支持看图）和 `Pro`（V4-Pro · 更强 · 不支持看图），
+鼠标点开就能选，也可以手打任意模型名（没实测过的服务商不给清单，但绝不因此让你没法输入）。
+
+**② 推理强度可选，而且真的按服务商翻译成正确的字段：**
+
+| 选项 | DeepSeek 实际发出的参数 |
+| --- | --- |
+| 关闭思考 | `thinking: {type: 'disabled'}` —— 不产生思维链，最快最省 |
+| 低（默认） | `reasoning_effort: 'low'` |
+| 中 / 高 / 最高 | `reasoning_effort: 'medium' / 'high' / 'max'` |
+
+默认给**低**而不是官方默认的"高"：这个工具是**每次打字停顿都可能触发一次预演**的，
+默认开高档会把钱烧在你还没写完的半句话上。想要最准就手动调到高。
+
+**③ 思维链走思考栏 —— 这条是必须一起修的。**
+
+DeepSeek 把 CoT 放在 `reasoning_content` 里**和正文分开返回**，而思考模式是 flash/pro 的
+**默认行为**。原来的代码写的是 `delta.content ?? delta.reasoning_content`，把两者挤进了同一条流 ——
+**只要一开思考，模型的思考过程就会被当成"代码输出"喂给协议解析器**。
+现在 `reasoning_content` 走应用本来就有思考通道，正文走协议通道，各归各。
+冒烟测试里有一条专门守这个：往思维链里塞一段**看起来完全合法的 `<<<SF file>>>` 标记**，
+断言它一个字都不能漏进正文流。
+
+**④ 钱花在哪儿看得见。** 顶栏徽标显示 `DeepSeek · deepseek-flash · 思考·高`；
+状态栏显示 `本轮 ≈1.9k（思考 403）` —— 思维链单独计费，强度调高之后这部分会明显变大。
+
+**⑤ 端点不认这个参数怎么办。** 有些 OpenAI 兼容端点不支持 `reasoning_effort`。
+这时会自动去掉该参数重试一次，并弹一条说明（不静默吞掉，也不让你自己猜为什么报错）。
+
+### 实测
+
+真模型跑了一轮，强度调到"高"：
+
+```
+顶栏徽标      DeepSeek · deepseek-flash · 思考·高
+思考栏收到    1902 字真实思维链
+用量          本轮 ≈1.9k（思考 403）· 累计 1 次调用
+项目目录      seed.js, think-check.md   ← 没有可疑文件
+```
+
+---
+
 ## v3.6 更新（切项目后时间线还是旧的 + 版本删除）
 
 ### 你报的第一条：切项目后版本时间线还是旧的

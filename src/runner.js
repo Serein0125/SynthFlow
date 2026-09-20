@@ -338,8 +338,29 @@ export class Runner {
     try {
       for await (const evt of this.provider.stream({ messages, signal: run.abort.signal, userPrompt: run.prompt, mode: run.mode, existingFiles })) {
         if (run.abort.signal.aborted) break;
-        if (evt?.type === 'delta' && evt.text) parser.push(evt.text);
-        else if (evt?.type === 'usage' && evt.usage) run.usage = evt.usage; // 真实 token 用量
+        if (evt?.type === 'delta' && evt.text) {
+          parser.push(evt.text);
+        } else if (evt?.type === 'think' && evt.text) {
+          // ★ 模型自己的思维链（DeepSeek 的 reasoning_content）走**思考栏**，
+          // 绝不能混进协议解析器 —— 思考模式是 flash/pro 的默认行为，
+          // 一旦混进去，模型的思考过程会被当成"代码输出"。
+          // 应用本来就有 think:start/think:delta/think:end 这套通道，正好对上。
+          if (!run.modelThinking) {
+            run.modelThinking = true;
+            this.emit('think:start', { runId: run.id, source: 'model' });
+          }
+          run.chars += evt.text.length;
+          this.emit('think:delta', { runId: run.id, delta: evt.text, source: 'model' });
+        } else if (evt?.type === 'usage' && evt.usage) {
+          run.usage = evt.usage; // 真实 token 用量
+        } else if (evt?.type === 'note' && evt.text) {
+          // 例如"该端点不支持推理强度参数，已自动去掉重试"
+          this.emit('toast', { level: 'warn', message: evt.text });
+        }
+      }
+      if (run.modelThinking) {
+        run.modelThinking = false;
+        this.emit('think:end', { runId: run.id, text: '', source: 'model' });
       }
       parser.end();
     } catch (err) {
@@ -469,12 +490,20 @@ export class Runner {
     // 用过的选区就消费掉，避免一直粘在后续轮次上
     this.selection = null;
 
-    // token 用量：优先用接口返回的真实 usage，没有就按字符数估算
+    // token 用量：优先用接口返回的真实 usage，没有就按字符数估算。
+    // 思考模式下 completion_tokens 里有一大块是思维链，单独记一份 ——
+    // 「推理强度」调到高之后花钱明显变快，得让用户看得见钱花在哪儿。
+    const reasoningTokens = run.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
     const usage = run.usage
-      ? { tokens: run.usage.total_tokens ?? (run.usage.prompt_tokens ?? 0) + (run.usage.completion_tokens ?? 0), real: true }
-      : { tokens: Math.max(0, Math.round(run.chars / 3)), real: false };
+      ? {
+        tokens: run.usage.total_tokens ?? (run.usage.prompt_tokens ?? 0) + (run.usage.completion_tokens ?? 0),
+        reasoning: reasoningTokens,
+        real: true,
+      }
+      : { tokens: Math.max(0, Math.round(run.chars / 3)), reasoning: 0, real: false };
     s.stats.modelCalls = (s.stats.modelCalls ?? 0) + 1;
     s.stats.estTokens = (s.stats.estTokens ?? 0) + usage.tokens;
+    if (reasoningTokens) s.stats.reasoningTokens = (s.stats.reasoningTokens ?? 0) + reasoningTokens;
 
     this.memory?.observeRun({
       prompt: run.prompt,
@@ -1010,7 +1039,14 @@ export class Runner {
         writeMode: this.workspace.staging ? 'staging' : 'direct',
         files: this.workspace.listFiles().length,
       },
-      provider: { name: this.provider.name, label: this.provider.label, ready: this.provider.ready, note: this.provider.note, model: this.config.model },
+      provider: {
+        name: this.provider.name,
+        label: this.provider.label,
+        ready: this.provider.ready,
+        note: this.provider.note,
+        model: this.config.model,
+        reasoningEffort: this.config.reasoningEffort ?? 'none',
+      },
       profile: { id: this.config.activeProfileId, name: (this.config.profiles ?? []).find((p) => p.id === this.config.activeProfileId)?.name ?? '' },
       busy: this.busy,
       run: this.run ? { id: this.run.id, kind: this.run.kind, mode: this.run.mode } : null,

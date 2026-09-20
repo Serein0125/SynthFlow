@@ -671,6 +671,9 @@ function setRunBadge(status) {
   }
 }
 
+/** 推理强度的中文标签（和后端 MODEL_CATALOG 里的 id 对应）。 */
+const EFFORT_TEXT = { none: '不思考', low: '思考·低', medium: '思考·中', high: '思考·高', max: '思考·最高' };
+
 function renderProviderBadge() {
   const p = S.provider;
   if (!p) {
@@ -681,9 +684,14 @@ function renderProviderBadge() {
     return;
   }
   if (el.providerBadge) {
-    el.providerBadge.textContent = `${p.label ?? p.name ?? '模型'}${p.ready ? '' : ' · 未就绪'}`;
+    // 把"哪个模型 + 什么推理强度"直接写在顶栏上：
+    // 这两件事直接决定速度、质量和花钱速度，不该藏在设置面板里。
+    const model = p.model ? ` · ${p.model}` : '';
+    const effort = EFFORT_TEXT[p.reasoningEffort] ?? '';
+    el.providerBadge.textContent = `${p.label ?? p.name ?? '模型'}${model}${effort ? ` · ${effort}` : ''}${p.ready ? '' : ' · 未就绪'}`;
     el.providerBadge.className = `badge ${p.ready ? 'ok' : 'err'}`;
-    el.providerBadge.title = p.note ?? '';
+    el.providerBadge.title = `${p.note ?? ''}\n点击可以在设置里换模型与推理强度`;
+    el.providerBadge.style.cursor = 'pointer';
   }
 }
 
@@ -845,6 +853,7 @@ on('state', (st) => {
   if (stats) {
     if (typeof stats.modelCalls === 'number') S.usage.calls = stats.modelCalls;
     if (typeof stats.estTokens === 'number') S.usage.tokens = stats.estTokens;
+    if (typeof stats.reasoningTokens === 'number') S.usage.reasoning = stats.reasoningTokens;
   }
   renderUsage();
   const keepDone = S.statusKind === 'done' && Date.now() - S.statusAt < 6000;
@@ -977,6 +986,7 @@ on('run:done', (d) => {
   }
   if (d.usage) {
     S.usage.last = d.usage.tokens ?? 0;
+    S.usage.lastReasoning = d.usage.reasoning ?? 0;
     renderUsage();
   }
   // 直接写入模式要明说"已经进项目了"，否则用户会下意识去找"应用到项目"按钮

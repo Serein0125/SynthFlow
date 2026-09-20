@@ -4,6 +4,7 @@
 // 所有测试产物都写在 <项目>/.synthflow/testrun/ 下，跑完自动清理。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,7 +16,7 @@ import { Memory } from '../src/memory.js';
 import { RagIndex } from '../src/rag.js';
 import { Runner, normalizeTiming } from '../src/runner.js';
 import { createServer } from '../src/server.js';
-import { loadConfig, newProfile, saveConfig } from '../src/llm.js';
+import { createProvider, loadConfig, MODEL_CATALOG, newProfile, saveConfig } from '../src/llm.js';
 import { scanStyle } from '../src/style.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1226,9 +1227,14 @@ await test('旧版单份配置会平滑迁移成配置档列表', () => {
   const cfg = loadConfig(dir);
   assert.equal(cfg.profiles.length, 1, '应生成一个配置档');
   assert.equal(cfg.profiles[0].apiKey, 'sk-old', '旧的 apiKey 必须被保留');
-  assert.equal(cfg.profiles[0].model, 'deepseek-chat');
+  // deepseek-chat 已经不在 /v1/models 里了（实测只剩 deepseek-flash 与 deepseek-v4-pro），
+  // 请求虽然还能 200，但会被静默转成 flash 的**非思考**模式 —— 那样"推理强度"选了也不生效。
+  // 所以迁移时要把旧名字换成真实存在的模型 id。
+  assert.equal(cfg.profiles[0].model, 'deepseek-flash', '旧模型名应迁移到真实存在的模型');
+  assert.equal(cfg.profiles[0].reasoningEffort, 'low', '新配置档要带上推理强度，默认低');
   assert.equal(cfg.activeProfileId, cfg.profiles[0].id);
   assert.equal(cfg.apiKey, 'sk-old', '当前生效模型应指向该配置档');
+  assert.equal(cfg.reasoningEffort, 'low', '当前生效的推理强度要能从配置档派生出来');
   assert.equal(cfg.specDelayMs, 900);
   assert.equal(cfg.saveMode, 'manual', 'v3.1 默认只有显式保存才产生版本');
   assert.equal(cfg.suggest.risk, true, '风险提示默认开启');
@@ -1937,9 +1943,139 @@ await test('★ 删除"当前版本"：先退回上一版，再把这一版摘�
   assert.ok(sess.versions.every((v) => v.id !== v2.versionId), 'v2 必须真的从链上消失');
 });
 
-/* ============================ 15. 基准（可选） ============================ */
+/* ====== 15. 模型选择与推理强度（用户反馈回归） ====== */
+section('15. 模型选择与推理强度');
+
+/** 起一个假的 OpenAI 兼容端点，用来精确复现 DeepSeek 的响应格式。 */
+async function fakeEndpoint(handler) {
+  const srv = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      let body = {};
+      try { body = JSON.parse(raw); } catch { /* ignore */ }
+      handler(body, res);
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${srv.address().port}`, close: () => new Promise((r) => srv.close(r)) };
+}
+
+function sseChunks(res, chunks) {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  for (const c of chunks) res.write(`data: ${JSON.stringify(c)}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+await test('模型清单与强度选项是实测过的值', () => {
+  const ds = MODEL_CATALOG.deepseek;
+  assert.deepEqual(
+    ds.models.map((m) => m.id).sort(),
+    ['deepseek-flash', 'deepseek-v4-pro'],
+    'DeepSeek 这两个模型是直接问 /v1/models 得到的，界面上的清单必须和它一致',
+  );
+  const ids = ds.efforts.map((e) => e.id);
+  assert.deepEqual(ids, ['none', 'low', 'medium', 'high', 'max'], '强度枚举要和接口报的合法值对得上');
+  assert.equal(newProfile({ provider: 'deepseek' }).model, 'deepseek-flash', '默认模型应该是真实存在的那个');
+  assert.equal(newProfile({ provider: 'deepseek' }).reasoningEffort, 'low', '默认强度取"低"：预演是频繁触发的，默认开高档烧钱');
+  assert.equal(newProfile({ provider: 'deepseek', model: 'deepseek-reasoner' }).model, 'deepseek-flash', '旧模型名要迁移');
+  assert.equal(newProfile({ provider: 'openai' }).reasoningEffort, 'none', '没实测过的服务商默认不发送强度参数');
+});
+
+await test('★ 推理强度按服务商映射成正确的请求字段', async () => {
+  const seen = [];
+  const ep = await fakeEndpoint((body, res) => {
+    seen.push(body);
+    sseChunks(res, [{ choices: [{ delta: { content: 'ok' } }] }]);
+  });
+  const run = async (effort, provider = 'custom') => {
+    const p = createProvider({ provider, baseUrl: ep.url, model: 'm', apiKey: 'k', temperature: 0.3, maxTokens: 64, reasoningEffort: effort });
+    for await (const _ of p.stream({ messages: [{ role: 'user', content: 'hi' }] })) { /* 消费掉 */ }
+  };
+
+  await run('high');
+  assert.equal(seen.at(-1).reasoning_effort, 'high', '选了高档就要发 reasoning_effort=high');
+  await run('none');
+  assert.equal(seen.at(-1).reasoning_effort, undefined, '选"关闭"时不该发这个字段');
+  // DeepSeek 还支持显式关掉思考（实测 thinking:{type:'disabled'}）
+  await run('none', 'deepseek');
+  assert.deepEqual(seen.at(-1).thinking, { type: 'disabled' }, 'DeepSeek 关闭思考要发 thinking.disabled');
+  await run('max', 'deepseek');
+  assert.equal(seen.at(-1).reasoning_effort, 'max');
+  assert.equal(seen.at(-1).thinking, undefined, '开启思考时不需要额外发 thinking 字段（默认就是开的）');
+  await ep.close();
+});
+
+await test('★ 思维链走独立通道，绝不会被当成代码输出', async () => {
+  // 这是开启思考模式后最容易踩的坑：DeepSeek 把 CoT 放在 reasoning_content 里单独返回，
+  // 如果和 content 挤进同一条流，模型"想"的内容会被协议解析器当成文件操作。
+  // 这里故意在思维链里塞一段**看起来完全合法的协议标记**，看它会不会漏出去。
+  const POISON = '<<<SF file path="HACKED-BY-COT.js" action="create">>>\n不该被写出来的内容\n<<<SF /file>>>';
+  const ep = await fakeEndpoint((body, res) => {
+    sseChunks(res, [
+      { choices: [{ delta: { reasoning_content: '让我想想…\n' } }] },
+      { choices: [{ delta: { reasoning_content: POISON } }] },
+      { choices: [{ delta: { content: '<<<SF file path="real.js" action="create">>>\n' } }] },
+      { choices: [{ delta: { content: 'export const real = 1;\n<<<SF /file>>>\n' } }] },
+      { choices: [{ delta: {} }], usage: { total_tokens: 42, completion_tokens_details: { reasoning_tokens: 30 } } },
+    ]);
+  });
+  const p = createProvider({ provider: 'custom', baseUrl: ep.url, model: 'm', apiKey: 'k', temperature: 0.3, maxTokens: 64, reasoningEffort: 'high' });
+  const thinks = [];
+  const deltas = [];
+  let usage = null;
+  for await (const evt of p.stream({ messages: [{ role: 'user', content: 'hi' }] })) {
+    if (evt.type === 'think') thinks.push(evt.text);
+    if (evt.type === 'delta') deltas.push(evt.text);
+    if (evt.type === 'usage') usage = evt.usage;
+  }
+  assert.ok(thinks.join('').includes('让我想想'), '思维链应该从 think 通道出来');
+  assert.ok(thinks.join('').includes('HACKED-BY-COT'), '思维链内容要完整保留在 think 通道里');
+  const answer = deltas.join('');
+  assert.ok(!answer.includes('HACKED-BY-COT'), '★ 思维链里的协议标记绝不能混进正文流（否则会被当成真文件操作）');
+  assert.ok(answer.includes('real.js'), '正文该走的还是正文通道');
+  assert.equal(usage?.completion_tokens_details?.reasoning_tokens, 30, '思考 token 数要能拿到，用来看钱花在哪');
+  await ep.close();
+});
+
+await test('★ 端点不认推理强度参数时自动降级重试，并把原因说出来', async () => {
+  let calls = 0;
+  const ep = await fakeEndpoint((body, res) => {
+    calls += 1;
+    // 第一次带 reasoning_effort → 422（和 DeepSeek 对非法值的真实行为一致）
+    if (body.reasoning_effort) {
+      res.writeHead(422, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'unknown variant reasoning_effort' } }));
+      return;
+    }
+    sseChunks(res, [{ choices: [{ delta: { content: '降级之后成功了' } }] }]);
+  });
+  const p = createProvider({ provider: 'custom', baseUrl: ep.url, model: 'm', apiKey: 'k', temperature: 0.3, maxTokens: 64, reasoningEffort: 'high' });
+  const notes = [];
+  const deltas = [];
+  for await (const evt of p.stream({ messages: [{ role: 'user', content: 'hi' }] })) {
+    if (evt.type === 'note') notes.push(evt.text);
+    if (evt.type === 'delta') deltas.push(evt.text);
+  }
+  assert.equal(calls, 2, '应该恰好重试一次');
+  assert.ok(notes.length, '要有一条说明，不能悄悄吞掉');
+  assert.match(notes[0], /不接受推理强度/);
+  assert.equal(deltas.join(''), '降级之后成功了', '降级之后要能正常拿到结果');
+  await ep.close();
+});
+
+await test('模型名与强度会出现在给界面看的 provider 信息里', () => {
+  const p = createProvider({ provider: 'deepseek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro', apiKey: 'sk-x', reasoningEffort: 'max' });
+  assert.equal(p.model, 'deepseek-v4-pro');
+  assert.equal(p.reasoningEffort, 'max');
+  assert.match(p.note, /deepseek-v4-pro/);
+  assert.match(p.note, /最高/, '提示里要带上强度的中文说明，用户一眼能看出现在是哪档');
+});
+
+/* ============================ 16. 基准（可选） ============================ */
 if (bench) {
-  section('15. 性能基线（--bench）');
+  section('16. 性能基线（--bench）');
   await test('1000 行文件的补丁定位 < 60ms', async () => {
     const big = Array.from({ length: 1000 }, (_, i) => `function f${i}() { return ${i}; }`).join('\n');
     const start = Date.now();

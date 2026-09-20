@@ -11,7 +11,7 @@ import { Memory } from './memory.js';
 import { Runner } from './runner.js';
 import { scanStyle, styleStats } from './style.js';
 import { buildProjectMap, locate, mapStats } from './projectmap.js';
-import { compactPromptText, createProvider, loadConfig, saveConfig, newProfile, PRESETS } from './llm.js';
+import { compactPromptText, createProvider, loadConfig, MODEL_CATALOG, newProfile, PRESETS, saveConfig } from './llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -205,6 +205,22 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
 
   svc = buildServices();
 
+  /**
+   * 把 loadConfig 的内存迁移（旧模型名 → 当前可用模型、补齐推理强度）落盘一次。
+   * 不落盘的话 config.json 里会一直躺着 deepseek-chat 这种已经下线的名字，
+   * 下次打开配置文件会以为模型没换成，排查时白白绕一圈。
+   */
+  function persistMigrations() {
+    const before = JSON.stringify(cfg.stored?.profiles ?? []);
+    const after = JSON.stringify(cfg.profiles ?? []);
+    if (before === after) return;
+    try {
+      saveConfig(root, { profiles: cfg.profiles, activeProfileId: cfg.activeProfileId });
+      log(`  [迁移] 模型配置已更新：${cfg.model}（推理强度 ${cfg.reasoningEffort}）`);
+    } catch { /* 写不进去也不能挡住启动 */ }
+  }
+  persistMigrations();
+
   function reloadServices() {
     // ★ 先把上一个项目的 Runner 彻底停掉。
     // 以前这里直接换成新的 svc，旧 Runner 的定时器还在、正在跑的那一轮也还在跑，
@@ -215,6 +231,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     }
     cfg = loadConfig(root);
     if (providerOverride) cfg.provider = providerOverride;
+    persistMigrations();
     svc = buildServices();
     // 想法 13：切项目等于换会话，前端必须整体重置，不能留着上一个项目的思考栏和输入框。
     // 注意 versions 也要带上：reset 事件必须**自洽**，不能只清空等下一个事件来填。
@@ -313,6 +330,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
           ...snap,
           config: { ...snap.config, ...publicConfig(cfg) },
           presets: visiblePresets(),
+          modelCatalog: visibleModelCatalog(),
           // 必须合并而不是覆盖 snapshot.paths —— 否则 staging / writeMode / files 会丢，
           // 前端在状态刷新时就会把项目徽标与暂存状态擦成空白。
           paths: {
@@ -647,6 +665,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       provider: p.provider,
       baseUrl: p.baseUrl,
       model: p.model,
+      reasoningEffort: p.reasoningEffort ?? 'none',
       temperature: p.temperature,
       maxTokens: p.maxTokens,
       apiKeySet: Boolean(p.apiKey) || Boolean(PRESETS[p.provider]?.needsKey === false),
@@ -744,6 +763,18 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         .filter(([k, v]) => !v.hidden || allowMock || k === cfg.provider)
         .map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, model: v.model, needsKey: v.needsKey }]),
     );
+  }
+
+  /** 每个服务商可选的模型清单与推理强度选项，供界面渲染下拉框。 */
+  function visibleModelCatalog() {
+    const out = {};
+    for (const key of Object.keys(PRESETS)) {
+      if (PRESETS[key].hidden && !allowMock && key !== cfg.provider) continue;
+      const c = MODEL_CATALOG[key];
+      if (!c) continue;
+      out[key] = { models: c.models ?? [], efforts: c.efforts ?? [], note: c.note ?? '', defaultEffort: c.defaultEffort ?? 'none' };
+    }
+    return out;
   }
 
   /* ------------------------------ 静态资源 ------------------------------ */
@@ -851,6 +882,7 @@ function publicConfig(cfg) {
     baseUrl: cfg.baseUrl,
     model: cfg.model,
     apiKeySet: Boolean(cfg.apiKey),
+    reasoningEffort: cfg.reasoningEffort ?? 'none',
     temperature: cfg.temperature,
     maxTokens: cfg.maxTokens,
     specDelayMs: cfg.specDelayMs,
@@ -920,7 +952,9 @@ if (isMain) {
   console.log(`  目标项目文件数 ${app.workspace.listFiles().length} / ${bytesToHuman(app.workspace.totalBytes())}`);
   console.log(`  本地数据   ${path.join(app.projectRoot, '.synthflow')}`);
   console.log(`  编辑器     ${fs.existsSync(MONACO_DIR) ? 'Monaco（VS Code 内核）' : '未安装 monaco-editor，将降级为只读高亮'}`);
-  console.log(`  模型       ${app.runner.provider.label} · ${cfg.model || '(未设置)'} · ${app.runner.provider.ready ? '就绪' : '未就绪'}`);
+  const effortNow = cfg.reasoningEffort ?? 'none';
+  const effortText = { none: '不思考', low: '低', medium: '中', high: '高', max: '最高' }[effortNow] ?? effortNow;
+  console.log(`  模型       ${app.runner.provider.label} · ${cfg.model || '(未设置)'} · 推理强度 ${effortText} · ${app.runner.provider.ready ? '就绪' : '未就绪'}`);
   if (!app.runner.provider.ready) console.log(`             ${app.runner.provider.note}`);
   console.log('  停止服务   Ctrl + C');
   console.log('');
