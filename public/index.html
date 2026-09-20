@@ -87,10 +87,6 @@
           <span id="dirty-dot" class="dirty-dot hidden" title="有未保存的修改">●</span>
           <span class="spacer"></span>
           <span id="file-meta" class="muted"></span>
-          <div class="seg" id="view-toggle" role="group">
-            <button class="seg-btn active" data-view="code" title="看完整代码（Ctrl+D 切换）">代码</button>
-            <button class="seg-btn" data-view="diff" title="看本轮差异（Ctrl+D 切换）">差异<span id="diff-count" class="seg-badge hidden"></span></button>
-          </div>
           <button id="btn-save" class="btn ghost small" title="保存文件（Ctrl+S）">保存</button>
         </div>
         <div id="pending-bar" class="pending-bar hidden">
@@ -101,9 +97,7 @@
         </div>
         <div class="code-wrap">
           <div id="editor-host" class="editor-host hidden"></div>
-          <div id="diff-host" class="editor-host hidden"></div>
           <pre id="code-pre" class="code"><code id="code" class="hl"></code></pre>
-          <pre id="diff-pre" class="code hidden"><code id="diff-code" class="hl"></code></pre>
           <div id="editor-empty" class="editor-empty">
             <p>代码会在这里实时长出来，也可以直接改。</p>
             <p class="muted">左边是它自动创建的文件，右边是它在想什么。</p>
@@ -235,7 +229,7 @@
         <div><kbd>Ctrl</kbd>+<kbd>S</kbd><span>保存当前编辑器里的文件</span></div>
         <div><kbd>Alt</kbd>+<kbd>Enter</kbd><span>不等判定，立即生成（同步生成关掉时也能用）</span></div>
         <div><kbd>Esc</kbd><span>关闭弹窗 / 停止生成</span></div>
-        <div><kbd>Ctrl</kbd>+<kbd>D</kbd><span>代码 / 差异 视图切换</span></div>
+        <div><kbd>Ctrl</kbd>+<kbd>D</kbd><span>选中下一个相同项（多光标）</span></div>
         <div><kbd>Ctrl</kbd>+<kbd>P</kbd><span>快速跳转文件</span></div>
         <div><kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd><span>采纳本轮第 N 条建议</span></div>
       </div>

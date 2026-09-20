@@ -107,58 +107,6 @@ function scheduleDraw() {
   }, 60);
 }
 
-function currentDiff(path) {
-  if (S.live[path]?.diff?.length) return { compact: S.live[path].diff, added: null };
-  return S.diffs[path] ?? null;
-}
-
-function updateDiffBadge() {
-  const d = S.current ? currentDiff(S.current) : null;
-  const n = d ? (d.compact ?? []).filter((x) => x.type !== 'same').length : 0;
-  if (el.diffCount) {
-    el.diffCount.textContent = n ? String(n) : '';
-    el.diffCount.classList.toggle('hidden', n === 0);
-  }
-  el.viewToggle?.querySelectorAll('.seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === S.view));
-}
-
-function renderCompareOptions() {
-  // 想法 9：已移除"与任意历史版本对比"。差异视图固定对比"上一个已保存版本"。
-}
-
-async function showDiffView(path) {
-  const curIdx = S.versions.findIndex((v) => v.id === S.activeVersionId);
-  const fromId = curIdx > 0 ? S.versions[curIdx - 1].id : 'v0';
-  const liveCompact = S.live[path]?.diff;
-  let data = null;
-  try {
-    data = await get(`/api/compare?path=${encodeURIComponent(path)}&from=${encodeURIComponent(fromId)}`);
-  } catch {
-    data = null;
-  }
-  const modified = liveCompact ? (S.live[path].content ?? '') : S.files[path] ?? '';
-  const original = data?.original ?? '';
-  await Editor.showDiff({
-    original,
-    modified,
-    compact: liveCompact ?? data?.compact ?? [],
-    language: langOf(path),
-  });
-  if (el.fileMeta) {
-    const stat = liveCompact
-      ? { added: liveCompact.filter((d) => d.type === 'ins').length, removed: liveCompact.filter((d) => d.type === 'del').length }
-      : data?.stat ?? { added: 0, removed: 0 };
-    el.fileMeta.textContent = `与 ${fromId} 对比 · +${stat.added} / -${stat.removed}`;
-  }
-}
-
-function setView(view) {
-  S.view = view;
-  LS.set('view', view);
-  updateDiffBadge();
-  renderCode({ focus: view === 'code' ? false : false });
-}
-
 function renderUnsaved(state) {
   const changed = state?.unsaved !== undefined && state.unsaved !== S.unsaved;
   if (state?.unsaved !== undefined) S.unsaved = state.unsaved;
@@ -237,7 +185,6 @@ async function renderCode({ soft = false, focus = false } = {}) {
     Editor.showHost?.('none');
     if (el.currentPath) el.currentPath.textContent = '未选择文件';
     if (el.fileMeta) el.fileMeta.textContent = '';
-    updateDiffBadge();
     return;
   }
   el.editorEmpty?.classList.add('hidden');
@@ -249,9 +196,7 @@ async function renderCode({ soft = false, focus = false } = {}) {
   const content = live ? live.content : S.files[path] ?? '';
   const added = [...(S.diffs[path]?.added ?? [])];
 
-  if (S.view === 'diff') {
-    await showDiffView(path);
-  } else {
+  {
     if (Editor.path === path) {
       // focus 必须一路传下去：refresh 以前没有这个参数，于是"点一个已经打开的
       // 文件"光标不会进编辑器 —— 用户点了文件却发现还得再点一下编辑器才能打字。
@@ -259,8 +204,6 @@ async function renderCode({ soft = false, focus = false } = {}) {
     } else {
       await Editor.open(path, content, { added, focus });
     }
-    // 想法 9：从差异切回代码时，必须把 Monaco 的显示主机切回来。
-    // 注意只能在这个分支里切 —— 放到 if 外面会把刚打开的差异视图又顶掉。
     Editor.showHost('code');
   }
   if (el.fileMeta) {
@@ -268,7 +211,6 @@ async function renderCode({ soft = false, focus = false } = {}) {
     const mark = added.length ? ` · 本轮 +${added.length}` : '';
     el.fileMeta.textContent = `${lines} 行 · ${content.length} 字符${mark}${live ? ' · 正在写入' : ''}${Editor.dirty ? ' · 未保存' : ''}`;
   }
-  updateDiffBadge();
 }
 
 /* ============================ 版本时间线 ============================ */
@@ -900,7 +842,7 @@ on('file:delta', (d) => {
   const entry = S.live[d.path];
   if (!entry) return;
   entry.content += d.delta;
-  if (S.current === d.path && S.view === 'code') scheduleDraw();
+  if (S.current === d.path) scheduleDraw();
 });
 
 on('file:end', (d) => {
@@ -1176,11 +1118,8 @@ document.addEventListener('keydown', (e) => {
     el.btnCommit.click();
     return;
   }
-  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'd') {
-    e.preventDefault();
-    setView(S.view === 'code' ? 'diff' : 'code');
-    return;
-  }
+  // 注意：Ctrl+D 必须留给编辑器 —— 那是 Monaco 的「选中下一个相同项」（多光标）。
+  // 以前它被拿来切差异视图，直接导致编辑器里没法做多光标选择。
   if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'p') {
     e.preventDefault();
     Panels.openPalette();
@@ -1415,8 +1354,6 @@ async function applyReset(payload) {
   // 并把路径栏、差异徽标一起归零 —— 这才是"重置"。所以要调用它，而不是手动改 DOM。
   Editor.path = null;
   Editor.setDirty(false);
-  // 差异视图是"本轮改动"的概念，换了会话就没有比较基准了，回到代码视图
-  S.view = 'code';
   await renderCode();
   // 意图条也归零，否则会留着上一个项目的判定结果
   if (el.intentFill) el.intentFill.style.width = '0%';
@@ -1537,10 +1474,6 @@ function bindUi() {
   });
 
   el.btnRedo?.addEventListener('click', () => doVersion('forward'));
-  el.viewToggle?.addEventListener('click', (e) => {
-    const btn = e.target.closest('.seg-btn');
-    if (btn) setView(btn.dataset.view);
-  });
   el.btnSave?.addEventListener('click', () => saveCurrent());
   el.btnCommit?.addEventListener('click', async () => {
     try {
@@ -1626,7 +1559,6 @@ function collectDirs(node, out = []) {
   try {
     Layout.init();
     applyTheme(S.theme);
-    S.view = LS.get('view', 'code');
     if (el.btnThinkMode) el.btnThinkMode.textContent = `思考：${S.thinkExpandAll ? '展开' : '折叠'}`;
     Panels.bindPalette();
     Panels.bindPicker(); // 必须在启动时就绑：否则"点项目名直接开选择器"时按钮是死的

@@ -469,34 +469,100 @@ try {
     if (!inEditor) throw new Error(`主动点文件后焦点在「${active}」，没有进入编辑器`);
   });
 
-  /* ------------------------------ E. 视图切换 ------------------------------ */
-  section('E. 差异 ↔ 代码（想法 9 的回归测试）');
+  /* ------------------------------ E. 编辑器多选（原差异视图已移除） ------------------------------ */
+  section('E. 编辑器：多光标多选必须可用（差异视图已移除）');
 
   await cdp.screenshot('02-code-view');
 
-  await test('切到差异视图', async () => {
-    const target = await cdp.evaluate(`return document.querySelector('.tree-file')?.dataset.path ?? null`);
-    if (!target) return;
-    await cdp.evaluate($click('.tree-file[data-path="' + target + '"]'));
-    await sleep(400);
-    // 直接调用并捕获异常，这样报错里带的是真正的堆栈而不是"等超时"
-    const direct = await cdp.evaluate(`
-      try { await showDiffView(S.current); return { ok: true }; }
-      catch (e) { return { ok: false, err: String(e && e.message || e), stack: String(e && e.stack || '').slice(0, 500) }; }
+  await test('差异视图相关的控件已经彻底消失', async () => {
+    const left = await cdp.evaluate(`
+      return ['#view-toggle', '#diff-host', '#diff-pre', '#diff-code', '#diff-count']
+        .filter((s) => document.querySelector(s));
     `);
-    if (!direct.ok) throw new Error(`showDiffView 抛错: ${direct.err}\n      ${direct.stack}`);
-    await cdp.waitFor(`(${$visible('#diff-host')}) || (${$visible('#diff-pre')})`, { timeout: 12000, label: '差异视图出现' });
+    if (left.length) throw new Error(`这些差异视图的残留还在页面上：${left.join(', ')}`);
+    const helpers = await cdp.evaluate(`
+      return { showDiffView: typeof showDiffView, setView: typeof setView, updateDiffBadge: typeof updateDiffBadge };
+    `);
+    const stillThere = Object.entries(helpers).filter(([, t]) => t !== 'undefined').map(([k]) => k);
+    if (stillThere.length) throw new Error(`这些函数应该一起删掉：${stillThere.join(', ')}`);
   });
 
-  await test('★ 能切回代码视图（曾经点回去没反应）', async () => {
-    await cdp.evaluate(`setView('code'); return true;`);
-    await cdp.waitFor(`(${$visible('#editor-host')}) || (${$visible('#code-pre')})`, { timeout: 12000, label: '代码视图恢复' });
-    const diffVisible = await cdp.evaluate(`return (${$visible('#diff-host')}) || (${$visible('#diff-pre')})`);
-    if (diffVisible) throw new Error('切回代码后差异视图仍然可见');
-    const tooltip = await cdp.evaluate($text('#file-meta'));
-    if (tooltip && tooltip.includes('对比')) throw new Error(`文件信息还停留在对比文案：${tooltip}`);
+  await test('★ Ctrl+D 必须是 Monaco 的多光标快捷键（曾经被差异视图占用）', async () => {
+    // 用户报的："编辑器里的代码无法多个字段选中，只能单个选中"。
+    // 根因就是这里：全局 keydown 和 Monaco addCommand 都把 Ctrl+D 拿去切差异视图了，
+    // 而 Ctrl+D 正是 Monaco 的「选中下一个相同项」。差异视图移除后必须交还给 Monaco。
+    const target = await cdp.evaluate(`return document.querySelector('.tree-file')?.dataset.path ?? null`);
+    if (!target) {
+      console.log(`      ${dim('（工作区没有文件，跳过）')}`);
+      return;
+    }
+    await cdp.evaluate($click(`.tree-file[data-path="${target}"]`));
+    await sleep(600);
+
+    const prep = await cdp.evaluate(`
+      const ed = Editor.inst;
+      if (!ed) return { error: '没有 Monaco 实例' };
+      ed.getModel().setValue('const alpha = 1;\\nconst beta = 2;\\nconst alpha = 3;\\n');
+      // 必须先有一段选中：addSelectionToNextFindMatch 是"把下一个相同项加进选区"，
+      // 光标状态下它不会凭空选中一个词。
+      ed.setSelection(new monaco.Selection(1, 7, 1, 12));
+      ed.focus();
+      return { before: ed.getSelections().length, text: ed.getModel().getValueInRange(ed.getSelection()) };
+    `);
+    if (prep.error) throw new Error(prep.error);
+    if (prep.text !== 'alpha') throw new Error(`前置条件不成立：选中的是「${prep.text}」`);
+
+    // 真的发一次 Ctrl+D 按键（不是直接调 action）——
+    // 这样才能验证"没有被全局快捷键抢走 / preventDefault 掉"
+    for (const type of ['rawKeyDown', 'keyUp']) {
+      await cdp.send('Input.dispatchKeyEvent', {
+        type, modifiers: 2, key: 'd', code: 'KeyD', windowsVirtualKeyCode: 68, nativeVirtualKeyCode: 68,
+      });
+    }
+    await sleep(350);
+
+    const r = await cdp.evaluate(`
+      const ed = Editor.inst;
+      const model = ed.getModel();
+      return { after: ed.getSelections().length, texts: ed.getSelections().map((s) => model.getValueInRange(s)) };
+    `);
+    if (r.after < 2) {
+      throw new Error(`按了 Ctrl+D 之后只有 ${r.after} 个光标 —— 多光标被抢走了（差异视图移除前就是这个症状）`);
+    }
+    if (!r.texts.every((t) => t === 'alpha')) throw new Error(`多选内容不对：${r.texts.join(' / ')}`);
+    console.log(`      ${dim(`Ctrl+D 多光标：${prep.before} → ${r.after} 个选区（${r.texts.join(' / ')}）`)}`);
   });
-  await cdp.screenshot('03-back-to-code');
+
+  await test('Alt+点击可以加多个光标（自由编辑的基本能力）', async () => {
+    // 坐标用 Monaco 自己的 API 算，别猜像素（行号栏会吃掉左侧 40px，猜就点到沟槽上了）
+    const pos = await cdp.evaluate(`
+      const ed = Editor.inst;
+      if (!ed) return null;
+      ed.getModel().setValue('aaa\\nbbb\\nccc\\n');
+      ed.focus();
+      const host = document.querySelector('#editor-host').getBoundingClientRect();
+      const p1 = ed.getScrolledVisiblePosition({ lineNumber: 1, column: 2 });
+      const p2 = ed.getScrolledVisiblePosition({ lineNumber: 2, column: 2 });
+      if (!p1 || !p2) return null;
+      return {
+        x: Math.round(host.x + p1.left + 4), y: Math.round(host.y + p1.top + p1.height / 2),
+        x2: Math.round(host.x + p2.left + 4), y2: Math.round(host.y + p2.top + p2.height / 2),
+      };
+    `);
+    if (!pos) {
+      console.log(`      ${dim('（Monaco 不可用，跳过）')}`);
+      return;
+    }
+    for (const [x, y] of [[pos.x, pos.y], [pos.x2, pos.y2]]) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1, buttons: 1, modifiers: 1 });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0, modifiers: 1 });
+      await sleep(180);
+    }
+    const n = await cdp.evaluate(`return Editor.inst ? Editor.inst.getSelections().length : 0`);
+    if (n < 2) throw new Error(`Alt+点击之后只有 ${n} 个光标，多选不可用`);
+    console.log(`      ${dim(`Alt+点击产生了 ${n} 个光标`)}`);
+  });
+  await cdp.screenshot('03-multi-cursor');
 
   /* ------------------------------ F. 同步开关 ------------------------------ */
   section('F. 同步生成开关（想法 1）');

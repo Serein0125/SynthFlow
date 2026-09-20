@@ -922,66 +922,16 @@ textarea {
   font-size: 12px;
 }
 
-/* 底部差异条 */
-.diff-strip {
-  max-height: 30%;
-  padding: 8px 0;
-  background: var(--bg-2);
-  border-top: 1px solid var(--border);
-  overflow: auto;
-  font-family: var(--font-code);
-  font-size: 11.5px;
-  line-height: 1.6;
-  white-space: pre;
-}
-
 /* --------------------------------------------------------------------------
-   12. 差异行（JS 注入 .d-ins / .d-del / .d-same）
+   12. 代码行（降级渲染时 JS 注入 .line / .mark-added）
+   注意：.d-ins / .d-del / .d-same 与 .diff-strip 是"差异视图"用的，
+   那个功能已整体移除（见 README）。
    -------------------------------------------------------------------------- */
 .code > div,
-.diff-strip > div,
-.code .line,
-.diff-strip .line {
+.code .line {
   display: block;
   padding: 0 14px 0 32px;
   position: relative;
-}
-
-.code .d-same,
-.diff-strip .d-same {
-  color: var(--text-2);
-}
-
-.d-ins {
-  background: rgba(63, 191, 143, 0.1);
-  color: #cdf3e2;
-}
-
-.d-ins::before {
-  content: "+";
-  position: absolute;
-  left: 10px;
-  color: var(--ok);
-  font-weight: 700;
-}
-
-.d-del {
-  background: rgba(229, 96, 108, 0.1);
-  color: #f5cdd1;
-}
-
-.d-del::before {
-  content: "-";
-  position: absolute;
-  left: 10px;
-  color: var(--err);
-  font-weight: 700;
-}
-
-.d-same::before {
-  content: " ";
-  position: absolute;
-  left: 10px;
 }
 
 /* --------------------------------------------------------------------------
@@ -1923,13 +1873,6 @@ textarea {
   max-width: 150px;
 }
 
-/* 差异条里的操作行 */
-.diff-strip .line.muted {
-  color: var(--text-3);
-  font-size: 11px;
-  padding-bottom: 4px;
-}
-
 /* 时间线里的回退按钮更紧凑 */
 .timeline-actions .btn {
   padding: 2px 7px;
@@ -2018,16 +1961,8 @@ textarea {
   color: var(--text-0);
 }
 
-/* 差异行：深色主题的浅色字在亮底上读不出来，单独给一组 */
-[data-theme="light"] .d-ins {
-  background: rgba(23, 145, 106, 0.12);
-  color: #14603f;
-}
-
-[data-theme="light"] .d-del {
-  background: rgba(207, 63, 77, 0.1);
-  color: #8f2b36;
-}
+/* 差异行：深色主题的浅色字在亮底上读不出来，单独给一组
+   （差异视图已移除，这里连同 .d-ins/.d-del 一起删掉了） */
 
 /* 本轮改动行：亮色下绿底要更淡 */
 [data-theme="light"] .code > div.mark-added {
@@ -2086,60 +2021,10 @@ textarea {
   width: 20px;
 }
 
-/* --- 分段控件：代码 / 本轮差异 --- */
-.seg {
-  display: inline-flex;
-  align-items: stretch;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
+/* --- 分段控件（.seg / .seg-btn）随"代码 / 差异"切换一起移除了，
+       现在只剩 .seg-badge 给「保存为版本」上的计数用 --- */
 
-.seg-btn {
-  padding: 3px 9px;
-  background: transparent;
-  border: 0;
-  border-left: 1px solid var(--border);
-  color: var(--text-2);
-  font-size: 11px;
-  font-weight: 500;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
-}
-
-.seg-btn:first-child {
-  border-left: 0;
-}
-
-.seg-btn:hover {
-  background: var(--hover);
-  color: var(--text-1);
-}
-
-.seg-btn.active {
-  background: var(--bg-4);
-  color: var(--text-0);
-  font-weight: 600;
-}
-
-/* 失效状态要和普通按钮一样明显 */
-.seg-btn:disabled,
-.seg-btn[disabled],
-.seg-btn[aria-disabled="true"] {
-  opacity: 0.45;
-  color: var(--text-3);
-  cursor: not-allowed;
-}
-
-.seg-btn:disabled:hover,
-.seg-btn[disabled]:hover {
-  background: transparent;
-  color: var(--text-3);
-}
-
-/* 差异条数小胶囊 */
+/* 版本/改动条数小胶囊 */
 .seg-badge {
   display: inline-block;
   margin-left: 5px;
@@ -2430,13 +2315,6 @@ textarea {
 .code > div.mark-added .ln {
   color: var(--ok);
   opacity: 1;
-}
-
-/* "本轮没有改动"的占位 */
-.code .no-diff {
-  padding: 14px 16px;
-  color: var(--text-3);
-  font-style: italic;
 }
 
 /* --- 命令面板（Ctrl+P） --- */

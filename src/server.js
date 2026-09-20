@@ -516,28 +516,9 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         return runner.writeFile(body.path, body.content ?? '');
       }
 
-      case '/api/compare': {
-        const rel = url.searchParams.get('path') ?? body.path;
-        const from = url.searchParams.get('from') ?? body.from;
-        const v = session.versions.find((x) => x.id === from);
-        if (!v) {
-          const e = new Error(`版本不存在: ${from}`);
-          e.status = 404;
-          throw e;
-        }
-        const oldText = workspace.readFromSnapshot(v.snapshotId, rel);
-        const now = workspace.read(rel);
-        const { diffLines, compactDiff } = await import('./util.js');
-        const diff = diffLines(oldText ?? '', now?.content ?? '');
-        return {
-          path: rel,
-          from: v.id,
-          fromExists: oldText !== null,
-          nowExists: Boolean(now),
-          compact: compactDiff(diff),
-          stat: { added: diff.filter((d) => d.type === 'ins').length, removed: diff.filter((d) => d.type === 'del').length },
-        };
-      }
+      // 注意：/api/compare 与整个"差异视图"一起移除了。
+      // 它只服务于编辑器里那个"代码 ↔ 差异"切换，功能性不强，
+      // 还占着 Ctrl+D（Monaco 的多光标快捷键）。
 
       case '/api/versions':
         return { ...session.versionList(), segments: session.segments.slice(-80) };

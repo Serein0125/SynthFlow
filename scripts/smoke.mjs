@@ -971,12 +971,12 @@ await test('styles.css 覆盖了 synctflow 运行时的关键 class', () => {
     '.suggestion', '.suggestion-title', '.suggestion-body', '.suggestion-actions', '.suggestion-insert',
     '.kind-clarify', '.kind-optimize', '.kind-risk', '.opblock', '.opblock-head', '.opblock-body',
     '.intent-bar', '.intent-fill', '.chip', '.chips', '.toast', '.modal', '.form-grid',
-    '.d-ins', '.d-del', '.tok-key', '.tok-str', '.tok-com', '.badge', '.btn', '.muted', '.empty',
-    '.seg', '.seg-btn', '.seg-badge', '.run-body', '.run-idx', '.run-mode', '.run-time',
+    '.tok-key', '.tok-str', '.tok-com', '.badge', '.btn', '.muted', '.empty',
+    '.seg-badge', '.run-body', '.run-idx', '.run-mode', '.run-time',
     '.run-files', '.run-collapse', '.anchor-flash', '.think-summary', '.think.collapsed',
     '.suggestion-batch', '.kbd-hint', '.statusbar', '.status-dot', '.status-text',
     '.palette-card', '.palette-input', '.palette-list', '.palette-item', '.keys', 'kbd',
-    '.switches', '.btn.tiny', '.ln', '.mark-added', '.no-diff', '.btn.icon-btn',
+    '.switches', '.btn.tiny', '.ln', '.mark-added', '.btn.icon-btn',
     // v3 新增
     '.splitter', '.layout-panel', '.lp-row', '.lp-presets', '.mini-select', '.project-chip',
     '.editor-host', '.dirty-dot', '.selection-chip', '.pending-bar', '.save-confirm',
@@ -1177,7 +1177,6 @@ await test('前端能在最小 DOM 上真正启动，并且事件处理不抛异
     '/api/config': { config: { provider: 'deepseek', specDelayMs: 1000, saveMode: 'confirm', suggest: { max: 4 } } },
     '/api/skills': { skills: [] },
     '/api/style': { style: { scanned: 5, totalFiles: 5, indent: '2 空格', summary: '【项目现有风格】' } },
-    '/api/compare': { original: 'const a = 0;\n', modified: 'const a = 1;\n', compact: [{ type: 'del', text: 'const a = 0;' }, { type: 'ins', text: 'const a = 1;' }], stat: { added: 1, removed: 1 } },
   };
   const fakeFetch = async (url) => {
     const key = String(url).split('?')[0];
@@ -1572,7 +1571,10 @@ await test('版本待确认：confirm 标记为已确认，discard 会回退到�
   assert.equal(ws.read('a.js').content, 'v3-good');
 });
 
-await test('与历史版本对比（想法 C）', () => {
+await test('快照能读出历史内容（版本回退的底层能力）', () => {
+  // 说明：原来这里测的是"与历史版本对比"（想法 C），那个功能（含 /api/compare
+  // 和编辑器里的差异视图）已经整体移除。但"快照里能读回历史文件内容"是**版本回退**
+  // 依赖的底层能力，仍然必须成立，所以把测试保留下来、去掉差异渲染那一段。
   const dir = path.join(TMP, 'cmptest');
   fs.rmSync(dir, { recursive: true, force: true });
   const ws = new Workspace(dir, { storeDir: path.join(TMP, 'cmptest-store') });
@@ -1583,10 +1585,7 @@ await test('与历史版本对比（想法 C）', () => {
   ws.applyOp({ path: 'a.js', mode: 'patch', patches: [{ search: 'line2', replace: 'line2-changed' }] });
   const old = ws.readFromSnapshot(snap1.id, 'a.js');
   assert.equal(old, 'line1\nline2\n', '快照里应能读到历史内容');
-  const cur = ws.read('a.js').content;
-  const d = compactDiff(diffLines(old, cur));
-  assert.ok(d.some((x) => x.type === 'ins' && /line2-changed/.test(x.text)));
-  assert.ok(d.some((x) => x.type === 'del' && x.text === 'line2'));
+  assert.equal(ws.read('a.js').content, 'line1\nline2-changed\n', '当前内容应该是改过的');
   assert.equal(v1.id, 'v1');
 });
 

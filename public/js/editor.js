@@ -5,7 +5,6 @@ const Editor = {
   mode: 'fallback', // monaco | fallback
   monaco: null,
   inst: null,
-  diff: null,
   path: null,
   dirty: false,
   loading: false,
@@ -84,14 +83,6 @@ const Editor = {
       fixedOverflowWidgets: true,
       readOnly: false,
     });
-    this.diff = M.editor.createDiffEditor(el.diffHost, {
-      ...common,
-      readOnly: true,
-      originalEditable: false,
-      renderSideBySide: true,
-      enableSplitViewResizing: true,
-      ignoreTrimWhitespace: false,
-    });
     this.decorations = this.inst.createDecorationsCollection([]);
     this.inst.onDidChangeModelContent(() => {
       if (this.suppressChange) return;
@@ -117,10 +108,9 @@ const Editor = {
     this.inst.addCommand(M.KeyMod.CtrlCmd | M.KeyCode.KeyS, () => {
       if (this.onSaveRequest) this.onSaveRequest();
     });
-    // Monaco 会自己处理 Ctrl+P 等；这里只补 Ctrl+D 切差异
-    this.inst.addCommand(M.KeyMod.CtrlCmd | M.KeyCode.KeyD, () => {
-      if (typeof setView === 'function') setView(S.view === 'code' ? 'diff' : 'code');
-    });
+    // 这里以前额外绑了 Ctrl+D 去切差异视图 —— 那是 Monaco 的
+    // 「选中下一个相同项」（多光标）快捷键，占了它就没法做多选。
+    // 差异视图已移除，Ctrl+D 交还给 Monaco 自己处理。
   },
 
   setDirty(v) {
@@ -131,18 +121,15 @@ const Editor = {
     if (this.onDirtyChange) this.onDirtyChange(v);
   },
 
+  /** 切换显示哪个主机：'code' 显示编辑器，'none' 全藏起来（比如没选文件时）。 */
   showHost(which) {
-    const hosts = { code: el.editorHost, diff: el.diffHost, codeFallback: el.codePre, diffFallback: el.diffPre };
     const useMonaco = this.mode === 'monaco';
-    for (const [key, node] of Object.entries(hosts)) {
-      if (!node) continue;
-      const visible = useMonaco ? key === which : key === `${which}Fallback`;
-      node.classList.toggle('hidden', !visible);
+    const codeHost = useMonaco ? el.editorHost : el.codePre;
+    const showCode = which === 'code';
+    for (const node of [el.editorHost, el.codePre]) {
+      if (node) node.classList.toggle('hidden', !showCode || node !== codeHost);
     }
-    if (this.mode === 'monaco') {
-      if (which === 'code' && this.inst) this.inst.layout();
-      if (which === 'diff' && this.diff) this.diff.layout();
-    }
+    if (useMonaco && showCode && this.inst) this.inst.layout();
   },
 
   /** 打开一个文件（内容来自服务端缓存）。focus 只在你主动点文件时才为 true。 */
@@ -246,43 +233,16 @@ const Editor = {
     return S.files[this.path] ?? '';
   },
 
-  /** 展示差异（Monaco 的真·并排 diff）；compact 用于降级渲染。 */
-  showDiff({ original, modified, language, compact }) {
-    if (this.mode === 'monaco') {
-      const M = this.monaco;
-      const lang = monacoLangOf(this.path ?? 'x.txt', language);
-      const o = M.editor.createModel(original ?? '', lang);
-      const m = M.editor.createModel(modified ?? '', lang);
-      const old = this.diff.getModel();
-      this.diff.setModel({ original: o, modified: m });
-      if (old) {
-        old.original?.dispose();
-        old.modified?.dispose();
-      }
-    } else if (el.diffCode) {
-      const rows = (compact ?? []).map((d) => {
-        if (d.type === 'gap') return `<div class="d-same gap">⋯ 折叠 ${d.count} 行未改动</div>`;
-        return `<div class="d-${d.type}">${highlightLines(d.text || ' ', language ?? langOf(this.path ?? 'x.txt'))[0]}</div>`;
-      });
-      el.diffCode.innerHTML = rows.length ? rows.join('') : '<div class="no-diff">没有差异</div>';
-    }
-    this.showHost('diff');
-  },
-
   setTheme(dark) {
     if (this.mode === 'monaco' && this.monaco) this.monaco.editor.setTheme(dark ? 'vs-dark' : 'vs');
   },
 
   setFontSize(px) {
-    if (this.mode === 'monaco' && this.inst) {
-      this.inst.updateOptions({ fontSize: px });
-      this.diff?.updateOptions({ fontSize: px });
-    }
+    if (this.mode === 'monaco' && this.inst) this.inst.updateOptions({ fontSize: px });
   },
 
   layout() {
     this.inst?.layout();
-    this.diff?.layout();
   },
 };
 
