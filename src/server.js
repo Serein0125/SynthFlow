@@ -282,8 +282,22 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     projectRoot: root,
     workspaceDir,
     listen() {
-      return new Promise((resolve) => {
-        server.listen(port ?? cfg.port, host, () => resolve(server.address()));
+      return new Promise((resolve, reject) => {
+        const onError = (err) => {
+          if (err.code === 'EADDRINUSE') {
+            console.error('');
+            console.error(`  ✗ 端口 ${port ?? cfg.port} 已经被占用。`);
+            console.error(`    很可能已经有一个 SynthFlow 在跑了 —— 直接打开 http://127.0.0.1:${port ?? cfg.port}/ 就能用。`);
+            console.error('    想再开一个实例：node src/server.js --port 7799');
+            console.error('');
+          }
+          reject(err);
+        };
+        server.once('error', onError);
+        server.listen(port ?? cfg.port, host, () => {
+          server.off('error', onError);
+          resolve(server.address());
+        });
       });
     },
     close() {
