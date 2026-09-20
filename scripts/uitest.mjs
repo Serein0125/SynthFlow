@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { sha1 } from '../src/util.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -314,8 +315,45 @@ try {
     }
   });
   // 记下进入测试前的项目，最后一定要切回去（否则会把用户的应用留在测试目录上）
-  const originalProject = (await (await fetch(`${BASE}/api/state`)).json()).paths.projectDir;
-  console.log(`  ${dim(`当前项目：${originalProject}（测试结束会切回）`)}`);
+  const preState = (await (await fetch(`${BASE}/api/state`)).json()).paths;
+  const originalProject = preState.projectDir;
+  const originalMode = preState.writeMode === 'direct' ? 'direct' : 'staging';
+  console.log(`  ${dim(`当前项目：${originalProject}（${originalMode === 'direct' ? '直接写入' : '暂存确认'}，测试结束会切回）`)}`);
+
+  /**
+   * 整个页面不允许出现整体滚动条：一旦文档能滚，顶栏、输入框就可能被滚出视口，
+   * 用户会看到"按钮点不到 / 输入框不见了"这种像坏掉的界面。
+   * 顺带找出到底是谁把文档撑高的，省得每次靠猜。
+   */
+  const scrollProbe = async () => cdp.evaluate(`
+    const win = [window.innerWidth, window.innerHeight];
+    const doc = document.documentElement;
+    const over = [];
+    for (const el of document.querySelectorAll('body *')) {
+      const r = el.getBoundingClientRect();
+      if (r.height === 0 && r.width === 0) continue;
+      if (r.bottom > win[1] + 1 || r.right > win[0] + 1) {
+        const cs = getComputedStyle(el);
+        // 只报"真的把文档撑大"的（非 fixed / 非绝对定位脱离流）
+        if (cs.position === 'fixed') continue;
+        over.push((el.id ? '#' + el.id : el.className ? '.' + String(el.className).split(' ')[0] : el.tagName)
+          + ' bottom=' + Math.round(r.bottom) + ' right=' + Math.round(r.right) + ' pos=' + cs.position);
+      }
+    }
+    return { scrollY: Math.round(window.scrollY), win, scrollH: doc.scrollHeight, appH: Math.round(document.querySelector('#app').getBoundingClientRect().height), over: over.slice(0, 8) };
+  `);
+
+  await test('★ 页面整体不可滚动（否则顶栏/输入框会被滚出视口）', async () => {
+    const p = await scrollProbe();
+    if (p.scrollH > p.win[1] + 2) {
+      throw new Error(
+        `文档高度 ${p.scrollH}px 超过视口 ${p.win[1]}px，页面能整体滚动（当前 scrollY=${p.scrollY}）\n`
+        + `      撑高文档的元素：${p.over.length ? p.over.join(' | ') : '（没找到，可能是 margin 塌陷或绝对定位）'}`,
+      );
+    }
+    if (p.scrollY > 0) throw new Error(`页面在启动时就被滚动了：scrollY=${p.scrollY}`);
+  });
+
   await cdp.screenshot('01-boot');
 
   /* ------------------------------ B. 布局 ------------------------------ */
@@ -742,7 +780,7 @@ try {
   });
 
   await test('关键控件都在视口内（没有被挤出去）', async () => {
-    const bad = await cdp.evaluate(`
+    const probe = await cdp.evaluate(`
       const sels = ['#prompt', '#btn-commit', '#btn-stop', '#btn-sync', '#btn-save-version', '#file-tree', '#timeline', '#stream-body'];
       const out = [];
       for (const s of sels) {
@@ -752,9 +790,21 @@ try {
         if (r.width < 8 || r.height < 8) out.push(s + ':尺寸异常 ' + Math.round(r.width) + 'x' + Math.round(r.height));
         else if (r.right < 0 || r.bottom < 0 || r.left > window.innerWidth || r.top > window.innerHeight) out.push(s + ':跑出视口');
       }
-      return out;
+      const rect = (s) => { const e = document.querySelector(s); if (!e) return null; const r = e.getBoundingClientRect(); return [Math.round(r.top), Math.round(r.bottom), Math.round(r.height)]; };
+      return {
+        out,
+        win: [window.innerWidth, window.innerHeight],
+        scroll: [Math.round(window.scrollY), document.documentElement.scrollTop, document.body.scrollTop],
+        docH: [document.documentElement.scrollHeight, Math.round(document.querySelector('#app').getBoundingClientRect().height)],
+        topbar: rect('.topbar'),
+        body: rect('.body'),
+        editor: rect('main.editor'),
+        codeWrap: rect('.code-wrap'),
+        composer: rect('.composer'),
+        modeChip: rect('#mode-chip'),
+      };
     `);
-    if (bad.length) throw new Error(bad.join('；'));
+    if (probe.out.length) throw new Error(`${probe.out.join('；')}\n      现场：${JSON.stringify(probe)}`);
   });
 
   await test('输入区高度符合布局变量', async () => {
@@ -886,6 +936,104 @@ try {
     console.log(`      ${dim(`已切回 ${res.projectDir}（${res.fileCount} 个文件）`)}`);
   });
 
+  /* --------------------- R. 直接写入模式（用户报"为什么还要我点应用"） --------------------- */
+  section('R. 直接写入模式（用户报"代码生成后还要我点应用到项目"）');
+
+  const directProj = path.join(OUT, 'directproj');
+  fs.rmSync(directProj, { recursive: true, force: true });
+  fs.mkdirSync(directProj, { recursive: true });
+
+  await test('★ 切到直接写入：状态位显示"直接写入"，待应用条完全消失', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: directProj, mode: 'direct' }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切换到直接写入失败：${res.error ?? ''}`);
+    // 这一段正是用户踩的坑：配置里写了 direct，服务端却仍是 staging
+    if (res.writeMode !== 'direct') throw new Error(`服务端写入方式没有生效：${res.writeMode}`);
+    if (res.staging) throw new Error('直接写入模式下 workspace.staging 仍为 true —— 改动又会进暂存层');
+    await cdp.waitFor(`document.querySelector('#mode-chip').textContent.includes('直接写入')`, {
+      timeout: 10000,
+      label: '写入方式状态位更新',
+    });
+    const hidden = await cdp.evaluate($visible('#pending-bar'));
+    if (hidden) throw new Error('直接写入模式下仍然显示了"应用到项目"那条栏 —— 用户会以为还得自己点一下');
+  });
+
+  await test('★ 直接写入模式下点状态位可切回暂存，再点回来（不用去设置页）', async () => {
+    await cdp.evaluate(`window.__sfOrigConfirm = window.confirm; window.confirm = () => true; return true;`);
+    try {
+      await cdp.evaluate($click('#mode-chip'));
+      await cdp.waitFor(`document.querySelector('#mode-chip').textContent.includes('暂存')`, { timeout: 10000, label: '切到暂存确认' });
+      await cdp.waitFor($visible('#pending-bar'), { timeout: 8000, label: '暂存模式下出现待应用栏' });
+      await cdp.evaluate($click('#mode-chip'));
+      await cdp.waitFor(`document.querySelector('#mode-chip').textContent.includes('直接写入')`, { timeout: 10000, label: '切回直接写入' });
+      await cdp.waitFor(`!(${$visible('#pending-bar')})`, { timeout: 8000, label: '待应用栏重新隐藏' });
+    } finally {
+      await cdp.evaluate(`window.confirm = window.__sfOrigConfirm; return true;`);
+    }
+  });
+
+  await test('★ 直接写入模式：生成完文件立刻在项目目录里，没有待应用', async () => {
+    // 这一条不依赖模型也能验：直接调用一次真实的写入接口，
+    // 确认落盘位置就是项目目录，而不是暂存层。
+    const res = await (await fetch(`${BASE}/api/save`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: 'direct-probe.txt', content: 'direct mode probe\n' }),
+    })).json();
+    if (!res.ok) throw new Error(`保存失败：${res.error ?? ''}`);
+    const onDisk = path.join(directProj, 'direct-probe.txt');
+    if (!fs.existsSync(onDisk)) throw new Error(`文件没有出现在项目目录：${onDisk}`);
+    const pending = await (await fetch(`${BASE}/api/pending`)).json();
+    if (pending.items.length) throw new Error(`直接写入模式下不该有待应用改动，实际 ${pending.items.length} 个`);
+    if (pending.staging) throw new Error('/api/pending 仍报告 staging=true');
+    const hidden = await cdp.evaluate($visible('#pending-bar'));
+    if (hidden) throw new Error('生成后"应用到项目"栏又冒出来了');
+  });
+
+  if (WITH_MODEL) {
+    await test('★ 真实生成：直接写入模式下代码同步进项目目录，无需点击（消耗额度）', async () => {
+      const before = await cdp.evaluate('return window.__sfProbe.starts');
+      await cdp.evaluate($type('#prompt', '在当前目录新建一个 direct-check.md，里面只写一行：直接写入模式生效。'));
+      await cdp.waitFor(`window.__sfProbe.starts > ${before}`, { timeout: 45000, label: '生成启动' });
+      await cdp.waitFor(`!document.querySelector('#run-badge').textContent.includes('正在')`, { timeout: 180000, label: '生成结束' });
+      const st = await (await fetch(`${BASE}/api/state`)).json();
+      if (st.paths.writeMode !== 'direct') throw new Error('生成过程中写入方式被改掉了');
+      const files = fs.readdirSync(directProj);
+      if (!files.length) throw new Error('生成完之后项目目录里一个文件都没有 —— 又写进暂存层了');
+      const hidden = await cdp.evaluate($visible('#pending-bar'));
+      if (hidden) throw new Error('生成后出现了"应用到项目"，与直接写入模式矛盾');
+      const status = await cdp.evaluate($text('#status-text'));
+      const detail = await cdp.evaluate($text('#status-detail'));
+      // 用户现场就是这里踩的：文件明明写对了，状态栏却红着「出错了」
+      if (status === '出错了') throw new Error(`生成成功但状态栏报错：${detail}`);
+      const badge = await cdp.evaluate($text('#run-badge'));
+      if (badge.includes('出错')) throw new Error(`运行徽标显示「${badge}」，说明这轮抛了异常`);
+      console.log(`      ${dim(`项目目录：${files.join('、')} · 状态栏「${status}」`)}`);
+    });
+    await cdp.screenshot('09-direct-write');
+  }
+
+  await test('切回原项目并恢复原来的写入方式', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: originalProject, mode: originalMode }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切回失败：${res.error ?? ''}`);
+    if (res.writeMode !== originalMode) throw new Error(`写入方式没有恢复：期望 ${originalMode}，实际 ${res.writeMode}`);
+    await cdp.waitFor(`document.querySelector('#project-chip').textContent.length > 0`, { timeout: 10000, label: '界面恢复' });
+    // 测试目录和它的项目数据（快照/会话/暂存）都要清掉，不能留在用户磁盘上
+    fs.rmSync(directProj, { recursive: true, force: true });
+    const slug = `${path.basename(directProj).replace(/[^\w-]/g, '') || 'project'}-${sha1(directProj).slice(0, 8)}`;
+    fs.rmSync(path.join(ROOT, '.synthflow', 'projects', slug), { recursive: true, force: true });
+    console.log(`      ${dim(`已切回 ${res.projectDir}（${res.writeMode === 'direct' ? '直接写入' : '暂存确认'}）`)}`);
+  });
+
   /* ------------------------------ 收尾 ------------------------------ */
   section('收尾');
   // 无论中间成功失败，都要把项目切回测试前的状态，别把用户的应用留在测试目录上
@@ -895,7 +1043,7 @@ try {
       const r = await fetch(`${BASE}/api/project`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ dir: originalProject, mode: 'staging' }),
+        body: JSON.stringify({ dir: originalProject, mode: originalMode }),
       });
       const j = await r.json();
       console.log(`  ${j.ok ? color(32, '✓') : color(31, '✗')} 项目已切回 ${j.projectDir ?? cur}${j.error ? ` (${j.error})` : ''}`);

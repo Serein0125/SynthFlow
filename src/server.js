@@ -151,6 +151,19 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     const writeMode = cfg.writeMode === 'staging' ? 'staging' : 'direct';
     const overlayDir = writeMode === 'staging' ? path.join(projectStore, 'staging') : projectDir;
     ensureDir(projectStore);
+
+    // 直接写入模式：如果上一轮用的是暂存模式，暂存层里可能还压着没应用的改动。
+    // 用户选"直接写入"的意思就是"生成即落到项目目录"，所以这些改动要补齐写进去 ——
+    // 不能无声无息地烂在暂存目录里（这正是之前的坑：他以为早写进项目了，其实没有）。
+    let carryOver = null;
+    if (writeMode === 'direct') {
+      const carry = new Workspace(projectDir, { storeDir: projectStore, overlayDir: path.join(projectStore, 'staging') });
+      const res = carry.applyPending();
+      if (res.applied.length || res.deleted.length) {
+        carryOver = res;
+        log(`  [写入] 直接写入模式：已把上次暂存的 ${res.applied.length} 个文件补齐写进项目${res.deleted.length ? `，并删除 ${res.deleted.length} 个` : ''}`);
+      }
+    }
     const migrated = migrateLegacyStore(globalStore, projectStore, projectDir === path.join(root, 'workspace'));
     if (migrated.length) log(`  [迁移] 已把旧的 ${migrated.join('、')} 搬到项目数据目录，历史版本不会丢`);
 
@@ -185,7 +198,7 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
       ...(registry.list ?? []).filter((p) => p.dir !== projectDir)].slice(0, 12);
     fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
 
-    return { projectDir, projectStore, writeMode, overlayDir, workspace, memory, rag, session, runner, registry, fileCount };
+    return { projectDir, projectStore, writeMode, overlayDir, workspace, memory, rag, session, runner, registry, fileCount, carryOver };
   }
 
   svc = buildServices();
@@ -207,6 +220,13 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
     broadcast('versions', svc.session.versionList());
     broadcast('timeline', { timeline: svc.session.timeline });
     broadcast('pending', { items: svc.workspace.pending(), staging: svc.workspace.staging });
+    if (svc.carryOver) {
+      const { applied, deleted } = svc.carryOver;
+      broadcast('toast', {
+        level: 'ok',
+        message: `直接写入模式：已把上次暂存的 ${applied.length} 个文件写进项目${deleted.length ? `，并删除 ${deleted.length} 个` : ''}，不用你再点"应用到项目"`,
+      });
+    }
     return svc;
   }
 

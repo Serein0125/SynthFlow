@@ -9,6 +9,7 @@ const el = {
   profileSelect: $('#profile-select'),
   runBadge: $('#run-badge'),
   projectChip: $('#project-chip'),
+  modeChip: $('#mode-chip'),
   btnUndo: $('#btn-undo'),
   btnRedo: $('#btn-redo'),
   btnRegenerate: $('#btn-regenerate'),

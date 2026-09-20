@@ -486,7 +486,11 @@ export class Runner {
     if (failed.length) {
       this.emit('toast', { level: 'warn', message: `${failed.length} 个补丁未命中：${failed.map((f) => f.path).join(', ')}（已保留其余改动）` });
     }
-    if (version.droppedBranches) {
+    // 注意 version 可能是 null：手动保存模式（saveMode: 'manual'）下这一轮不产生版本，
+    // 上面几处都已经写成 version?.id，这里以前漏了问号 ——
+    // 结果是"每生成成功一次就抛一次 TypeError"，状态栏变红「出错了」，
+    // 用户以为生成失败，其实文件早就写对了。
+    if (version && version.droppedBranches) {
       this.emit('toast', { level: 'warn', message: `你刚才在历史版本上继续生成，已丢弃后面的 ${version.droppedBranches} 个版本分支` });
     }
 

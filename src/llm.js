@@ -103,7 +103,15 @@ export function loadConfig(projectRoot) {
 
     // —— 项目与写入 ——
     projectDir: stored.projectDir || '',
-    writeMode: stored.writeMode === 'staging' ? 'staging' : stored.projectDir ? 'staging' : 'direct',
+    // 必须尊重用户显式选过的写入模式。这里原先写的是
+    //   stored.writeMode === 'staging' ? 'staging' : stored.projectDir ? 'staging' : 'direct'
+    // 于是只要配了项目目录，"直接写入"每读一次配置就被悄悄掰回暂存模式：
+    // config.json 里明明写着 direct，运行中的服务器却是 staging，
+    // 用户在界面上选了直接写入，代码却还落在暂存层，还反问他"要不要应用到项目"。
+    // 只有配置里压根没有 writeMode（老配置）时，才按"有项目目录就先暂存"兜底。
+    writeMode: stored.writeMode === 'staging' || stored.writeMode === 'direct'
+      ? stored.writeMode
+      : (stored.projectDir ? 'staging' : 'direct'),
     customInstructions: stored.customInstructions || '',
 
     port: Number(stored.port ?? 7788),
@@ -127,6 +135,10 @@ export function saveConfig(projectRoot, patch) {
     next.apiKey = active.apiKey;
     next.temperature = active.temperature;
     next.maxTokens = active.maxTokens;
+  }
+  if (patch.writeMode !== undefined) {
+    // 只认两个合法值：脏值落盘后再被 loadConfig 一兜底，用户选的模式就又变了。
+    next.writeMode = patch.writeMode === 'staging' ? 'staging' : 'direct';
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8');

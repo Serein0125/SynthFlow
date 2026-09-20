@@ -473,6 +473,47 @@ await test('定时参数缺失/非法时不会退化成"立即提交"', () => {
   assert.ok(Number.isFinite(normalizeTiming({}).settleMs));
 });
 
+await test('★ 手动保存模式下生成一轮：不许出现"文件写对了却报错"', async () => {
+  // 用户报的现场：状态栏每次都变红「出错了」（TypeError: Cannot read properties of null
+  // (reading 'droppedBranches')），但文件其实已经正确写进项目。
+  // 根因是 #applyRun 里 version 在手动保存模式下恒为 null，而某一处漏了空值保护。
+  // 因为异常发生在 run:done 之后，只等 run:done 的用例根本发现不了 —— 必须断言"没有 run:error"。
+  const dir = path.join(TMP, 'manualmode');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'manualmode-store') });
+  const sess = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'manualmode-sessions') });
+  const evts = [];
+  const r = new Runner({
+    session: sess,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'manualmode-store')),
+    config: { ...cfg, saveMode: 'manual', commitIdleMs: 30, specDelayMs: 10, settleMs: 30 },
+    emit: (name, payload) => evts.push({ name, payload }),
+  });
+
+  const versionsBefore = sess.versions.length; // 基线 v0 本来就算一个版本，所以比增量而不是比 0
+  r.onInput({ text: '帮我写一个后台管理系统，包含用户列表、搜索和分页。', idleMs: 2000 });
+  await waitFor(() => evts.some((e) => e.name === 'run:done'), 30000, 'run:done');
+  // 异常是在 run:done 之后抛的，给它一点时间冒出来
+  await sleep(500);
+
+  const errors = evts.filter((e) => e.name === 'run:error');
+  assert.equal(
+    errors.length,
+    0,
+    `手动保存模式下不该有任何 run:error，实际：${errors.map((e) => e.payload?.message).join('；')}`,
+  );
+  const done = evts.find((e) => e.name === 'run:done');
+  assert.ok((done.payload.files ?? []).length > 0, '这一轮应该真的写了文件');
+  assert.equal(done.payload.versionId, null, '手动保存模式不该自动产生版本');
+  assert.ok(sess.pendingRound, '应当记下一笔"未保存的改动"');
+  assert.equal(sess.versions.length, versionsBefore, '没有点保存就不该多出任何版本');
+  // 文件确实在盘上
+  const written = done.payload.files.filter((f) => fs.existsSync(path.join(dir, f)));
+  assert.equal(written.length, done.payload.files.length, 'run:done 报告的文件必须真的落盘');
+});
+
 await test('未写完就先预演，但不落盘', async () => {
   runner.onInput({ text: '帮我写一个后台管理系统，包含', idleMs: 100 });
   await waitFor(() => events.some((e) => e.name === 'spec:done'), 15000, 'spec:done');
@@ -1483,9 +1524,107 @@ await test('与历史版本对比（想法 C）', () => {
   assert.equal(v1.id, 'v1');
 });
 
-/* ============================ 12. 基准（可选） ============================ */
+/* ============ 12. 写入方式：直接写入必须真的"直接"（用户反馈回归） ============ */
+section('12. 写入方式：直接写入不被配置读取悄悄掰回暂存');
+
+await test('loadConfig 尊重显式选择的 direct（哪怕已经配了项目目录）', () => {
+  const dir = path.join(TMP, 'mode-cfg');
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, '.synthflow'), { recursive: true });
+  // 这正是用户踩到的组合：有项目目录 + 明确选了直接写入
+  fs.writeFileSync(
+    path.join(dir, '.synthflow', 'config.json'),
+    JSON.stringify({ projectDir: 'D:\\ProgramData\\My_project', writeMode: 'direct' }),
+    'utf8',
+  );
+  const cfg = loadConfig(dir);
+  assert.equal(
+    cfg.writeMode,
+    'direct',
+    '配置里写了 direct 就必须是 direct —— 之前这里会被强行掰回 staging，'
+    + '导致用户选了直接写入，代码却还进暂存层，界面还在问"要不要应用到项目"',
+  );
+  assert.equal(cfg.projectDir, 'D:\\ProgramData\\My_project', '项目目录不能被顺手改掉');
+});
+
+await test('loadConfig 对老配置（没写 writeMode）仍按"有项目目录就暂存"兜底', () => {
+  const dir = path.join(TMP, 'mode-cfg-legacy');
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, '.synthflow'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.synthflow', 'config.json'),
+    JSON.stringify({ projectDir: 'D:\\some\\project' }),
+    'utf8',
+  );
+  assert.equal(loadConfig(dir).writeMode, 'staging', '老配置没有 writeMode，默认保护性暂存');
+  fs.writeFileSync(path.join(dir, '.synthflow', 'config.json'), JSON.stringify({}), 'utf8');
+  assert.equal(loadConfig(dir).writeMode, 'direct', '连项目目录都没有（默认 workspace）就不该多一层暂存');
+});
+
+await test('saveConfig 把非法 writeMode 归一到 direct，脏值不会落盘', () => {
+  const dir = path.join(TMP, 'mode-save');
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, '.synthflow'), { recursive: true });
+  saveConfig(dir, { projectDir: 'D:\\p', writeMode: 'direct' });
+  assert.equal(loadConfig(dir).writeMode, 'direct');
+  saveConfig(dir, { writeMode: 'staging' });
+  assert.equal(loadConfig(dir).writeMode, 'staging', '切回暂存也要生效');
+  saveConfig(dir, { writeMode: 'DIRECT' });
+  assert.equal(loadConfig(dir).writeMode, 'direct', '大小写不对的值应当被归一，而不是留下一个读不懂的状态');
+  saveConfig(dir, { writeMode: 'whatever' });
+  assert.equal(loadConfig(dir).writeMode, 'direct');
+  assert.equal(loadConfig(dir).projectDir, 'D:\\p', '后续 saveConfig 不能把项目目录冲掉');
+});
+
+await test('saveConfig 保存设置（不带 writeMode）不会误改写入方式', () => {
+  const dir = path.join(TMP, 'mode-keep');
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, '.synthflow'), { recursive: true });
+  saveConfig(dir, { projectDir: 'D:\\p', writeMode: 'direct' });
+  // 设置面板保存的是另一批字段，这里不能顺手把 writeMode 重置
+  saveConfig(dir, { settleMs: 1600, compactStyle: 'concise' });
+  assert.equal(loadConfig(dir).writeMode, 'direct', '保存别的设置不该动写入方式');
+  assert.equal(loadConfig(dir).settleMs, 1600);
+});
+
+await test('切到直接写入时，上一次暂存的改动会被补齐写进项目', () => {
+  const projectDir = path.join(TMP, 'carry-project');
+  const storeDir = path.join(TMP, 'carry-store');
+  fs.rmSync(projectDir, { recursive: true, force: true });
+  fs.rmSync(storeDir, { recursive: true, force: true });
+  const stagingDir = path.join(storeDir, 'staging');
+
+  // 第一段：暂存模式下生成
+  const staged = new Workspace(projectDir, { storeDir, overlayDir: stagingDir });
+  assert.equal(staged.staging, true);
+  staged.applyOp({ path: 'src/hello.js', mode: 'create', content: 'export const hi = 1;\n' });
+  assert.equal(staged.pending().length, 1);
+  assert.ok(!fs.existsSync(path.join(projectDir, 'src', 'hello.js')), '暂存模式下真实项目里不该有文件');
+
+  // 第二段：用户切到直接写入 —— 服务端会用一个"暂存视角"的工作区把遗留改动补齐
+  //（server.js buildServices 里的 carryOver，逻辑等价于下面这两行）
+  const carry = new Workspace(projectDir, { storeDir, overlayDir: path.join(storeDir, 'staging') });
+  const res = carry.applyPending();
+  assert.deepEqual(res.applied, ['src/hello.js'], '遗留暂存必须补齐写进项目');
+  assert.equal(
+    fs.readFileSync(path.join(projectDir, 'src', 'hello.js'), 'utf8'),
+    'export const hi = 1;\n',
+    '内容要和暂存层里的一致',
+  );
+
+  // 第三段：切完之后真的处于直接写入 —— 再生成一次应立刻落盘，且没有待应用
+  const direct = new Workspace(projectDir, { storeDir, overlayDir: projectDir });
+  assert.equal(direct.staging, false);
+  assert.deepEqual(direct.pending(), [], '直接写入模式下不该再有"待应用"清单');
+  assert.deepEqual([...direct.pendingRels()], [], 'pendingRels 也必须为空，否则界面会留一个点不动的按钮');
+  direct.applyOp({ path: 'src/direct.js', mode: 'create', content: 'export const d = 2;\n' });
+  assert.ok(fs.existsSync(path.join(projectDir, 'src', 'direct.js')), '直接写入必须立刻出现在项目目录里');
+  assert.deepEqual(direct.pending(), [], '直接写入模式下永远没有待应用改动');
+});
+
+/* ============================ 13. 基准（可选） ============================ */
 if (bench) {
-  section('11. 性能基线（--bench）');
+  section('13. 性能基线（--bench）');
   await test('1000 行文件的补丁定位 < 60ms', async () => {
     const big = Array.from({ length: 1000 }, (_, i) => `function f${i}() { return ${i}; }`).join('\n');
     const start = Date.now();

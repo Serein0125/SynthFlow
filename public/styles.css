@@ -2618,6 +2618,27 @@ body.resizing .editor-host {
   border-color: transparent;
 }
 
+/* 写入方式状态位：常驻显示"直接写入 / 暂存确认"，点一下就切换。
+   让用户永远不用猜"我选的模式到底生效没有"。 */
+.mode-chip {
+  flex: none;
+  font-size: 10.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mode-chip.direct {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border-color: transparent;
+}
+
+.mode-chip.staging {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: transparent;
+}
+
 .mini-select {
   height: 22px;
   padding: 0 4px;
@@ -3182,6 +3203,19 @@ body.resizing .editor-host {
   grid-template-rows: auto auto auto minmax(0, 1fr) var(--splitter) auto;
   min-height: 0;
 }
+
+/* 每一行都用显式 grid-row 定位，绝不能靠"第几个孩子"对号入座。
+   #pending-bar 一旦 display:none（直接写入模式下永远如此），后面的孩子会整体上移一行：
+   结果 .code-wrap 掉进 auto 行塌成 0 高、横向分隔条吃掉整个 1fr、
+   输入区被挤到页面下方 185px（= composer-h 190 - splitter 5），
+   用户看到的就是"输入框不见了 / 按钮点不到"。
+   显式定位后，谁被隐藏都只留一个 0 高的空行，其它行纹丝不动。 */
+.editor > .tabs { grid-row: 1; }
+.editor > .editor-toolbar { grid-row: 2; }
+.editor > #pending-bar { grid-row: 3; }
+.editor > .code-wrap { grid-row: 4; }
+.editor > .splitter.horizontal { grid-row: 5; }
+.editor > .composer { grid-row: 6; }
 
 .composer {
   height: var(--composer-h);

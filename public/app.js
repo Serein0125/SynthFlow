@@ -291,6 +291,10 @@ function renderPending(payload) {
   const bar = el.pendingBar;
   if (!bar) return;
   if (!S.staging) {
+    // 直接写入模式：不存在"待应用"这回事 —— AI 生成时就已经写进项目目录了。
+    // 这里必须把残留的待应用清单清空，否则会留下一个点不动的"应用到项目"按钮，
+    // 让人以为还要自己确认一次。
+    S.pending = [];
     bar.classList.add('hidden');
     return;
   }
@@ -642,9 +646,50 @@ function renderProjectChip(state) {
     S.projectDir = dir;
     S.staging = Boolean(state.paths?.staging ?? state.workspace?.staging);
     const short = dir.split(/[\\/]/).filter(Boolean).slice(-2).join('/');
-    el.projectChip.textContent = `📁 ${short}${S.staging ? ' · 暂存' : ''}`;
-    el.projectChip.title = `目标项目：${dir}\n${S.staging ? '暂存模式：AI 改动需你确认后才写入项目' : '直接写入模式'}\n点击可以切换项目`;
+    el.projectChip.textContent = `📁 ${short}`;
+    el.projectChip.title = `目标项目：${dir}\n点击可以切换项目`;
     el.projectChip.classList.toggle('warn', S.staging);
+  }
+  // 写入方式是独立的状态位：之前它只以 "· 暂存" 后缀藏在项目名后面，
+  // 用户选了"直接写入"却看不出来到底生效没有，于是一直在等一个不该出现的"应用"按钮。
+  if (state?.paths?.writeMode) renderModeChip(state.paths.writeMode);
+}
+
+/** 写入方式状态位：常驻可见、可点击切换。 */
+function renderModeChip(mode) {
+  if (!el.modeChip) return;
+  const direct = mode === 'direct';
+  S.writeMode = mode;
+  S.staging = !direct;
+  el.modeChip.textContent = direct ? '⚡ 直接写入' : '🛡 暂存确认';
+  el.modeChip.classList.toggle('direct', direct);
+  el.modeChip.classList.toggle('staging', !direct);
+  el.modeChip.title = direct
+    ? '直接写入模式：AI 生成的代码立刻落进项目目录，不会问你"要不要应用"。点击改成暂存确认。'
+    : '暂存确认模式：AI 改动先放暂存层，你点"应用到项目"后才写进去。点击改成直接写入。';
+  renderPending({ items: S.pending, staging: S.staging });
+}
+
+/** 点击状态位就地切换写入方式（不换项目）。 */
+async function toggleWriteMode() {
+  const next = S.writeMode === 'direct' ? 'staging' : 'direct';
+  if (next === 'direct') {
+    const ok = window.confirm(
+      '切到「直接写入模式」？\n\n'
+      + `之后 AI 生成的代码会立刻写进 ${S.projectDir || '当前项目'}，不再经过暂存层、也不需要你点"应用到项目"。\n`
+      + '（版本回退仍然可用，改动前会自动留快照。）',
+    );
+    if (!ok) return;
+  }
+  try {
+    const res = await post('/api/project', { dir: S.projectDir, mode: next });
+    renderModeChip(res.writeMode);
+    renderProjectChip({ paths: { projectDir: res.projectDir, staging: res.staging, writeMode: res.writeMode } });
+    setStatus('ok', next === 'direct'
+      ? '已切到直接写入：生成的代码立刻进入项目目录'
+      : '已切到暂存确认：改动先落暂存层，确认后再写入');
+  } catch (err) {
+    setStatus('err', `切换写入方式失败：${err.message}`);
   }
 }
 
@@ -876,7 +921,14 @@ on('run:done', (d) => {
     S.usage.last = d.usage.tokens ?? 0;
     renderUsage();
   }
-  setStatus('done', `已写入 ${d.files?.length ?? 0} 个文件`, `${d.ms}ms${d.versionId ? ` · 版本 ${d.versionId}` : ' · 未保存为版本'}`);
+  // 直接写入模式要明说"已经进项目了"，否则用户会下意识去找"应用到项目"按钮
+  setStatus(
+    'done',
+    S.staging
+      ? `已写入暂存层 ${d.files?.length ?? 0} 个文件（确认后进项目）`
+      : `已直接写入项目目录：${d.files?.length ?? 0} 个文件`,
+    `${d.ms}ms${d.versionId ? ` · 版本 ${d.versionId}` : ' · 未保存为版本'}`,
+  );
   checkStreamLimit();
 });
 
@@ -1391,6 +1443,7 @@ function bindUi() {
   });
   el.btnSettings?.addEventListener('click', () => Panels.openSettings());
   el.projectChip?.addEventListener('click', () => Panels.openPicker());
+  el.modeChip?.addEventListener('click', () => toggleWriteMode());
   el.btnHelp?.addEventListener('click', () => el.helpModal.classList.remove('hidden'));
   $('#help-close')?.addEventListener('click', () => el.helpModal.classList.add('hidden'));
   el.helpModal?.addEventListener('click', (e) => {
