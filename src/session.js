@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { changedSpan, clamp, ensureDir, newId, nowIso, readJsonSafe, sha1, similarity, writeJsonAtomic } from './util.js';
 
+/** 轮次前像日志的总体积上限（会话文件每次保存都会整份重写，不能无限膨胀）。 */
+const JOURNAL_MAX_BYTES = 1.5 * 1024 * 1024;
+
 /* ------------------------------------------------------------------ *
  * 1) 意图完整度判定（想法 6）
  *    "不要一个字刚打就立刻改代码" —— 用多信号打分，而不是单纯等固定时间。
@@ -193,6 +196,12 @@ export class Session {
     // v3.1（想法 11）：只有点「保存为版本」才产生版本。
     // 这里记录"还没保存的改动"，并提供撤销所需的回合前快照。
     this.pendingRound = null;
+    // v3.3：每一轮**改了哪些文件、改之前长什么样**。
+    // 之前时间线上只有"已保存版本"，⏪ 也只能退到上一个已保存版本 ——
+    // 中间那些没保存的轮次既看不见也退不动。这里用"只存这一轮碰过的文件"的前像
+    // 把它补上（一轮通常 1-3 个文件，比每轮打一个全量快照省得多）。
+    this.roundJournal = [];
+    this.maxJournal = 40;
     this.syncEnabled = true;
 
     // 想法 & 修复：暂存模式下"基线"就是项目原样，用一个空快照表示即可 ——
@@ -463,6 +472,67 @@ export class Session {
     this.touch();
   }
 
+  /* ------------------------- 轮次前像日志（v3.3） ------------------------- */
+
+  /**
+   * 记一轮"改之前的文件内容"。必须在这一轮真正写盘**之前**调用。
+   * @param {{id:string, prompt?:string, mode?:string, files:Object<string,{existed:boolean,content:string|null}>, skipped?:string[]}} entry
+   */
+  pushRoundJournal(entry) {
+    this.roundJournal.push({
+      id: entry.id,
+      at: entry.at ?? nowIso(),
+      prompt: String(entry.prompt ?? '').slice(0, 160),
+      mode: entry.mode ?? '',
+      files: entry.files ?? {},
+      skipped: entry.skipped ?? [],
+    });
+    if (this.roundJournal.length > this.maxJournal) {
+      this.roundJournal = this.roundJournal.slice(-this.maxJournal);
+    }
+    // 体积也要剪：会话文件每次 save() 都会整份写盘，不能让它无限膨胀
+    let total = this.journalBytes();
+    while (total > JOURNAL_MAX_BYTES && this.roundJournal.length > 1) {
+      const dropped = this.roundJournal.shift();
+      for (const f of Object.values(dropped.files ?? {})) total -= (f.content?.length ?? 0);
+    }
+    this.touch();
+    return this.roundJournal.length;
+  }
+
+  journalBytes() {
+    let total = 0;
+    for (const e of this.roundJournal) {
+      for (const f of Object.values(e.files ?? {})) total += (f.content?.length ?? 0) + 32;
+    }
+    return total;
+  }
+
+  /** 保存版本之后，这些"未保存的轮次"已经进了版本，前像就没用了。 */
+  clearRoundJournal() {
+    this.roundJournal = [];
+    this.touch();
+  }
+
+  popRoundJournal() {
+    const entry = this.roundJournal.pop() ?? null;
+    if (entry) this.touch();
+    return entry;
+  }
+
+  /** 给界面看的精简清单（不带文件内容，只带"这一轮动了哪些文件"）。 */
+  roundJournalBrief() {
+    return this.roundJournal.map((e, i) => ({
+      n: i + 1,
+      id: e.id,
+      at: e.at,
+      prompt: e.prompt,
+      mode: e.mode,
+      files: Object.keys(e.files ?? {}),
+      skipped: e.skipped ?? [],
+    }));
+  }
+
   /** 确认一个"待确认"版本（想法 2）。 */
   confirmVersion(versionId) {
     const v = versionId ? this.versions.find((x) => x.id === versionId) : this.currentVersion;
@@ -500,6 +570,7 @@ export class Session {
       timeline: this.timeline,
       manualEdits: this.manualEdits,
       pendingRound: this.pendingRound,
+      roundJournal: this.roundJournal,
       syncEnabled: this.syncEnabled,
       versionSeq: this.versionSeq,
       activeIndex: this.activeIndex,
@@ -540,9 +611,11 @@ export class Session {
     s.stats = { runs: 0, commits: 0, rollbacks: 0, forwards: 0, charsGenerated: 0, adopted: 0, dismissed: 0, modelCalls: 0, estTokens: 0, ...(data.stats ?? {}) };
     if (!Array.isArray(s.timeline)) s.timeline = [];
     if (!Array.isArray(s.manualEdits)) s.manualEdits = [];
+    if (!Array.isArray(s.roundJournal)) s.roundJournal = [];
     if (!s.pendingRound) s.pendingRound = null;
     if (typeof s.syncEnabled !== 'boolean') s.syncEnabled = true;
     s.maxTimeline = 40;
+    s.maxJournal = 40;
     return s;
   }
 

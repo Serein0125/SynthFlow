@@ -495,9 +495,14 @@ textarea {
 }
 
 .tree-children {
-  padding-left: 13px; /* 每层缩进 */
+  /* 每层缩进只能在这里加一次。之前 JS 还按 depth 再加 12px 内边距，
+     加上这里的 padding 13px + margin 8px，一级就吃掉 33px ——
+     七八级子目录（231px+）直接把 260px 的侧栏撑满，文件名一个字都看不见。
+     现在对齐 VS Code 的手感：一级 12px（8 内边距 + 4 外边距），
+     8 层也只要 96px，侧栏里仍然放得下文件名。 */
+  padding-left: 8px;
   border-left: 1px solid var(--border-soft);
-  margin-left: 8px;
+  margin-left: 4px;
 }
 
 .tree-dir,
@@ -550,6 +555,7 @@ textarea {
 
 .tree-item .name,
 .tree-file .name {
+  min-width: 0; /* 没有它，flex 子项不肯收缩，ellipsis 不会生效 */
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -653,6 +659,40 @@ textarea {
 .timeline-item.reverted b {
   text-decoration: line-through;
   text-decoration-color: var(--err);
+}
+
+/* v3.3：还没保存为版本的那些轮次。它们也能被 ⏪ / 点击回退，
+   所以要和"已保存版本"在视觉上分得开 —— 用虚线 + 次要色，不要抢主版本的注意力。 */
+.timeline-sep {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 4px;
+  padding: 0 4px;
+  font-size: 10.5px;
+  color: var(--text-3);
+  list-style: none;
+}
+
+.timeline-sep::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-soft);
+}
+
+.timeline-item.unsaved {
+  border-left-style: dashed;
+  opacity: 0.9;
+}
+
+.timeline-item.unsaved b {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.timeline-item.unsaved span {
+  color: var(--text-3);
 }
 
 .timeline-actions {
@@ -2255,11 +2295,35 @@ textarea {
   border-top: 1px solid var(--border);
   color: var(--text-2);
   font-size: 11.5px;
+  /* 状态栏是固定 26px 高的一行。把左侧栏拉宽、编辑区变窄之后，
+     里面的文字以前会**换行成 4-5 行**（实测 #status-text 从 18px 撑到 89px），
+     把整个输入区顶破 23px、页面出现滚动条。
+     一行就是一行的东西：一律不换行，放不下就省略号。 */
+  overflow: hidden;
+  min-width: 0;
+}
+
+.statusbar > * {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.statusbar > .spacer {
+  flex: 1 1 auto;
+  min-width: 6px;
+}
+
+.statusbar > .status-dot {
+  overflow: visible;
+  flex: 0 0 auto;
 }
 
 .status-text {
   color: var(--text-1);
   font-weight: 600;
+  flex: 0 1 auto;
 }
 
 .status-dot {
@@ -2549,9 +2613,12 @@ body.hide-stream .stream {
 }
 
 .composer {
-  height: var(--composer-h);
+  /* 这里原来是 height + min-height 都写死成同一个值，还配了 overflow:auto ——
+     于是输入区被拉到低于内容高度时，溢出的那部分被"藏"成内部滚动条：
+     用户看到的就是"一键整合/导入这些按钮和输入框挤在一起"。
+     现在只留 min-height：设定值是**下限**，内容更高时盒子自己长起来。 */
   min-height: var(--composer-h);
-  overflow: auto;
+  overflow: visible;
 }
 
 .splitter {
@@ -3218,8 +3285,11 @@ body.resizing .editor-host {
 .editor > .composer { grid-row: 6; }
 
 .composer {
-  height: var(--composer-h);
-  min-height: 120px;
+  /* 用 min-height 而不是固定 height：用户把输入区拉小是"想矮一点"，
+     不是"想让它塌掉"。内容（意图条 + 输入框 + 底部工具行）撑得比设定值高时，
+     这里就让盒子长起来，而不是让工具行溢出压到输入框上。
+     实测内容天然下限约 171px，滑块的 min 与它对齐。 */
+  min-height: var(--composer-h);
   border-top: 1px solid var(--border);
 }
 
@@ -3231,6 +3301,9 @@ body.resizing .editor-host {
 
 .composer-row {
   align-items: stretch;
+  /* 输入区被拉高时，多出来的高度给输入框这一行，而不是在底部留一块空白 */
+  flex: 1 1 auto;
+  min-height: 92px;
 }
 
 .composer-side {
@@ -3253,6 +3326,21 @@ body.resizing .editor-host {
   gap: 6px;
   padding: 0 10px 4px;
   min-height: 22px;
+  /* 同理：这一行也不能换行，否则窄编辑区下会把输入区顶高 */
+  flex-wrap: nowrap;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.prompt-tools > * {
+  min-width: 0;
+  white-space: nowrap;
+}
+
+#compact-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 }
 
 /* --- 25.2 左栏：文件树 / 时间线 各占一份，谁都不会挤掉谁（想法 14） --- */

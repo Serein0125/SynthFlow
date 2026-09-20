@@ -193,11 +193,33 @@ export class Workspace {
         this.deleted.add(r);
         this.saveState();
       }
+      this.pruneEmptyParents(r, this.overlayDir);
     } else if (fs.existsSync(this.abs(r).abs)) {
       fs.rmSync(this.abs(r).abs, { force: true, recursive: true });
+      // 删完文件还得把空掉的父目录一起收掉，否则用户打开项目文件夹会看到
+      // 一串空目录 —— 这就是"文件没删干净"的观感来源。
+      this.pruneEmptyParents(r, this.root);
     }
     this.invalidateScan();
     return r;
+  }
+
+  /**
+   * 从被删文件所在目录往上走，把空掉的父目录一路删掉（碰到根目录或非空目录就停）。
+   * 只走一条链，不做全树遍历 —— 删除是高频操作，不能每次都扫整个项目。
+   */
+  pruneEmptyParents(rel, base = this.root) {
+    const stop = path.resolve(base);
+    let dir = path.dirname(resolveInside(stop, rel).abs);
+    while (dir && dir !== stop && dir.startsWith(stop + path.sep)) {
+      try {
+        if (fs.readdirSync(dir).length > 0) break;
+        fs.rmdirSync(dir);
+      } catch {
+        break; // 目录不存在、非空、或被占用 —— 都不是错误
+      }
+      dir = path.dirname(dir);
+    }
   }
 
   /**
@@ -330,6 +352,8 @@ export class Workspace {
       const target = this.absRead(item.path);
       if (item.status === 'deleted') {
         if (fs.existsSync(target.abs)) fs.rmSync(target.abs, { force: true });
+        // 同样要把空掉的父目录收掉，不然应用删除之后项目里留一串空文件夹
+        this.pruneEmptyParents(item.path, this.root);
         deleted.push(item.path);
       } else {
         const src = this.abs(item.path).abs;
@@ -547,6 +571,7 @@ export class Workspace {
         if (!(rel in want)) this.deleted.add(rel);
       }
       if (this.deleted.size) this.saveState();
+      this.invalidateScan();
       return { snapshotId, restored: this.pendingRels().size, files: [...this.pendingRels()], meta: man };
     }
     // 直接模式：工作区由 SynthFlow 独占管理，整目录重建才等价于"回到那一版"
@@ -563,6 +588,10 @@ export class Workspace {
       this.write(rel, fs.readFileSync(src, 'utf8'));
       written.push(rel);
     }
+    // 这里必须显式失效扫描缓存：上面是直接 rmSync 删的，绕过了会失效缓存的 remove()。
+    // 回退到一个**空快照**时一个文件都不会 write，缓存就永远不失效 ——
+    // 结果文件已经删干净了，界面上的文件树还是旧的。
+    this.invalidateScan();
     return { snapshotId, restored: written.length, files: written, meta: man };
   }
 

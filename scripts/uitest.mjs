@@ -807,13 +807,18 @@ try {
     if (probe.out.length) throw new Error(`${probe.out.join('；')}\n      现场：${JSON.stringify(probe)}`);
   });
 
-  await test('输入区高度符合布局变量', async () => {
+  await test('输入区高度符合布局变量（设定值是下限，内容更高时盒子自己长）', async () => {
     const info = await cdp.evaluate(`
-      const h = Math.round(document.querySelector('.composer').getBoundingClientRect().height);
+      const box = document.querySelector('.composer');
+      const h = Math.round(box.getBoundingClientRect().height);
       const v = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--composer-h'), 10);
-      return { h, v };
+      return { h, v, scrollH: box.scrollHeight, clientH: box.clientHeight };
     `);
-    if (Math.abs(info.h - info.v) > 6) throw new Error(`输入区高度 ${info.h}px 与 --composer-h ${info.v}px 不符`);
+    // 设定值是"至少这么高"：内容更高时盒子必须长起来，否则工具行会被压到输入框上
+    if (info.h < info.v - 6) throw new Error(`输入区高度 ${info.h}px 低于设定值 ${info.v}px`);
+    if (info.scrollH > info.clientH + 2) {
+      throw new Error(`输入区内容溢出了 ${info.scrollH - info.clientH}px（控件会互相重叠）`);
+    }
   });
 
   /* ------------------------------ O. 需要模型的用例 ------------------------------ */
@@ -1014,8 +1019,206 @@ try {
       if (badge.includes('出错')) throw new Error(`运行徽标显示「${badge}」，说明这轮抛了异常`);
       console.log(`      ${dim(`项目目录：${files.join('、')} · 状态栏「${status}」`)}`);
     });
+
+    await test('★ 时间线里出现"未保存的每一轮"，⏪ 可以按轮回退（想法 4 的补充）', async () => {
+      const st = await (await fetch(`${BASE}/api/state`)).json();
+      const rounds = st.unsaved?.rounds ?? [];
+      if (!rounds.length) throw new Error('生成了一轮，但 unsaved.rounds 是空的 —— 时间线又只显示已保存版本了');
+      // 时间线上应该画出来
+      await cdp.waitFor(`document.querySelectorAll('#timeline .timeline-item.unsaved').length > 0`, {
+        timeout: 8000,
+        label: '时间线出现未保存轮次',
+      });
+      const info = await cdp.evaluate(`
+        return {
+          sep: document.querySelector('#timeline .timeline-sep')?.textContent?.trim() ?? '',
+          unsaved: document.querySelectorAll('#timeline .timeline-item.unsaved').length,
+          undoDisabled: document.querySelector('#btn-undo')?.disabled,
+        };
+      `);
+      if (!info.sep.includes('未保存')) throw new Error(`时间线分隔标签不对：${info.sep}`);
+      if (info.undoDisabled) throw new Error('有未保存轮次时 ⏪ 不该被禁用（它现在能按轮回退）');
+      console.log(`      ${dim(`时间线：${info.sep} · ${info.unsaved} 个可回退轮次 · ⏪ 可用`)}`);
+
+      // 真的按一次，验证它退的是"一轮"而不是整个版本
+      const before = (await (await fetch(`${BASE}/api/state`)).json()).unsaved?.rounds?.length ?? 0;
+      await cdp.evaluate($click('#btn-undo'));
+      await sleep(900);
+      const after = (await (await fetch(`${BASE}/api/state`)).json()).unsaved?.rounds?.length ?? 0;
+      if (after >= before) throw new Error(`点了 ⏪ 之后未保存轮次从 ${before} 变成 ${after}，没有回退`);
+      console.log(`      ${dim(`点一次 ⏪：未保存轮次 ${before} → ${after}`)}`);
+    });
     await cdp.screenshot('09-direct-write');
   }
+
+  /* ---------- S. 布局手感（用户第四轮反馈的 1/2/3 条） ---------- */
+  section('S. 布局手感：文件树缩进 / 拖动灵敏度 / 滑块下限');
+
+  const layoutProj = path.join(OUT, 'layoutproj');
+  fs.rmSync(layoutProj, { recursive: true, force: true });
+  // 造一个 8 层深的目录，专门用来验"深目录会不会把侧栏撑爆"
+  const deepRel = 'a/b/c/d/e/f/g/h/deep-file.js';
+  fs.mkdirSync(path.join(layoutProj, path.dirname(deepRel)), { recursive: true });
+  fs.writeFileSync(path.join(layoutProj, deepRel), 'export const deep = 1;\n', 'utf8');
+  fs.writeFileSync(path.join(layoutProj, 'top.js'), 'export const top = 1;\n', 'utf8');
+
+  await test('切到布局测试项目', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: layoutProj, mode: 'direct' }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切换失败：${res.error ?? ''}`);
+    await sleep(600);
+  });
+
+  await test('★ 8 层深目录不会把文件树撑爆（缩进每级只算一次）', async () => {
+    // 先把左侧栏恢复成默认宽度，别受前面用例影响
+    await cdp.evaluate(`
+      document.querySelector('#layout-panel')?.classList.remove('hidden');
+      const el = document.querySelector('#ly-sidebar');
+      el.value = 260; el.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#layout-panel').classList.add('hidden');
+      return true;
+    `);
+    await sleep(400);
+    // 把所有折叠的目录逐轮点开，直到没有新的展开为止
+    for (let pass = 0; pass < 12; pass += 1) {
+      const clicked = await cdp.evaluate(`
+        let n = 0;
+        for (const d of document.querySelectorAll('#file-tree .tree-dir.collapsed')) { d.click(); n += 1; }
+        return n;
+      `);
+      if (!clicked) break;
+      await sleep(160);
+    }
+    const info = await cdp.evaluate(`
+      const tree = document.querySelector('#file-tree');
+      const items = [...tree.querySelectorAll('.tree-item')];
+      const deepest = items.map((el) => ({ left: Math.round(el.getBoundingClientRect().left), name: el.querySelector('.name')?.textContent ?? '', nameW: Math.round((el.querySelector('.name')?.getBoundingClientRect().width) ?? 0) }))
+        .sort((a, b) => b.left - a.left)[0];
+      return { treeW: Math.round(tree.getBoundingClientRect().width), deepest, count: items.length, scrollW: tree.scrollWidth, clientW: tree.clientWidth };
+    `);
+    if (info.count < 9) throw new Error(`目录没有展开完整，只有 ${info.count} 项（期望 ≥9）`);
+    // 最深一行的左边缘不能吃掉大半侧栏
+    if (info.deepest.left > info.treeW * 0.55) {
+      throw new Error(`8 层深目录的左边缘到了 ${info.deepest.left}px（文件树只有 ${info.treeW}px），文件名会被挤没`);
+    }
+    if (info.treeW - info.deepest.left < 60) {
+      throw new Error(`最深一行只剩 ${info.treeW - info.deepest.left}px 放文件名，太窄`);
+    }
+    if (info.scrollW > info.clientW + 4) throw new Error(`文件树出现了横向滚动（${info.scrollW} > ${info.clientW}）`);
+    console.log(`      ${dim(`树宽 ${info.treeW}px · 最深项 left=${info.deepest.left}px · 名字「${info.deepest.name}」`)}`);
+  });
+
+  await test('★ 拖动分栏线：拖多少就变多少（不是平方级放大）', async () => {
+    const dragBy = async (sel, dx) => {
+      const box = await cdp.evaluate(`
+        const el = document.querySelector(${JSON.stringify(sel)});
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      `);
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1, buttons: 1 });
+      for (let i = 1; i <= 5; i += 1) {
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x + (dx * i) / 5, y: box.y, button: 'left', buttons: 1 });
+        await sleep(20);
+      }
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x + dx, y: box.y, button: 'left', buttons: 0 });
+      await sleep(120);
+    };
+    const width = () => cdp.evaluate(`return parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-w'), 10)`);
+
+    const before = await width();
+    await dragBy('#split-left', 40);
+    const after40 = await width();
+    const delta1 = after40 - before;
+    if (Math.abs(delta1 - 40) > 14) {
+      throw new Error(`拖 40px，左侧栏实际变了 ${delta1}px —— 拖动应该是 1:1 的（以前每帧都把累计位移再加一遍，会越拖越快）`);
+    }
+    // 再拖一次，验证不会"越拖越快"
+    await dragBy('#split-left', 40);
+    const after80 = await width();
+    const delta2 = after80 - after40;
+    if (Math.abs(delta2 - 40) > 14) throw new Error(`第二次拖 40px 实际变了 ${delta2}px，说明位移在累加`);
+    console.log(`      ${dim(`左侧栏 ${before} → ${after40} → ${after80}（两次各拖 40px）`)}`);
+
+    // 输入区的分界线：往下拖 = 输入区变矮
+    const h = () => cdp.evaluate(`return Math.round(document.querySelector('.composer').getBoundingClientRect().height)`);
+    const h0 = await h();
+    const box = await cdp.evaluate(`
+      const r = document.querySelector('#split-composer').getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    `);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1, buttons: 1 });
+    for (let i = 1; i <= 5; i += 1) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y - (30 * i) / 5, button: 'left', buttons: 1 });
+      await sleep(20);
+    }
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x, y: box.y - 30, button: 'left', buttons: 0 });
+    await sleep(150);
+    const h1 = await h();
+    if (h1 - h0 < 15) throw new Error(`把输入区分界线往上拖 30px，输入区只从 ${h0} 变成 ${h1}（往上拖应该变高）`);
+    console.log(`      ${dim(`输入区 ${h0} → ${h1}（分界线往上拖 30px）`)}`);
+  });
+
+  await test('★ 输入区拉到最小时，工具行不会和输入框重叠', async () => {
+    await cdp.evaluate(`
+      document.querySelector('#layout-panel')?.classList.remove('hidden');
+      const el = document.querySelector('#ly-composer');
+      el.value = el.min; el.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    `);
+    await sleep(300);
+    const geo = await cdp.evaluate(`
+      const p = document.querySelector('#prompt').getBoundingClientRect();
+      const t = document.querySelector('.prompt-tools').getBoundingClientRect();
+      const c = document.querySelector('.composer');
+      const box = c.getBoundingClientRect();
+      const cs = getComputedStyle(document.documentElement).getPropertyValue('--composer-h');
+      let over = 0; let who = '';
+      for (const el of c.querySelectorAll('*')) {
+        const s = getComputedStyle(el);
+        if (s.display === 'none' || s.position === 'absolute') continue;
+        const r = el.getBoundingClientRect();
+        if (r.height === 0) continue;
+        const d = Math.round(r.bottom - box.bottom);
+        if (d > over) { over = d; who = el.className || el.id; }
+      }
+      return { overlap: Math.round(p.bottom - t.top), composerVar: cs, composerH: Math.round(box.height), over, who };
+    `);
+    if (geo.overlap > 1) throw new Error(`输入框和工具行重叠了 ${geo.overlap}px（输入区 ${geo.composerVar}）`);
+    if (geo.over > 1) throw new Error(`输入区里有元素（${geo.who}）超出底边 ${geo.over}px`);
+    console.log(`      ${dim(`输入区设为 ${geo.composerVar} 时实际高 ${geo.composerH}px，无重叠`)}`);
+  });
+
+  await test('滑块下限本身就是安全的（不用靠 CSS 兜底）', async () => {
+    const mins = await cdp.evaluate(`
+      return {
+        sidebar: Number(document.querySelector('#ly-sidebar').min),
+        stream: Number(document.querySelector('#ly-stream').min),
+        composer: Number(document.querySelector('#ly-composer').min),
+      };
+    `);
+    if (mins.composer < 200) throw new Error(`输入区滑块的 min=${mins.composer}，内容需要 201px，拉到底就会挤在一起`);
+    if (mins.sidebar < 100) throw new Error(`左侧栏滑块 min=${mins.sidebar} 太小`);
+    if (mins.stream < 120) throw new Error(`思考栏滑块 min=${mins.stream} 太小`);
+    console.log(`      ${dim(`滑块下限：左侧栏 ${mins.sidebar} / 思考栏 ${mins.stream} / 输入区 ${mins.composer}`)}`);
+  });
+
+  await test('清理布局测试项目并切回', async () => {
+    const r = await fetch(`${BASE}/api/project`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: originalProject, mode: originalMode }),
+    });
+    const res = await r.json();
+    if (!res.ok) throw new Error(`切回失败：${res.error ?? ''}`);
+    fs.rmSync(layoutProj, { recursive: true, force: true });
+    const slug = `${path.basename(layoutProj).replace(/[^\w-]/g, '') || 'project'}-${sha1(layoutProj).slice(0, 8)}`;
+    fs.rmSync(path.join(ROOT, '.synthflow', 'projects', slug), { recursive: true, force: true });
+    await cdp.waitFor(`document.querySelector('#project-chip').textContent.length > 0`, { timeout: 10000, label: '界面恢复' });
+  });
 
   await test('切回原项目并恢复原来的写入方式', async () => {
     const r = await fetch(`${BASE}/api/project`, {

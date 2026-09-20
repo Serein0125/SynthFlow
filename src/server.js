@@ -342,7 +342,12 @@ export function createServer({ projectRoot, port, host = '127.0.0.1', log = cons
         return runner.saveVersion({ label: body.label });
 
       case '/api/version/undo-round':
+        // 一次性退回到"最近一次保存版本"的状态（跨所有未保存轮次）
         return runner.undoRound();
+
+      case '/api/version/undo-step':
+        // v3.3：只往回退 N 轮，粒度是"轮"，不要求先保存版本
+        return runner.undoRoundStep({ count: Number(body.count ?? 1) });
 
       case '/api/timeline/clear':
         session.clearTimeline();

@@ -14,6 +14,8 @@
     "bench": "node scripts/smoke.mjs --bench",
     "uitest": "node scripts/uitest.mjs",
     "uitest:model": "node scripts/uitest.mjs --with-model",
+    "monkey": "node scripts/monkey.mjs",
+    "monkey:model": "node scripts/monkey.mjs --with-model --rounds=80",
     "livecheck": "node scripts/livecheck.mjs",
     "clean": "node scripts/clean.mjs"
   },

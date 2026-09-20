@@ -11,6 +11,12 @@ import { scanStyle } from './style.js';
 import { buildProjectMap, locate, locatorBrief } from './projectmap.js';
 import { addedLineNumbers, compactDiff, newId, nowIso, sha1 } from './util.js';
 
+/**
+ * 单文件超过这个大小就不记"轮次前像"了（回退时会如实告知哪几个文件退不回来），
+ * 免得一个大文件把会话文件撑爆。
+ */
+const JOURNAL_MAX_FILE_BYTES = 256 * 1024;
+
 export class Runner {
   constructor({ session, workspace, rag, memory, config, emit }) {
     this.session = session;
@@ -378,12 +384,34 @@ export class Runner {
     const s = this.session;
     s.status = 'applying';
     const promptBefore = this.committedPrompt;
-    // 想法 11：落盘前先打一个"本轮之前"的快照，用于"撤销未保存的改动"。
-    // 注意这不是版本 —— 时间线上不会出现它。
+    const manualMode = this.config.saveMode !== 'auto';
+
+    // v3.3：写盘**之前**记下这一轮要碰的每个文件的"前像"，用于一轮一轮往回退。
+    // 只记这一轮真正改到的文件（通常 1-3 个），比每轮打一个全量快照省得多。
+    const before = {};
+    const skipped = [];
+    const seen = new Set();
+    for (const op of run.ops ?? []) {
+      const rel = String(op.path || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
+      if (!rel || seen.has(rel)) continue;
+      seen.add(rel);
+      const cur = this.workspace.read(rel);
+      if (cur?.tooLarge || (cur?.content?.length ?? 0) > JOURNAL_MAX_FILE_BYTES) {
+        skipped.push(rel); // 太大的文件不记前像，回退时如实告知
+        continue;
+      }
+      before[rel] = { existed: Boolean(cur), content: cur ? cur.content : null };
+    }
+
+    // 想法 11：还需要一个"第一轮未保存改动之前"的全量快照，供"一次性撤销全部未保存改动"。
+    // 以前这里**每一轮**都打一个全量快照，而且 setPendingRound 每轮把 preSnapshotId 覆盖掉 ——
+    // 结果是白占磁盘，撤销时也只退得掉最后一轮。现在只在第一轮取一次。
     let preSnapshot = null;
-    try {
-      preSnapshot = this.workspace.snapshot({ label: `pre-round ${run.id}`, runId: run.id, meta: { kind: 'pre-round' } });
-    } catch { /* 快照失败不影响写入 */ }
+    if (!manualMode || !s.pendingRound?.preSnapshotId) {
+      try {
+        preSnapshot = this.workspace.snapshot({ label: `pre-round ${run.id}`, runId: run.id, meta: { kind: 'pre-round' } });
+      } catch { /* 快照失败不影响写入 */ }
+    }
     const results = [];
     for (const op of run.ops) {
       let res;
@@ -398,12 +426,17 @@ export class Runner {
     const okFiles = results.filter((r) => r.ok).map((r) => r.path);
     const failed = results.filter((r) => !r.ok);
     const summary = `${run.retryOf ? '补丁重试 · ' : ''}${run.mode === 'regenerate' ? '生成' : run.mode === 'continue' ? '增量续写' : '增量修改'} ${okFiles.length} 个文件${failed.length ? `（${failed.length} 个失败）` : ''}`;
-    const manualMode = this.config.saveMode !== 'auto';
     let version = null;
     if (manualMode) {
+      // v3.3：把这一轮的前像记进日志（时间线上一轮一个"可回退"的点）
+      if (okFiles.length) {
+        s.pushRoundJournal({ id: run.id, prompt: run.prompt, mode: run.mode, files: before, skipped });
+      }
       // 想法 11：只有点「保存为版本」才产生版本，这里只记一笔"未保存的改动"
       s.setPendingRound({
-        preSnapshotId: preSnapshot?.id ?? null,
+        // 关键：保留**第一轮**的快照 id，不能被后面几轮覆盖 ——
+        // 否则"撤销未保存的改动"实际上只退得掉最后一轮。
+        preSnapshotId: s.pendingRound?.preSnapshotId ?? preSnapshot?.id ?? null,
         runId: run.id,
         files: [...new Set([...(s.pendingRound?.files ?? []), ...okFiles])],
         promptBefore,
@@ -580,6 +613,8 @@ export class Runner {
       confirmed: true,
     });
     s.clearPendingRound();
+    // 这些轮次已经进了版本，轮次前像日志就功成身退了（回退改走版本链）
+    s.clearRoundJournal();
     s.save();
     this.emit('versions', s.versionList());
     this.emit('state', this.snapshot());
@@ -599,6 +634,7 @@ export class Runner {
       return { ok: false, error: `撤销失败：${err.message}` };
     }
     s.clearPendingRound();
+    s.clearRoundJournal();
     s.prompt = pending.promptBefore ?? s.prompt;
     this.committedPrompt = s.currentVersion?.promptAfter ?? '';
     this.rag?.build({ force: true });
@@ -609,6 +645,59 @@ export class Runner {
     this.emit('state', this.snapshot());
     this.emit('toast', { level: 'warn', message: `已撤销未保存的改动（恢复 ${restore.restored} 个文件）` });
     return { ok: true, ...restore };
+  }
+
+  /**
+   * 往回退 N 轮（v3.3）。粒度是"轮"，不是"已保存的版本" ——
+   * 之前 ⏪ 只能退回上一个已保存版本，中间那些没保存的轮次既看不见也退不动。
+   * 用的是每轮记下的文件前像，所以只动这一轮真正改过的文件。
+   */
+  undoRoundStep({ count = 1 } = {}) {
+    const s = this.session;
+    const n = Math.max(1, Math.min(30, Number(count) || 1));
+    if (s.activeIndex !== s.versions.length - 1) {
+      return { ok: false, error: '你正处于历史版本上，请先点 ⏩ 回到最新版本再按轮回退' };
+    }
+    const undone = [];
+    const touched = new Set();
+    let failedFiles = 0;
+    for (let i = 0; i < n; i += 1) {
+      const entry = s.popRoundJournal();
+      if (!entry) break;
+      for (const [rel, pre] of Object.entries(entry.files ?? {})) {
+        try {
+          if (pre.existed) this.workspace.write(rel, pre.content ?? '');
+          else this.workspace.remove(rel);
+          touched.add(rel);
+        } catch {
+          failedFiles += 1;
+        }
+      }
+      undone.push(entry);
+    }
+    if (!undone.length) return { ok: false, error: '没有可以回退的轮次了' };
+
+    // 思考栏里那些已经撤回的轮次也要去掉，不然它还留在那儿让人以为改动还在
+    const ids = new Set(undone.map((e) => e.id));
+    s.timeline = s.timeline.filter((t) => !ids.has(t.id));
+    if (!s.roundJournal.length) {
+      s.clearPendingRound();
+    } else if (s.pendingRound) {
+      const remain = [...new Set(s.roundJournal.flatMap((e) => Object.keys(e.files ?? {})))];
+      s.setPendingRound({ files: remain, round: s.roundJournal.length });
+    }
+    this.recentFiles = this.recentFiles.filter((p) => touched.has(p));
+    this.rag?.build({ force: true });
+    s.save();
+    this.emit('tree', { tree: this.safeTree() });
+    this.emit('versions', s.versionList());
+    this.emit('state', this.snapshot());
+    this.emit('timeline', { timeline: s.timeline });
+    this.emit('toast', {
+      level: 'ok',
+      message: `已回退 ${undone.length} 轮（还原 ${touched.size} 个文件）${failedFiles ? `，${failedFiles} 个文件还原失败` : ''}`,
+    });
+    return { ok: true, undone: undone.length, files: [...touched], failedFiles, remaining: s.roundJournal.length };
   }
 
   /** 提交：优先就地"采纳"预演结果，避免重复调用模型（省钱 + 更快）。 */
@@ -682,6 +771,9 @@ export class Runner {
     clearTimeout(this.commitTimer);
     clearTimeout(this.settleTimer);
     this.committedPrompt = s.currentVersion?.promptAfter ?? '';
+    // 在版本链上移动游标 = 整体覆盖了工作区状态，未保存轮次的前像不再对应任何东西
+    s.clearPendingRound();
+    s.clearRoundJournal();
     this.rag?.build({ force: true });
     if (direction !== 'forward') this.memory?.observeRollback();
     s.save();
@@ -843,8 +935,15 @@ export class Runner {
       versions: s.versionList(),
       pendingConfirm: s.pendingConfirm,
       unsaved: s.pendingRound
-        ? { round: s.pendingRound.round, files: s.pendingRound.files ?? [], at: s.pendingRound.at, canUndo: Boolean(s.pendingRound.preSnapshotId) }
-        : null,
+        ? {
+          round: s.pendingRound.round,
+          files: s.pendingRound.files ?? [],
+          at: s.pendingRound.at,
+          canUndo: Boolean(s.pendingRound.preSnapshotId),
+          // v3.3：时间线要显示"还没保存的每一轮"，⏪ 也要能一轮一轮往回退
+          rounds: s.roundJournalBrief(),
+        }
+        : { round: 0, files: [], at: null, canUndo: false, rounds: [] },
       syncEnabled: this.syncEnabled,
       intent: this.lastIntent,
       decision: this.lastDecision ? { mode: this.lastDecision.mode, ratio: this.lastDecision.ratio, reason: this.lastDecision.reason } : null,

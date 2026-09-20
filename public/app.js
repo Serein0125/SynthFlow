@@ -32,7 +32,9 @@ function renderTree(tree) {
   const walk = (node, depth, parent) => {
     for (const child of node.children ?? []) {
       const row = document.createElement('div');
-      row.style.paddingLeft = `${8 + depth * 12}px`;
+      // 缩进完全交给 .tree-children 的嵌套（CSS 里每层只加一次）。
+      // 这里以前还会再按 depth 补 12px，和 CSS 的 13px+8px 叠在一起，
+      // 一级就要 33px，深目录直接把侧栏撑爆。
       if (child.type === 'dir') {
         const collapsed = S.collapsedDirs.has(child.path);
         row.className = `tree-item tree-dir${collapsed ? ' collapsed' : ''}`;
@@ -158,6 +160,7 @@ function setView(view) {
 }
 
 function renderUnsaved(state) {
+  const changed = state?.unsaved !== undefined && state.unsaved !== S.unsaved;
   if (state?.unsaved !== undefined) S.unsaved = state.unsaved;
   if (state?.syncEnabled !== undefined) setSyncUi(state.syncEnabled);
   const n = S.unsaved?.round ?? 0;
@@ -171,6 +174,24 @@ function renderUnsaved(state) {
       ? `有 ${n} 轮改动还没保存为版本（${(S.unsaved.files ?? []).length} 个文件）—— 点这里保存`
       : '把当前改动保存为一个版本（Ctrl+Alt+S）';
   }
+  if (el.btnUndo) {
+    // 有未保存轮次时 ⏪ 依然可用（按轮回退），别把它灰掉
+    const rounds = S.unsaved?.rounds?.length ?? 0;
+    el.btnUndo.disabled = !(rounds > 0 || S.canBack);
+    el.btnUndo.title = rounds > 0
+      ? `回退一轮（还有 ${rounds} 轮未保存的改动可以退）`
+      : '回退到上一个已保存版本（Alt+Z）';
+  }
+  // 时间线里要同时画"已保存版本"和"未保存的每一轮"，所以这里跟着刷新
+  if (changed) renderTimelineOnly();
+}
+
+/**
+ * 只重画时间线。传空对象给 renderVersions 是有意的：
+ * 里面所有字段都是"有才覆盖"，所以 S.canBack / S.canForward 与两个按钮的状态都不会被动。
+ */
+function renderTimelineOnly() {
+  renderVersions({});
 }
 
 function setSyncUi(enabled) {
@@ -276,6 +297,30 @@ function renderVersions(payload) {
     });
     el.timeline.appendChild(li);
   });
+
+  // v3.3：把"还没保存为版本的每一轮"也画出来。
+  // 之前时间线上只有已保存版本，⏪ 也只能退到上一个已保存版本 ——
+  // 中间这些轮次既看不见也退不动。
+  const rounds = S.unsaved?.rounds ?? [];
+  if (rounds.length) {
+    const head = document.createElement('li');
+    head.className = 'timeline-sep';
+    head.innerHTML = `<span>未保存的 ${rounds.length} 轮</span>`;
+    head.title = '这些轮次还没保存为版本，但可以一轮一轮往回退（⏪）';
+    el.timeline.appendChild(head);
+    // 最新的在最上面，和不保存就走不回去的直觉相反容易被忽略
+    [...rounds].reverse().forEach((r) => {
+      const li = document.createElement('li');
+      li.className = 'timeline-item unsaved';
+      const names = r.files ?? [];
+      li.innerHTML = `<b>第${r.n}轮</b><span>${esc((r.prompt || '（无提示词）').slice(0, 40))}${
+        names.length ? ` · ${names.length} 个文件` : ''}</span>`;
+      li.title = `回退到这一轮之前（会连带撤销它后面的 ${rounds.length - r.n + 1} 轮）\n${names.join('\n')}`;
+      li.addEventListener('click', () => undoRounds(rounds.length - r.n + 1));
+      el.timeline.appendChild(li);
+    });
+  }
+
   if (el.versionHint) {
     el.versionHint.textContent = S.versions.length > 1 ? ` ${curIdx}/${S.versions.length - 1}` : '';
     el.versionHint.title = S.canForward ? '你正处于历史版本，可以点 ⏩ 前进回去' : '';
@@ -1005,6 +1050,21 @@ async function undoUnsaved() {
   }
 }
 
+/** v3.3：往回退 N 轮（粒度是"轮"，不是"已保存版本"）。 */
+async function undoRounds(count = 1) {
+  try {
+    const res = await post('/api/version/undo-step', { count });
+    if (!res.ok) {
+      toast(res.error ?? '没有可回退的轮次', 'warn', 3200);
+      return;
+    }
+    S.unsaved = null;
+    setStatus('done', `已回退 ${res.undone} 轮`, `还原 ${res.files?.length ?? 0} 个文件 · 还剩 ${res.remaining} 轮未保存`);
+  } catch (err) {
+    toast(`回退失败：${err.message}`, 'err');
+  }
+}
+
 /* ============================ 保存 ============================ */
 
 async function saveCurrent({ silent = false, reason = '' } = {}) {
@@ -1330,7 +1390,9 @@ function bindUi() {
   // 想法 11：保存为版本（两个入口）
   el.btnSaveVersion?.addEventListener('click', () => saveVersion());
   el.btnUndo?.addEventListener('click', () => {
-    if (S.unsaved?.canUndo && !S.canBack) undoUnsaved();
+    // v3.3：优先按"轮"往回退 —— 不必先保存版本也能一步步退回去。
+    // 只有没有未保存轮次时，才退到上一个已保存版本。
+    if ((S.unsaved?.rounds?.length ?? 0) > 0) undoRounds(1);
     else doVersion('back');
   });
 

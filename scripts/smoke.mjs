@@ -1622,9 +1622,187 @@ await test('切到直接写入时，上一次暂存的改动会被补齐写进�
   assert.deepEqual(direct.pending(), [], '直接写入模式下永远没有待应用改动');
 });
 
-/* ============================ 13. 基准（可选） ============================ */
+/* ====== 13. 第四轮反馈：删除清干净 / 一轮一轮往回退（用户反馈回归） ====== */
+section('13. 删除收尾与轮次级回退');
+
+await test('删除文件后，空掉的父目录也要一起收掉', () => {
+  const dir = path.join(TMP, 'prune');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'prune-store') });
+  ws.applyOp({ path: 'src/deep/nested/temp.js', mode: 'create', content: 'export const t = 1;\n' });
+  ws.applyOp({ path: 'src/deep/nested/keep.js', mode: 'create', content: 'export const k = 1;\n' });
+  ws.applyOp({ path: 'top.js', mode: 'create', content: 'export const x = 1;\n' });
+
+  ws.applyOp({ path: 'src/deep/nested/temp.js', mode: 'delete' });
+  assert.ok(fs.existsSync(path.join(dir, 'src', 'deep', 'nested', 'keep.js')), '同级文件不能被误删');
+  assert.ok(
+    fs.existsSync(path.join(dir, 'src', 'deep', 'nested')),
+    '目录里还有文件，不能把目录删掉',
+  );
+
+  // 删掉最后一个文件后，整条空目录链都该消失（用户"文件没删干净"的观感就来自这里）
+  ws.applyOp({ path: 'src/deep/nested/keep.js', mode: 'delete' });
+  assert.ok(!fs.existsSync(path.join(dir, 'src', 'deep', 'nested')), 'nested 空目录应被回收');
+  assert.ok(!fs.existsSync(path.join(dir, 'src', 'deep')), 'deep 空目录应被回收');
+  assert.ok(!fs.existsSync(path.join(dir, 'src')), 'src 空目录应被回收');
+  assert.ok(fs.existsSync(path.join(dir, 'top.js')), '根目录下的其它文件必须保留');
+  assert.ok(fs.existsSync(dir), '项目根目录本身不能被删');
+
+  // 暂存模式下"应用删除"也要收干净
+  const sdir = path.join(TMP, 'prune-staging');
+  fs.rmSync(sdir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(sdir, 'p', 'x', 'y'), { recursive: true });
+  fs.writeFileSync(path.join(sdir, 'p', 'x', 'y', 'gone.js'), 'const g = 1;\n', 'utf8');
+  const sws = new Workspace(path.join(sdir, 'p'), { storeDir: path.join(sdir, 'store'), overlayDir: path.join(sdir, 'store', 'staging') });
+  sws.applyOp({ path: 'x/y/gone.js', mode: 'delete' });
+  assert.equal(sws.pending().length, 1, '暂存模式下应记为一条待删除');
+  sws.applyPending();
+  assert.ok(!fs.existsSync(path.join(sdir, 'p', 'x')), '应用删除后空目录也要回收');
+});
+
+await test('轮次前像日志：按条数与体积剪枝，且能持久化', () => {
+  const dir = path.join(TMP, 'journal');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'journal-store') });
+  const s = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'journal-sessions') });
+  for (let i = 0; i < 60; i += 1) {
+    s.pushRoundJournal({ id: `r${i}`, prompt: `第 ${i} 轮`, files: { [`f${i}.js`]: { existed: false, content: null } } });
+  }
+  assert.equal(s.roundJournal.length, 40, '条数应被剪到 40');
+  assert.equal(s.roundJournal[0].prompt, '第 20 轮', '剪掉的应该是最旧的');
+
+  // 体积剪枝：塞几个大文件，总字节数必须被压到上限以内
+  const big = 'x'.repeat(200 * 1024);
+  for (let i = 0; i < 30; i += 1) {
+    s.pushRoundJournal({ id: `big${i}`, files: { [`big${i}.js`]: { existed: true, content: big } } });
+  }
+  assert.ok(s.journalBytes() <= 1.6 * 1024 * 1024, `日志体积应被压到 1.5MB 以内，实际 ${(s.journalBytes() / 1048576).toFixed(2)}MB`);
+
+  s.pushRoundJournal({ id: 'last', prompt: '最后一轮', files: { 'a.js': { existed: true, content: 'const a = 1;\n' } } });
+  s.save();
+  const loaded = Session.load(s.file, { workspace: ws, config: {} });
+  assert.ok(loaded.roundJournal.length > 0, '刷新后轮次日志必须还在');
+  assert.equal(loaded.roundJournal[loaded.roundJournal.length - 1].id, 'last');
+  const brief = loaded.roundJournalBrief();
+  assert.ok(brief.every((e) => !('content' in e) && Array.isArray(e.files)), '给界面看的清单不该带文件内容');
+});
+
+await test('★ 生成 3 轮后：能一轮一轮往回退，也能一次性全退', async () => {
+  const dir = path.join(TMP, 'roundundo');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'roundundo-store') });
+  const sess = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'roundundo-sessions') });
+  const evts = [];
+  const r = new Runner({
+    session: sess,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'roundundo-store')),
+    config: { ...cfg, saveMode: 'manual', autoCommit: true, patchRetry: false, commitIdleMs: 20, specDelayMs: 5, settleMs: 20 },
+    emit: (n, p) => evts.push({ name: n, payload: p }),
+  });
+
+  // 每一轮生成一个新文件（用桩 provider 精确控制，不依赖 mock 的输出格式）
+  let round = 0;
+  r.provider = {
+    name: 'stub',
+    label: '桩',
+    ready: true,
+    note: '',
+    async *stream() {
+      round += 1;
+      yield { type: 'delta', text: `<<<SF file path="r${round}.js" action="create">>>\nexport const r${round} = ${round};\n<<<SF /file>>>\n` };
+    },
+  };
+
+  for (let i = 1; i <= 3; i += 1) {
+    sess.setPrompt(`第 ${i} 轮：新建 r${i}.js`);
+    await r.commit({ reason: 'test', force: true });
+    await waitFor(() => !r.busy && evts.some((e) => e.name === 'run:done' && e.payload.runId), 15000, `第 ${i} 轮完成`);
+    evts.length = 0;
+  }
+  assert.deepEqual(ws.listFiles().sort(), ['r1.js', 'r2.js', 'r3.js'], '三轮各生成一个文件');
+  assert.equal(sess.roundJournal.length, 3, '应有 3 条轮次前像');
+  assert.equal(sess.versions.length, 1, '手动保存模式下不该自动产生版本');
+  assert.equal(sess.pendingRound.round, 3, '未保存改动应记到第 3 轮');
+
+  // ★ 单步回退：只退最后一轮
+  const step1 = r.undoRoundStep({ count: 1 });
+  assert.equal(step1.ok, true, step1.error);
+  assert.equal(step1.undone, 1);
+  assert.deepEqual(ws.listFiles().sort(), ['r1.js', 'r2.js'], '退一轮应只删掉 r3.js');
+  assert.equal(sess.roundJournal.length, 2);
+  assert.equal(sess.pendingRound.round, 2, '未保存轮数要跟着减少');
+
+  // 跨版本保护：待在历史版本上时不允许按轮回退（先存一个版本，让游标有可能停在历史版本上）
+  r.saveVersion({ label: '存一版' });
+  assert.equal(sess.versions.length, 2, '保存后应有 v0 + v1');
+  sess.activeIndex = 0;
+  const blocked = r.undoRoundStep({ count: 1 });
+  assert.equal(blocked.ok, false, '在历史版本上必须拒绝，否则回退对象会错乱');
+  assert.match(blocked.error, /历史版本/);
+  sess.activeIndex = sess.versions.length - 1;
+  // 保存版本时会把已保存的那些轮次从日志里清掉，所以这里重新造两轮未保存改动
+  await r.commit({ reason: 'test', force: true });
+  await waitFor(() => !r.busy, 15000, '补一轮');
+  assert.equal(sess.roundJournal.length, 1, '保存版本后日志清零，这一轮应只记 1 条');
+
+  // ★ 一次退到"保存点"：只退得掉保存之后的那一轮（保存过的内容属于版本，由版本链负责）
+  // 注意此时磁盘上应该是 r1/r2 —— r3 在前一步已经被按轮回退掉了。
+  const step2 = r.undoRoundStep({ count: 5 });
+  assert.equal(step2.ok, true, step2.error);
+  assert.deepEqual(ws.listFiles().sort(), ['r1.js', 'r2.js'], '按轮回退不该动到已保存版本里的文件');
+  assert.equal(sess.roundJournal.length, 0);
+  assert.equal(sess.pendingRound, null, '没有未保存轮次了，pendingRound 要清空');
+  assert.equal(sess.versions.length, 2, '版本链不受按轮回退影响');
+
+  // 已经退到头了，再退要说清楚而不是抛异常
+  const again = r.undoRoundStep({ count: 1 });
+  assert.equal(again.ok, false);
+  assert.match(again.error, /没有可以回退/);
+});
+
+await test('★ preSnapshotId 保留第一轮：一次性撤销能退掉全部未保存轮次', async () => {
+  const dir = path.join(TMP, 'presnap');
+  fs.rmSync(dir, { recursive: true, force: true });
+  const ws = new Workspace(dir, { storeDir: path.join(TMP, 'presnap-store') });
+  const sess = new Session({ workspace: ws, config: {}, storeDir: path.join(TMP, 'presnap-sessions') });
+  const r = new Runner({
+    session: sess,
+    workspace: ws,
+    rag: new RagIndex(ws),
+    memory: new Memory(path.join(TMP, 'presnap-store')),
+    config: { ...cfg, saveMode: 'manual', autoCommit: true, patchRetry: false, commitIdleMs: 20, specDelayMs: 5, settleMs: 20 },
+    emit: () => {},
+  });
+  let n = 0;
+  r.provider = {
+    name: 'stub', label: '桩', ready: true, note: '',
+    async *stream() { n += 1; yield { type: 'delta', text: `<<<SF file path="n${n}.js" action="create">>>\nexport const n${n} = ${n};\n<<<SF /file>>>\n` }; },
+  };
+  for (let i = 1; i <= 3; i += 1) {
+    sess.setPrompt(`第 ${i} 轮`);
+    await r.commit({ reason: 'test', force: true });
+    await waitFor(() => !r.busy, 15000, `第 ${i} 轮完成`);
+  }
+  assert.deepEqual(ws.listFiles().sort(), ['n1.js', 'n2.js', 'n3.js']);
+  const snapId = sess.pendingRound.preSnapshotId;
+  const firstRunId = sess.roundJournal[0].id;
+  // preSnapshotId 必须是**第一轮之前**那个快照：以前每轮都会覆盖它，
+  // 结果"撤销未保存的改动"其实只退掉了最后一轮。
+  const snaps = ws.listSnapshots().filter((s) => s.id === snapId);
+  assert.equal(snaps.length, 1, 'preSnapshotId 应指向一个存在的快照');
+  assert.equal(snaps[0].runId, firstRunId, `preSnapshotId 应指向第一轮的快照，实际指向 ${snaps[0].runId}`);
+
+  const res = r.undoRound();
+  assert.equal(res.ok, true, res.error);
+  assert.deepEqual(ws.listFiles(), [], '一次性撤销必须退掉全部 3 轮');
+  assert.equal(sess.roundJournal.length, 0, '轮次日志也要一起清空');
+});
+
+/* ============================ 14. 基准（可选） ============================ */
 if (bench) {
-  section('13. 性能基线（--bench）');
+  section('14. 性能基线（--bench）');
   await test('1000 行文件的补丁定位 < 60ms', async () => {
     const big = Array.from({ length: 1000 }, (_, i) => `function f${i}() { return ${i}; }`).join('\n');
     const start = Date.now();
